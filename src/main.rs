@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::process;
 use toml_edit::{DocumentMut, value};
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const HELP: &str = "\
 phx-port — stable port assignments for Phoenix projects
 
@@ -219,6 +221,9 @@ fn main() {
     let config = config_path();
 
     match args.first().map(|s| s.as_str()) {
+        Some("--version" | "-V") => {
+            println!("phx-port {}", VERSION);
+        }
         Some("--help" | "-h") => {
             println!("{}", HELP);
         }
