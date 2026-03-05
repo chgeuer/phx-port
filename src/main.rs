@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::IsTerminal;
@@ -17,6 +17,9 @@ USAGE:
     PORT=$(phx-port) PORT_DEBUG=$(phx-port debug) my-app
 
     phx-port --list             List all registered projects and ports
+    phx-port --list --tree      Show ports as a directory tree
+    phx-port --list --tree --show-as-http-url
+                                Show tree with clickable http://localhost URLs
     phx-port --register         Register the current directory for a new port
     phx-port --register debug   Register a named port role
     phx-port --delete <X>       Remove all ports (X = port number, directory name, or '.')
@@ -171,6 +174,187 @@ fn cmd_list(config: &PathBuf) {
         }
     } else {
         eprintln!("No ports registered.");
+    }
+}
+
+struct TreeNode {
+    children: BTreeMap<String, TreeNode>,
+    ports: Vec<(i64, String)>,
+}
+
+impl TreeNode {
+    fn new() -> Self {
+        TreeNode {
+            children: BTreeMap::new(),
+            ports: Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, segments: &[&str], ports: Vec<(i64, String)>) {
+        if segments.is_empty() {
+            self.ports = ports;
+            return;
+        }
+        self.children
+            .entry(segments[0].to_string())
+            .or_insert_with(TreeNode::new)
+            .insert(&segments[1..], ports);
+    }
+
+    fn collapse(&mut self) {
+        for child in self.children.values_mut() {
+            child.collapse();
+        }
+        let keys: Vec<String> = self.children.keys().cloned().collect();
+        for key in keys {
+            let should_merge = self
+                .children
+                .get(&key)
+                .is_some_and(|c| c.children.len() == 1 && c.ports.is_empty());
+            if should_merge {
+                let child = self.children.remove(&key).unwrap();
+                let (gk, gv) = child.children.into_iter().next().unwrap();
+                self.children.insert(format!("{}/{}", key, gk), gv);
+            }
+        }
+    }
+}
+
+fn format_ports(ports: &[(i64, String)], as_url: bool) -> String {
+    let mut sorted = ports.to_vec();
+    sorted.sort_by_key(|(p, _)| *p);
+    sorted
+        .iter()
+        .map(|(p, r)| {
+            let port_str = if as_url {
+                format!("http://localhost:{}", p)
+            } else {
+                format!("{}", p)
+            };
+            if r == DEFAULT_ROLE {
+                port_str
+            } else {
+                format!("{} ({})", port_str, r)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+struct TreeLine {
+    prefix: String,
+    name: String,
+    port_info: Option<String>,
+    name_end: usize,
+}
+
+fn collect_tree_lines(node: &TreeNode, prefix: &str, depth: usize, as_url: bool, lines: &mut Vec<TreeLine>) {
+    let children: Vec<(&String, &TreeNode)> = node.children.iter().collect();
+    for (i, (name, child)) in children.iter().enumerate() {
+        let is_last = i == children.len() - 1;
+        let connector = if is_last { "└── " } else { "├── " };
+        let continuation = if is_last { "    " } else { "│   " };
+        let name_end = depth * 4 + 4 + name.chars().count();
+
+        lines.push(TreeLine {
+            prefix: format!("{}{}", prefix, connector),
+            name: name.to_string(),
+            port_info: if child.ports.is_empty() {
+                None
+            } else {
+                Some(format_ports(&child.ports, as_url))
+            },
+            name_end,
+        });
+
+        collect_tree_lines(
+            child,
+            &format!("{}{}", prefix, continuation),
+            depth + 1,
+            as_url,
+            lines,
+        );
+    }
+}
+
+fn cmd_list_tree(config: &PathBuf, as_url: bool) {
+    let doc = read_config(config);
+    let table = match doc.get("ports").and_then(|v| v.as_table()) {
+        Some(t) => t,
+        None => {
+            eprintln!("No ports registered.");
+            return;
+        }
+    };
+
+    let mut dir_ports: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
+    for (dir, dir_value) in table.iter() {
+        if let Some(dir_table) = dir_value.as_table() {
+            let ports: Vec<(i64, String)> = dir_table
+                .iter()
+                .filter_map(|(role, v)| v.as_integer().map(|p| (p, role.to_string())))
+                .collect();
+            if !ports.is_empty() {
+                dir_ports.insert(dir.to_string(), ports);
+            }
+        }
+    }
+
+    if dir_ports.is_empty() {
+        eprintln!("No ports registered. Use --register or PORT=$(phx-port) to add one.");
+        return;
+    }
+
+    let home = home_dir().to_string_lossy().to_string();
+    let mut root = TreeNode::new();
+
+    for (dir, ports) in &dir_ports {
+        let relative = dir.strip_prefix(&home).unwrap_or(dir.as_str());
+        let relative = relative.strip_prefix('/').unwrap_or(relative);
+        let segments: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
+        root.insert(&segments, ports.clone());
+    }
+
+    root.collapse();
+
+    // Collapse single-child root chain into the display path
+    let mut display_root = home;
+    let mut render_node = &root;
+    while render_node.children.len() == 1 && render_node.ports.is_empty() {
+        let (name, child) = render_node.children.iter().next().unwrap();
+        display_root = format!("{}/{}", display_root, name);
+        render_node = child;
+    }
+
+    if render_node.children.is_empty() {
+        if !render_node.ports.is_empty() {
+            println!("{} .. {}", display_root, format_ports(&render_node.ports, as_url));
+        }
+        return;
+    }
+
+    let mut lines = Vec::new();
+    collect_tree_lines(render_node, "", 0, as_url, &mut lines);
+
+    let max_end = lines
+        .iter()
+        .filter(|l| l.port_info.is_some())
+        .map(|l| l.name_end)
+        .max()
+        .unwrap_or(0);
+    let target = max_end + 2;
+
+    println!("{}", display_root);
+    for line in &lines {
+        match &line.port_info {
+            Some(ports) => {
+                let dots = target.saturating_sub(line.name_end).max(2);
+                println!("{}{} {} {}", line.prefix, line.name, ".".repeat(dots), ports);
+            }
+            None => {
+                println!("{}{}", line.prefix, line.name);
+            }
+        }
     }
 }
 
@@ -382,7 +566,14 @@ fn main() {
             println!("{}", HELP);
         }
         Some("--list" | "-l") => {
-            cmd_list(&config);
+            let rest: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
+            let tree = rest.contains(&"--tree");
+            let as_url = rest.contains(&"--show-as-http-url");
+            if tree {
+                cmd_list_tree(&config, as_url);
+            } else {
+                cmd_list(&config);
+            }
         }
         Some("--register" | "-r") => {
             let role = args.get(1).map(|s| s.as_str()).unwrap_or(DEFAULT_ROLE);

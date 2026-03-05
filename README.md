@@ -84,6 +84,12 @@ Put this in a project's `run` script and never think about ports again.
 # List all registered projects and their ports
 phx-port --list
 
+# Show ports as a directory tree
+phx-port --list --tree
+
+# Show tree with clickable URLs
+phx-port --list --tree --show-as-http-url
+
 # Explicitly register the current directory (default role: main)
 phx-port --register
 
@@ -124,6 +130,31 @@ Registered /home/user/projects/shop (debug) → port 4004    # ← new role
  4002  /home/user/projects/admin
  4003  /home/user/projects/shop
  4004  /home/user/projects/shop (debug)
+```
+
+### Tree view
+
+With many projects, the tree view gives a cleaner overview grouped by directory structure. Single-child directories are collapsed automatically:
+
+```
+$ phx-port --list --tree
+/home/user
+├── projects
+│   ├── api ......... 4001
+│   ├── admin ....... 4002
+│   └── shop ........ 4003, 4004 (debug)
+└── work/services ... 4005
+```
+
+Add `--show-as-http-url` to make ports clickable in terminals that support hyperlinks:
+
+```
+$ phx-port --list --tree --show-as-http-url
+/home/user
+├── projects
+│   ├── api ......... http://localhost:4001
+│   └── shop ........ http://localhost:4003, http://localhost:4004 (debug)
+└── work/services ... http://localhost:4005
 ```
 
 ## License
