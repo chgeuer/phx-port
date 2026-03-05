@@ -8,6 +8,9 @@ When you work on multiple web projects, they often default to the same port. `ph
 ~/projects/my_app $ PORT=$(phx-port) iex -S mix phx.server
 # → always starts on the same port, every time
 
+~/github/livebook-dev/livebook $ LIVEBOOK_PORT=$( phx-port ) LIVEBOOK_IFRAME_PORT=$( phx-port iframe ) iex -S mix phx.server
+# → The 2 ports necessary to run liveview.dev locally
+
 ~/projects/node_api $ PORT=$(phx-port) node server.js
 # → works with any framework or language
 ```
