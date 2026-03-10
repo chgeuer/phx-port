@@ -110,6 +110,10 @@ phx-port open
 
 # Open the browser for a named port role
 phx-port open debug
+
+# 'launch' is an alias for 'open'
+phx-port launch
+phx-port launch debug
 ```
 
 ### Interactive mode
@@ -161,6 +165,35 @@ $ phx-port list --port-only
 │   ├── api ......... 4001
 │   └── shop ........ 4003, 4004 (debug)
 └── work/services ... 4005
+```
+
+## VS Code extension
+
+A bundled [VS Code extension](vscode-extension/) adds two commands to the Explorer folder context menu:
+
+- **Open in Browser (phx-port)** — looks up the port for the selected folder and opens `http://localhost:<port>` in your default browser.
+- **Show Port (phx-port)** — displays the assigned port number in a notification.
+
+### Install from source
+
+```bash
+just vscode-install    # compiles, packages, and installs the .vsix
+```
+
+Or manually:
+
+```bash
+cd vscode-extension
+npm install
+npm run compile
+npx @vscode/vsce package --no-dependencies
+code --install-extension phx-port-*.vsix
+```
+
+To uninstall:
+
+```bash
+just vscode-uninstall
 ```
 
 ## License
