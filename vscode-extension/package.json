@@ -1,0 +1,56 @@
+{
+  "name": "phx-port",
+  "displayName": "phx-port",
+  "description": "Right-click a project folder to look up or open its assigned HTTP port via phx-port.",
+  "version": "0.1.0",
+  "publisher": "chgeuer",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chgeuer/phx-port"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "phx-port.openInBrowser",
+        "title": "Open in Browser (phx-port)"
+      },
+      {
+        "command": "phx-port.showPort",
+        "title": "Show Port (phx-port)"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "phx-port.openInBrowser",
+          "when": "explorerResourceIsFolder",
+          "group": "z_phxport@1"
+        },
+        {
+          "command": "phx-port.showPort",
+          "when": "explorerResourceIsFolder",
+          "group": "z_phxport@2"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  }
+}
