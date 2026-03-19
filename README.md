@@ -97,13 +97,19 @@ $ phx-port running
   http://localhost:4004   /home/user/projects/shop (debug)
 ```
 
-`phx-port discover` starts a temporary local web server on a random free port and opens your default browser with a page listing all running projects. The list is rebuilt on every page load, so projects that start later will appear on refresh. Each link points directly to the target app (e.g. `http://localhost:4001`) — no redirect involved. When you click a link, the browser navigates there naturally while a background `sendBeacon('/shutdown')` call tells the discover server to exit:
+`phx-port discover` starts a temporary local web server on a random free port and opens your default browser with a page listing all running projects. Click any project to jump straight to it:
 
-```
-$ phx-port discover
-Serving project list at http://localhost:52431
-Press Ctrl+C to close without selecting.
-```
+<p align="center">
+  <img src="docs/discover-screenshot.png" alt="phx-port discover — browser view of running projects" width="700">
+</p>
+
+The list is rebuilt on every page load, so projects that start or stop between refreshes are always reflected. Each link points directly to the target app (e.g. `http://localhost:4001`) — no redirect involved. When you click a link, the browser navigates there naturally while a background `sendBeacon('/shutdown')` call tells the discover server to exit.
+
+On [Omarchy](https://omarchy.com), `phx-port discover` is registered as a desktop application called **Disco**, so you can launch it directly from the app launcher (<kbd>Super</kbd>+<kbd>Space</kbd>):
+
+<p align="center">
+  <img src="docs/omarchy-super-space.png" alt="Launching Disco from the Omarchy app launcher" width="550">
+</p>
 
 ### Managing registrations
 
