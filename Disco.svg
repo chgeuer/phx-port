@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <radialGradient id="ball" cx="45%" cy="40%" r="50%">
+      <stop offset="0%" stop-color="#f0f0f0"/>
+      <stop offset="60%" stop-color="#c0c0c0"/>
+      <stop offset="100%" stop-color="#707070"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Background circle glow -->
+  <circle cx="64" cy="68" r="58" fill="url(#glow)"/>
+
+  <!-- Hanging string -->
+  <line x1="64" y1="4" x2="64" y2="24" stroke="#aaa" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Main ball -->
+  <circle cx="64" cy="64" r="40" fill="url(#ball)" stroke="#999" stroke-width="0.5"/>
+
+  <!-- Mirror tile grid - horizontal lines -->
+  <ellipse cx="64" cy="34" rx="28" ry="1" fill="none" stroke="#aaa" stroke-width="0.6" opacity="0.7"/>
+  <ellipse cx="64" cy="44" rx="37" ry="1" fill="none" stroke="#aaa" stroke-width="0.6" opacity="0.7"/>
+  <ellipse cx="64" cy="54" rx="39.5" ry="1" fill="none" stroke="#aaa" stroke-width="0.6" opacity="0.7"/>
+  <line x1="24" y1="64" x2="104" y2="64" stroke="#aaa" stroke-width="0.6" opacity="0.7"/>
+  <ellipse cx="64" cy="74" rx="39.5" ry="1" fill="none" stroke="#aaa" stroke-width="0.6" opacity="0.7"/>
+  <ellipse cx="64" cy="84" rx="37" ry="1" fill="none" stroke="#aaa" stroke-width="0.6" opacity="0.7"/>
+  <ellipse cx="64" cy="94" rx="28" ry="1" fill="none" stroke="#aaa" stroke-width="0.6" opacity="0.7"/>
+
+  <!-- Vertical lines on ball -->
+  <path d="M64,24 Q64,64 64,104" fill="none" stroke="#aaa" stroke-width="0.6" opacity="0.7"/>
+  <path d="M44,27 Q36,64 44,101" fill="none" stroke="#aaa" stroke-width="0.6" opacity="0.7"/>
+  <path d="M84,27 Q92,64 84,101" fill="none" stroke="#aaa" stroke-width="0.6" opacity="0.7"/>
+  <path d="M32,36 Q24,64 32,92" fill="none" stroke="#aaa" stroke-width="0.6" opacity="0.7"/>
+  <path d="M96,36 Q104,64 96,92" fill="none" stroke="#aaa" stroke-width="0.6" opacity="0.7"/>
+
+  <!-- Sparkle reflections -->
+  <circle cx="48" cy="48" r="3" fill="white" opacity="0.9"/>
+  <circle cx="52" cy="42" r="1.5" fill="white" opacity="0.7"/>
+  <circle cx="42" cy="55" r="1" fill="white" opacity="0.5"/>
+
+  <!-- Colored light rays -->
+  <line x1="30" y1="90" x2="10" y2="118" stroke="#ff6b9d" stroke-width="2.5" opacity="0.6" stroke-linecap="round"/>
+  <line x1="50" y1="98" x2="38" y2="124" stroke="#c084fc" stroke-width="2.5" opacity="0.6" stroke-linecap="round"/>
+  <line x1="78" y1="98" x2="90" y2="124" stroke="#38bdf8" stroke-width="2.5" opacity="0.6" stroke-linecap="round"/>
+  <line x1="98" y1="90" x2="118" y2="118" stroke="#4ade80" stroke-width="2.5" opacity="0.6" stroke-linecap="round"/>
+  <line x1="24" y1="64" x2="6" y2="64" stroke="#facc15" stroke-width="2.5" opacity="0.5" stroke-linecap="round"/>
+  <line x1="104" y1="64" x2="122" y2="64" stroke="#fb923c" stroke-width="2.5" opacity="0.5" stroke-linecap="round"/>
+
+  <!-- Small sparkle dots around -->
+  <circle cx="14" cy="112" r="2" fill="#ff6b9d" opacity="0.8"/>
+  <circle cx="40" cy="120" r="1.5" fill="#c084fc" opacity="0.8"/>
+  <circle cx="88" cy="120" r="1.5" fill="#38bdf8" opacity="0.8"/>
+  <circle cx="114" cy="112" r="2" fill="#4ade80" opacity="0.8"/>
+</svg>
