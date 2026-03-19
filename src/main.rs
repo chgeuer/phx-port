@@ -666,27 +666,33 @@ fn cmd_running(config: &PathBuf) {
 
 fn build_discover_html(projects: &[RunningProject]) -> String {
     let mut items = String::new();
-    for p in projects {
-        let name = std::path::Path::new(&p.dir)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&p.dir);
-        let role_suffix = if p.role == DEFAULT_ROLE {
-            String::new()
-        } else {
-            format!(" <span class=\"role\">({})</span>", p.role)
-        };
-        items.push_str(&format!(
-            "    <li><a href=\"/goto/{port}\">\
-             <span class=\"port\">:{port}</span> \
-             {name}{role}\
-             <div class=\"dir\">{dir}</div>\
-             </a></li>\n",
-            port = p.port,
-            name = name,
-            role = role_suffix,
-            dir = p.dir,
-        ));
+    if projects.is_empty() {
+        items.push_str(
+            "    <li class=\"empty\">No projects are currently running. Refresh to check again.</li>\n",
+        );
+    } else {
+        for p in projects {
+            let name = std::path::Path::new(&p.dir)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&p.dir);
+            let role_suffix = if p.role == DEFAULT_ROLE {
+                String::new()
+            } else {
+                format!(" <span class=\"role\">({})</span>", p.role)
+            };
+            items.push_str(&format!(
+                "    <li><a href=\"http://localhost:{port}\">\
+                 <span class=\"port\">:{port}</span> \
+                 {name}{role}\
+                 <div class=\"dir\">{dir}</div>\
+                 </a></li>\n",
+                port = p.port,
+                name = name,
+                role = role_suffix,
+                dir = p.dir,
+            ));
+        }
     }
 
     let template = r#"<!DOCTYPE html>
@@ -706,6 +712,7 @@ a:hover { background: #0f3460; }
 .port { color: #e94560; font-weight: 600; margin-right: 0.5rem; }
 .dir { color: #888; font-size: 0.85rem; margin-top: 0.25rem; }
 .role { color: #aaa; }
+.empty { color: #888; padding: 0.75rem 1rem; }
 footer { margin-top: 2rem; color: #555; font-size: 0.8rem; }
 </style></head>
 <body>
@@ -713,6 +720,11 @@ footer { margin-top: 2rem; color: #555; font-size: 0.8rem; }
 <ul>
 ITEMS_PLACEHOLDER</ul>
 <footer>Click a project to open it. This page will close automatically.</footer>
+<script>
+document.querySelectorAll('a').forEach(a => {
+    a.addEventListener('click', () => navigator.sendBeacon('/shutdown'));
+});
+</script>
 </body>
 </html>"#;
 
@@ -720,20 +732,12 @@ ITEMS_PLACEHOLDER</ul>
 }
 
 fn cmd_discover(config: &PathBuf) {
-    let running = get_running_projects(config);
-    if running.is_empty() {
-        eprintln!("No registered projects are currently running.");
-        process::exit(1);
-    }
-
     let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| {
         eprintln!("Failed to start server: {}", e);
         process::exit(1);
     });
     let server_port = listener.local_addr().unwrap().port();
     let server_url = format!("http://localhost:{}", server_port);
-
-    let html = build_discover_html(&running);
 
     eprintln!("Serving project list at {}", server_url);
     eprintln!("Press Ctrl+C to close without selecting.");
@@ -765,20 +769,17 @@ fn cmd_discover(config: &PathBuf) {
                     continue;
                 }
 
-                if let Some(rest) = path.strip_prefix("/goto/")
-                    && let Ok(target_port) = rest.parse::<u16>()
-                {
-                    let target_url = format!("http://localhost:{}", target_port);
-                    let response = format!(
-                        "HTTP/1.1 302 Found\r\nLocation: {}\r\nConnection: close\r\n\r\n",
-                        target_url
-                    );
+                if path == "/shutdown" {
+                    let response = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
                     let _ = stream.write_all(response.as_bytes());
                     let _ = stream.flush();
                     drop(stream);
                     break;
                 }
 
+                // Re-enumerate running projects on every page load
+                let running = get_running_projects(config);
+                let html = build_discover_html(&running);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     html.len(),
