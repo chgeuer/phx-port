@@ -5,7 +5,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use toml_edit::{DocumentMut, value};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -724,6 +724,17 @@ ITEMS_PLACEHOLDER</ul>
 document.querySelectorAll('a').forEach(a => {
     a.addEventListener('click', () => navigator.sendBeacon('/shutdown'));
 });
+(function poll() {
+    setTimeout(async () => {
+        try { await fetch('/ping'); poll(); }
+        catch {
+            document.querySelectorAll('a').forEach(a => a.removeAttribute('href'));
+            document.querySelector('footer').textContent =
+                'The discover server has closed. This list may be out of date.';
+            document.body.style.opacity = '0.5';
+        }
+    }, 3000);
+})();
 </script>
 </body>
 </html>"#;
@@ -736,19 +747,30 @@ fn cmd_discover(config: &PathBuf) {
         eprintln!("Failed to start server: {}", e);
         process::exit(1);
     });
+    listener.set_nonblocking(true).unwrap_or_else(|e| {
+        eprintln!("Failed to configure server: {}", e);
+        process::exit(1);
+    });
+
     let server_port = listener.local_addr().unwrap().port();
     let server_url = format!("http://localhost:{}", server_port);
+    let deadline = Instant::now() + Duration::from_secs(5 * 60);
 
     eprintln!("Serving project list at {}", server_url);
-    eprintln!("Press Ctrl+C to close without selecting.");
+    eprintln!("Will auto-close after 5 minutes. Press Ctrl+C to close sooner.");
 
     if let Err(e) = open_url(&server_url) {
         eprintln!("Failed to open browser: {}", e);
     }
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
+    loop {
+        if Instant::now() >= deadline {
+            eprintln!("No selection made — timed out after 5 minutes.");
+            break;
+        }
+
+        match listener.accept() {
+            Ok((mut stream, _)) => {
                 stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
                 let mut buf = [0u8; 4096];
                 let n = match stream.read(&mut buf) {
@@ -769,6 +791,13 @@ fn cmd_discover(config: &PathBuf) {
                     continue;
                 }
 
+                if path == "/ping" {
+                    let response = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    continue;
+                }
+
                 if path == "/shutdown" {
                     let response = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
                     let _ = stream.write_all(response.as_bytes());
@@ -777,7 +806,6 @@ fn cmd_discover(config: &PathBuf) {
                     break;
                 }
 
-                // Re-enumerate running projects on every page load
                 let running = get_running_projects(config);
                 let html = build_discover_html(&running);
                 let response = format!(
@@ -787,6 +815,10 @@ fn cmd_discover(config: &PathBuf) {
                 );
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
             }
             Err(_) => break,
         }
