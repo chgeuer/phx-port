@@ -37,7 +37,9 @@ USAGE:
     phx-port discover           Open a browser page to pick a running project
     phx-port daemon [--listen ADDRESS]...
                                 Route TLS by SNI to live https/main workloads
+    phx-port proxy status       Show live daemon state and counters
     phx-port proxy routes       Show persistently discovered TLS routes
+    phx-port proxy stop         Gracefully stop the running daemon
     phx-port open               Open default browser for the current directory's port
     phx-port open debug         Open browser for a named port role
     phx-port launch             Alias for 'open'
@@ -983,9 +985,26 @@ fn main() {
             }
         }
         Some("proxy") => match args.get(1).map(String::as_str) {
-            Some("routes") if args.len() == 2 => route_cache::print(&config),
+            Some("status") if args.len() == 2 => match proxy::query_control("STATUS") {
+                Ok(response) => print!("{response}"),
+                Err(error) => {
+                    eprintln!("{error}");
+                    process::exit(1);
+                }
+            },
+            Some("routes") if args.len() == 2 => match proxy::query_control("ROUTES") {
+                Ok(response) => print!("{response}"),
+                Err(_) => route_cache::print(&config),
+            },
+            Some("stop") if args.len() == 2 => match proxy::query_control("STOP") {
+                Ok(response) => print!("{response}"),
+                Err(error) => {
+                    eprintln!("{error}");
+                    process::exit(1);
+                }
+            },
             _ => {
-                eprintln!("Usage: phx-port proxy routes");
+                eprintln!("Usage: phx-port proxy <status|routes|stop>");
                 process::exit(1);
             }
         },

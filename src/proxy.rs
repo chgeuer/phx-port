@@ -3,15 +3,20 @@ use native_tls::TlsConnector;
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(250);
@@ -23,6 +28,7 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(30);
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 const TLS_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 const TCP_FAILURE_THRESHOLD: u8 = 3;
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct Backend {
@@ -131,26 +137,38 @@ impl Drop for ProbePermit<'_> {
 
 struct ProxyState {
     config: PathBuf,
+    listeners: RwLock<Vec<SocketAddr>>,
     routes: RwLock<HashMap<String, ActiveRoute>>,
     conflicts: RwLock<HashMap<String, Vec<Backend>>>,
     flights: Mutex<HashMap<String, Arc<DiscoveryFlight>>>,
     negative: Mutex<HashMap<String, Instant>>,
     workloads: Mutex<Vec<Backend>>,
     waiting_clients: AtomicUsize,
+    active_connections: AtomicUsize,
     probes: Arc<ProbeLimiter>,
+    accepted_connections: AtomicU64,
+    relayed_connections: AtomicU64,
+    rejected_connections: AtomicU64,
+    successful_discoveries: AtomicU64,
 }
 
 impl ProxyState {
     fn new(config: PathBuf) -> Self {
         Self {
             config,
+            listeners: RwLock::new(Vec::new()),
             routes: RwLock::new(HashMap::new()),
             conflicts: RwLock::new(HashMap::new()),
             flights: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
             workloads: Mutex::new(Vec::new()),
             waiting_clients: AtomicUsize::new(0),
+            active_connections: AtomicUsize::new(0),
             probes: Arc::new(ProbeLimiter::new()),
+            accepted_connections: AtomicU64::new(0),
+            relayed_connections: AtomicU64::new(0),
+            rejected_connections: AtomicU64::new(0),
+            successful_discoveries: AtomicU64::new(0),
         }
     }
 
@@ -209,8 +227,19 @@ impl Drop for WaitingClient<'_> {
     }
 }
 
+struct ActiveConnection {
+    state: Arc<ProxyState>,
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.state.active_connections.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub fn run(listen_addresses: &[String]) -> Result<(), String> {
     let state = Arc::new(ProxyState::new(config_path()));
+    let shutdown = Arc::new(AtomicBool::new(false));
     let mut listeners = Vec::new();
 
     for address in listen_addresses {
@@ -219,40 +248,100 @@ pub fn run(listen_addresses: &[String]) -> Result<(), String> {
         eprintln!("TLS proxy listening on {}", listener.local_addr().unwrap());
         listeners.push(listener);
     }
+    *state
+        .listeners
+        .write()
+        .map_err(|_| "listener state lock poisoned".to_string())? = listeners
+        .iter()
+        .filter_map(|listener| listener.local_addr().ok())
+        .collect();
 
+    let signal = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || signal.store(true, Ordering::Release))
+        .map_err(|error| format!("cannot install shutdown signal handler: {error}"))?;
+
+    #[cfg(unix)]
+    let (control_path, control_thread) =
+        start_control_server(Arc::clone(&state), Arc::clone(&shutdown))?;
+
+    let mut listener_threads = Vec::new();
     for listener in listeners {
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("cannot configure listener: {error}"))?;
         let state = Arc::clone(&state);
-        thread::spawn(move || {
-            for accepted in listener.incoming() {
-                match accepted {
-                    Ok(stream) => {
-                        let state = Arc::clone(&state);
+        let shutdown = Arc::clone(&shutdown);
+        listener_threads.push(thread::spawn(move || {
+            while !shutdown.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        state.accepted_connections.fetch_add(1, Ordering::Relaxed);
+                        let connection_state = Arc::clone(&state);
+                        connection_state
+                            .active_connections
+                            .fetch_add(1, Ordering::AcqRel);
                         thread::spawn(move || {
-                            if let Err(error) = handle_connection(stream, state) {
+                            let _active = ActiveConnection {
+                                state: Arc::clone(&connection_state),
+                            };
+                            if let Err(error) =
+                                handle_connection(stream, Arc::clone(&connection_state))
+                            {
+                                connection_state
+                                    .rejected_connections
+                                    .fetch_add(1, Ordering::Relaxed);
                                 eprintln!("TLS proxy connection rejected: {error}");
                             }
                         });
                     }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
                     Err(error) => eprintln!("TLS proxy accept failed: {error}"),
                 }
             }
-        });
+        }));
     }
 
-    {
+    let reconciler_thread = {
         let state = Arc::clone(&state);
+        let shutdown = Arc::clone(&shutdown);
         thread::spawn(move || {
-            loop {
+            while !shutdown.load(Ordering::Acquire) {
                 thread::sleep(LIVENESS_INTERVAL);
                 reconcile_workloads(&state);
                 reconcile_routes(&state);
             }
-        });
+        })
+    };
+
+    while !shutdown.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(100));
+    }
+    for listener_thread in listener_threads {
+        let _ = listener_thread.join();
+    }
+    #[cfg(unix)]
+    let _ = control_thread.join();
+    let _ = reconciler_thread.join();
+
+    let drain_deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    while state.active_connections.load(Ordering::Acquire) > 0 && Instant::now() < drain_deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let remaining = state.active_connections.load(Ordering::Acquire);
+    if remaining > 0 {
+        eprintln!("TLS proxy shutdown drain timed out with {remaining} connection(s) still active");
     }
 
-    loop {
-        thread::park();
+    #[cfg(unix)]
+    if let Err(error) = std::fs::remove_file(&control_path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        eprintln!("Could not remove control socket: {error}");
     }
+    eprintln!("TLS proxy stopped");
+    Ok(())
 }
 
 fn bind_listener(address: &str) -> io::Result<TcpListener> {
@@ -274,6 +363,179 @@ fn bind_listener(address: &str) -> io::Result<TcpListener> {
     socket.bind(&address.into())?;
     socket.listen(1024)?;
     Ok(socket.into())
+}
+
+pub fn query_control(command: &str) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        let mut stream = UnixStream::connect(control_socket_path())
+            .map_err(|error| format!("TLS proxy daemon is not reachable: {error}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|error| format!("cannot configure control connection: {error}"))?;
+        stream
+            .write_all(format!("{command}\n").as_bytes())
+            .map_err(|error| format!("cannot send daemon command: {error}"))?;
+        stream
+            .shutdown(Shutdown::Write)
+            .map_err(|error| format!("cannot finish daemon command: {error}"))?;
+        let mut response = String::new();
+        stream
+            .take(64 * 1024)
+            .read_to_string(&mut response)
+            .map_err(|error| format!("cannot read daemon response: {error}"))?;
+        Ok(response)
+    }
+
+    #[cfg(not(unix))]
+    Err("live daemon status is not supported on this platform".to_string())
+}
+
+#[cfg(unix)]
+fn control_socket_path() -> PathBuf {
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime).join("phx-port").join("control.sock");
+    }
+    config_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("phx-port-runtime")
+        .join("control.sock")
+}
+
+#[cfg(unix)]
+fn start_control_server(
+    state: Arc<ProxyState>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(PathBuf, thread::JoinHandle<()>), String> {
+    let path = control_socket_path();
+    let directory = path
+        .parent()
+        .ok_or_else(|| "control socket has no parent directory".to_string())?;
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("cannot create control directory: {error}"))?;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("cannot secure control directory: {error}"))?;
+
+    if path.exists() {
+        if UnixStream::connect(&path).is_ok() {
+            return Err(format!(
+                "another TLS proxy daemon is already using {}",
+                path.display()
+            ));
+        }
+        std::fs::remove_file(&path)
+            .map_err(|error| format!("cannot remove stale control socket: {error}"))?;
+    }
+
+    let listener = UnixListener::bind(&path)
+        .map_err(|error| format!("cannot bind control socket {}: {error}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("cannot secure control socket: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("cannot configure control socket: {error}"))?;
+
+    let thread = thread::spawn(move || {
+        while !shutdown.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(2))) {
+                        let _ = writeln!(stream, "ERROR cannot configure request timeout: {error}");
+                        continue;
+                    }
+                    let mut request = String::new();
+                    let response = match (&mut stream).take(1024).read_to_string(&mut request) {
+                        Ok(_) => render_control_response(&state, &shutdown, request.trim()),
+                        Err(error) => format!("ERROR cannot read request: {error}\n"),
+                    };
+                    let _ = stream.write_all(response.as_bytes());
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => eprintln!("TLS proxy control accept failed: {error}"),
+            }
+        }
+    });
+
+    Ok((path, thread))
+}
+
+fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &str) -> String {
+    match request {
+        "STATUS" => {
+            let listeners = state
+                .listeners
+                .read()
+                .map(|listeners| {
+                    listeners
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let active_routes = state.routes.read().map(|routes| routes.len()).unwrap_or(0);
+            let conflicts = state
+                .conflicts
+                .read()
+                .map(|conflicts| conflicts.len())
+                .unwrap_or(0);
+            let discoveries = state
+                .flights
+                .lock()
+                .map(|flights| flights.len())
+                .unwrap_or(0);
+            let probes = state.probes.in_use.lock().map(|count| *count).unwrap_or(0);
+            format!(
+                "running\nlisteners={listeners}\nactive_routes={active_routes}\nconflicts={conflicts}\nactive_connections={}\nwaiting_clients={}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={}\nrelayed_connections={}\nrejected_connections={}\nsuccessful_discoveries={}\n",
+                state.active_connections.load(Ordering::Relaxed),
+                state.waiting_clients.load(Ordering::Relaxed),
+                state.accepted_connections.load(Ordering::Relaxed),
+                state.relayed_connections.load(Ordering::Relaxed),
+                state.rejected_connections.load(Ordering::Relaxed),
+                state.successful_discoveries.load(Ordering::Relaxed),
+            )
+        }
+        "ROUTES" => {
+            let mut lines = Vec::new();
+            if let Ok(routes) = state.routes.read() {
+                for (hostname, route) in routes.iter() {
+                    lines.push(format!(
+                        "active\t{hostname}\t{}\t{}\t{}\t{}",
+                        route.backend.project,
+                        route.backend.role,
+                        route.backend.port,
+                        route.certificate_fingerprint
+                    ));
+                }
+            }
+            if let Ok(conflicts) = state.conflicts.read() {
+                for (hostname, backends) in conflicts.iter() {
+                    let owners = backends
+                        .iter()
+                        .map(|backend| {
+                            format!("{}:{}:{}", backend.project, backend.role, backend.port)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    lines.push(format!("conflict\t{hostname}\t{owners}"));
+                }
+            }
+            lines.sort();
+            if lines.is_empty() {
+                "No active TLS routes.\n".to_string()
+            } else {
+                format!("{}\n", lines.join("\n"))
+            }
+        }
+        "STOP" => {
+            shutdown.store(true, Ordering::Release);
+            "stopping\n".to_string()
+        }
+        _ => "ERROR unknown command\n".to_string(),
+    }
 }
 
 fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<(), String> {
@@ -317,7 +579,11 @@ fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<()
         "Routing {hostname} to 127.0.0.1:{} ({} {})",
         backend.port, backend.project, backend.role
     );
-    relay(client, upstream, &buffered).map_err(|error| format!("relay failed: {error}"))
+    state.relayed_connections.fetch_add(1, Ordering::Relaxed);
+    match relay(client, upstream, &buffered) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(format!("relay failed: {error}")),
+    }
 }
 
 fn resolve_backend(hostname: &str, state: &ProxyState) -> Result<Backend, String> {
@@ -372,6 +638,7 @@ fn discover_backend(
     let backend = matched.backend.clone();
     clear_conflict(state, hostname);
     install_active_route(state, hostname, matched);
+    state.successful_discoveries.fetch_add(1, Ordering::Relaxed);
     eprintln!(
         "Discovered {hostname} at 127.0.0.1:{} ({} {})",
         backend.port, backend.project, backend.role
@@ -872,6 +1139,7 @@ mod tests {
         ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, ProbeLimiter, ProbeMatch,
         ProxyState, WaitingClient, bind_listener, cache_negative, clear_conflict,
         observe_workloads, prefer_https_per_project, reconcile_routes, record_conflict,
+        render_control_response,
     };
     use crate::{route_cache, update_config};
     use std::net::TcpListener;
@@ -1003,6 +1271,29 @@ mod tests {
 
         assert!(ipv6.local_addr().unwrap().is_ipv6());
         assert!(ipv4.local_addr().unwrap().is_ipv4());
+    }
+
+    #[test]
+    fn control_status_reports_state_and_stop_sets_shutdown() {
+        let directory = tempdir().unwrap();
+        let state = ProxyState::new(directory.path().join("ports.toml"));
+        state
+            .routes
+            .write()
+            .unwrap()
+            .insert("www.example.com".to_string(), active_route(backend()));
+        state.accepted_connections.store(7, Ordering::Relaxed);
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+
+        let status = render_control_response(&state, &shutdown, "STATUS");
+        assert!(status.contains("active_routes=1"));
+        assert!(status.contains("accepted_connections=7"));
+
+        assert_eq!(
+            render_control_response(&state, &shutdown, "STOP"),
+            "stopping\n"
+        );
+        assert!(shutdown.load(Ordering::Acquire));
     }
 
     #[test]

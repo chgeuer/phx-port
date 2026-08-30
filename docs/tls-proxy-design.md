@@ -176,16 +176,27 @@ hostname; `main` provides compatibility for projects that already use their
 default role for HTTPS. Matching roles in different projects still invoke the
 hostname-conflict policy.
 
-Additional inspection commands should include:
+The daemon exposes a current-user-only Unix control socket and supports:
 
 ```text
 phx-port proxy status
 phx-port proxy routes
+phx-port proxy stop
 ```
 
-The exact command names may be adjusted to remain consistent with the final
-CLI structure, but operators must be able to inspect active, inactive,
-conflicting, and cached routes.
+The socket is `$XDG_RUNTIME_DIR/phx-port/control.sock` when
+`XDG_RUNTIME_DIR` is set, and otherwise lives under a private
+`phx-port-runtime` directory beside the registry. The directory mode is
+`0700`; the socket mode is `0600`. Startup removes a stale socket but refuses
+to replace one whose daemon responds.
+
+`status` reports listener addresses, route and conflict counts, bounded
+discovery resource usage, and connection/discovery counters. `routes` returns
+the live active and conflicting route table while the daemon is reachable,
+then falls back to cached registry state for offline diagnostics. `stop`
+requests graceful shutdown: listeners and reconciliation stop accepting new
+work, existing relays receive up to 30 seconds to finish, and the control
+socket is removed.
 
 ## Workload discovery
 

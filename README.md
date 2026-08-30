@@ -131,17 +131,24 @@ original ClientHello is then relayed unchanged, so the backend remains the TLS
 endpoint and retains its own certificate and private key.
 
 Successful discoveries are cached in the registry as derived state and can be
-inspected with:
+inspected alongside live daemon health:
 
 ```bash
+phx-port proxy status
 phx-port proxy routes
+phx-port proxy stop
 ```
+
+`proxy routes` uses the daemon's live route table when it is running and falls
+back to persisted routes otherwise. The control socket is available only to the
+current user at `$XDG_RUNTIME_DIR/phx-port/control.sock`, or under the
+configuration directory when `XDG_RUNTIME_DIR` is unavailable.
 
 The daemon revalidates a persisted mapping before activating it in a new
 process. Newly active workloads that present a no-SNI default certificate are
 also discovered eagerly from their exact DNS SANs; strictly SNI-only workloads
-continue to use lazy discovery. Richer live status commands and the optional
-Linux socket-handoff fast path are described in
+continue to use lazy discovery. The optional Linux socket-handoff fast path is
+described in
 [`docs/tls-proxy-design.md`](docs/tls-proxy-design.md) and
 [`docs/socket-forwarding-design.md`](docs/socket-forwarding-design.md).
 

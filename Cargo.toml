@@ -13,6 +13,7 @@ panic = "abort"
 
 [dependencies]
 atomicwrites = "0.4"
+ctrlc = "3"
 fs2 = "0.4"
 native-tls = "0.2"
 sha2 = "0.10"
