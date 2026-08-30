@@ -22,7 +22,7 @@ defmodule PhxPortHandoff.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:rustler, ">= 0.36.1 and < 0.39.0"},
+      {:rustler, "~> 0.36.1"},
       {:thousand_island, "~> 1.4"}
     ]
   end

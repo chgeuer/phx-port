@@ -5,9 +5,11 @@ TCP sockets routed by `phx-port`. The application terminates TLS with its own
 certificate configuration, sees the client's real source address, and talks
 directly to the client without a byte relay.
 
-The integration requires Linux, Erlang/OTP 29 or later, Bandit, and Thousand
-Island. Applications without this package continue to use phx-port's generic
-TLS passthrough relay.
+The integration requires Linux, Erlang/OTP 29 or later, Rustler 0.36, Bandit,
+and Thousand Island. Applications without this package continue to use
+phx-port's generic TLS passthrough relay. Rustler 0.38 is not currently
+supported because end-to-end testing exposed incompatible imported-descriptor
+ownership behavior.
 
 ## Installation
 

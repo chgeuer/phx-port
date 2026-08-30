@@ -7,15 +7,18 @@ handoff-only second-server architecture described below.
 
 The version 1 wire codec, endpoint derivation, same-UID capability handshake,
 Rust `SCM_RIGHTS` sender, Rustler receiver, and Thousand Island TLS transport
-are implemented. A Phoenix endpoint has completed HTTP/1.1 and HTTP/2 requests
-with its production SNI certificate configuration over original port-443
-sockets. The daemon peeks without consuming the ClientHello, automatically
-attempts handoff at a derived `SOCK_SEQPACKET` endpoint, and falls back to its
-ordinary TLS relay only before a descriptor is delivered.
+are implemented. Two independently certificated Phoenix endpoints have
+completed HTTP/1.1 and HTTP/2 requests through dynamic SNI routing over
+original port-443 sockets. The daemon peeks without consuming the ClientHello,
+automatically attempts handoff at a derived `SOCK_SEQPACKET` endpoint, and
+falls back to its ordinary TLS relay only before a descriptor is delivered.
 
 Combining ordinary TCP and handed-off connections within one native accept
 broker remains future work. The current package runs an additional
-handoff-only Bandit supervisor beside the ordinary Phoenix endpoint.
+handoff-only Bandit supervisor beside the ordinary Phoenix endpoint. The
+tested receiver uses Rustler 0.36.2; Rustler 0.38 produced incompatible
+descriptor ownership behavior and is intentionally excluded pending a
+separate investigation.
 
 This design complements
 [`tls-proxy-design.md`](tls-proxy-design.md). The generic TLS proxy remains
@@ -291,11 +294,11 @@ listener.
 - A normal connection accepted from the TCP listener.
 - A connected descriptor received from phx-port over the handoff listener.
 
-The implementation uses a Rustler resource-backed native accept broker. A
-dedicated native worker uses Linux `epoll` to multiplex both listener sources
-without blocking normal BEAM schedulers and delivers accepted sockets to
-waiting Thousand Island acceptors. Elixir supervision owns the broker
-lifecycle.
+The future implementation would use a Rustler resource-backed native accept
+broker. A dedicated native worker would use Linux `epoll` to multiplex both
+listener sources without blocking normal BEAM schedulers and deliver accepted
+sockets to waiting Thousand Island acceptors. Elixir supervision would own the
+broker lifecycle.
 
 Multiple Thousand Island acceptors may invoke `accept/1` concurrently. The
 broker queues waiters and accepted sockets so each descriptor is delivered to

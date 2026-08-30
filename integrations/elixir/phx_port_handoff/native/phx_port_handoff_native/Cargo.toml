@@ -9,6 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 nix = { version = "0.30", features = ["fs", "socket", "uio", "user"] }
-rustler = "0.38"
+rustler = "0.36"
 
 [workspace]

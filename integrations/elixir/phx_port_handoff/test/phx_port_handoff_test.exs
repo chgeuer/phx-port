@@ -36,10 +36,11 @@ defmodule PhxPortHandoffTest do
       ])
 
     assert {:ok, broker} = Native.listen(path)
+    accept = Task.async(fn -> Native.accept(broker) end)
     assert is_reference(broker)
     assert {:error, message} = Native.listen(path)
     assert message =~ "already listening"
-    assert File.exists?(path)
+    assert {:error, :econnaborted} = Task.await(accept)
   end
 
   test "native broker replaces a stale endpoint" do

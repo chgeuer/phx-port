@@ -26,6 +26,7 @@ mod atoms {
     rustler::atoms! {
         ok,
         error,
+        econnaborted,
     }
 }
 
@@ -128,6 +129,9 @@ fn accept(
     let mut packet = [0_u8; MAX_PACKET_LENGTH + 1];
     let length = recv(control.as_raw_fd(), &mut packet, MsgFlags::empty())
         .map_err(|error| failure(format!("cannot receive handoff hello: {error}")))?;
+    if length == 0 {
+        return Err(Error::Term(Box::new(atoms::econnaborted())));
+    }
     parse_empty_message(&packet[..length], TYPE_HELLO)?;
     send(
         control.as_raw_fd(),
@@ -156,6 +160,9 @@ fn accept(
             .collect::<Vec<_>>();
         (message.bytes, descriptors)
     };
+    if packet_length == 0 {
+        return Err(Error::Term(Box::new(atoms::econnaborted())));
+    }
     if descriptors.len() != 1 {
         for descriptor in descriptors {
             drop(unsafe { OwnedFd::from_raw_fd(descriptor) });
