@@ -12,6 +12,8 @@ use toml_edit::{DocumentMut, value};
 
 #[cfg(test)]
 mod config_tests;
+mod handoff;
+mod handoff_protocol;
 mod proxy;
 mod route_cache;
 mod systemd_service;

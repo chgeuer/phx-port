@@ -2,7 +2,14 @@
 
 ## Status
 
-Exploratory design for an optional, cooperative Linux fast path.
+Implementation in progress for an optional, cooperative Linux fast path.
+
+The version 1 wire codec, endpoint derivation, same-UID capability handshake,
+and Rust `SCM_RIGHTS` sender are implemented. The daemon peeks without
+consuming the ClientHello, automatically attempts handoff at a derived
+`SOCK_SEQPACKET` endpoint, and falls back to its ordinary TLS relay only before
+a descriptor is delivered. The Rustler/Thousand Island receiving adapter
+remains to be implemented.
 
 This design complements
 [`tls-proxy-design.md`](tls-proxy-design.md). The generic TLS proxy remains
@@ -436,6 +443,27 @@ Conceptual responses:
 ADOPTED(connection_id)
 REJECTED(connection_id, reason_code)
 ```
+
+Version 1 uses a 40-byte fixed header followed by at most 253 bytes of UTF-8
+SNI. The complete `SOCK_SEQPACKET` packet is capped at 512 bytes:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 4 | Magic bytes `PHXP` |
+| 4 | 1 | Protocol version (`1`) |
+| 5 | 1 | Message type (`HELLO=1`, `READY=2`, `HANDOFF=3`, `ADOPTED=4`, `REJECTED=5`) |
+| 6 | 2 | Flags, zero in version 1 |
+| 8 | 16 | Connection identifier |
+| 24 | 4 | Peeked byte count, unsigned network byte order |
+| 28 | 8 | Sender monotonic timestamp in nanoseconds, unsigned network byte order |
+| 36 | 2 | Payload length, unsigned network byte order |
+| 38 | 2 | Rejection reason code, unsigned network byte order |
+| 40 | variable | UTF-8 SNI payload for `HANDOFF`; empty for every other message |
+
+`HELLO` and `READY` form the capability/version handshake and require every
+field after the message type to be zero. `ADOPTED` and `REJECTED` echo the
+request's connection identifier. `REJECTED` requires a nonzero reason code.
+All numeric fields use network byte order.
 
 The header does not contain TLS payload. The TLS bytes remain in the passed
 socket's kernel receive queue.

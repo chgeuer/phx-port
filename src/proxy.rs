@@ -1,4 +1,4 @@
-use crate::{config_path, is_port_open, read_config, route_cache, tls_client_hello};
+use crate::{config_path, handoff, is_port_open, read_config, route_cache, tls_client_hello};
 use native_tls::TlsConnector;
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -7,7 +7,7 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use x509_parser::extensions::GeneralName;
@@ -29,6 +29,7 @@ const LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 const TLS_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 const TCP_FAILURE_THRESHOLD: u8 = 3;
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct Backend {
@@ -150,6 +151,10 @@ struct ProxyState {
     relayed_connections: AtomicU64,
     rejected_connections: AtomicU64,
     successful_discoveries: AtomicU64,
+    handoff_attempts: AtomicU64,
+    successful_handoffs: AtomicU64,
+    handoff_fallbacks: AtomicU64,
+    delivered_handoff_failures: AtomicU64,
 }
 
 impl ProxyState {
@@ -169,6 +174,10 @@ impl ProxyState {
             relayed_connections: AtomicU64::new(0),
             rejected_connections: AtomicU64::new(0),
             successful_discoveries: AtomicU64::new(0),
+            handoff_attempts: AtomicU64::new(0),
+            successful_handoffs: AtomicU64::new(0),
+            handoff_fallbacks: AtomicU64::new(0),
+            delivered_handoff_failures: AtomicU64::new(0),
         }
     }
 
@@ -238,6 +247,7 @@ impl Drop for ActiveConnection {
 }
 
 pub fn run(listen_addresses: &[String]) -> Result<(), String> {
+    PROCESS_START.get_or_init(Instant::now);
     let state = Arc::new(ProxyState::new(config_path()));
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut listeners = Vec::new();
@@ -489,13 +499,17 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 .unwrap_or(0);
             let probes = state.probes.in_use.lock().map(|count| *count).unwrap_or(0);
             format!(
-                "running\nlisteners={listeners}\nactive_routes={active_routes}\nconflicts={conflicts}\nactive_connections={}\nwaiting_clients={}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={}\nrelayed_connections={}\nrejected_connections={}\nsuccessful_discoveries={}\n",
+                "running\nlisteners={listeners}\nactive_routes={active_routes}\nconflicts={conflicts}\nactive_connections={}\nwaiting_clients={}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={}\nrelayed_connections={}\nrejected_connections={}\nsuccessful_discoveries={}\nhandoff_attempts={}\nsuccessful_handoffs={}\nhandoff_fallbacks={}\ndelivered_handoff_failures={}\n",
                 state.active_connections.load(Ordering::Relaxed),
                 state.waiting_clients.load(Ordering::Relaxed),
                 state.accepted_connections.load(Ordering::Relaxed),
                 state.relayed_connections.load(Ordering::Relaxed),
                 state.rejected_connections.load(Ordering::Relaxed),
                 state.successful_discoveries.load(Ordering::Relaxed),
+                state.handoff_attempts.load(Ordering::Relaxed),
+                state.successful_handoffs.load(Ordering::Relaxed),
+                state.handoff_fallbacks.load(Ordering::Relaxed),
+                state.delivered_handoff_failures.load(Ordering::Relaxed),
             )
         }
         "ROUTES" => {
@@ -539,12 +553,19 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
 }
 
 fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<(), String> {
+    let accepted_at_ns = PROCESS_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64;
     client
         .set_read_timeout(Some(CLIENT_HELLO_TIMEOUT))
         .map_err(|error| format!("cannot set ClientHello timeout: {error}"))?;
-    let (hostname, buffered) =
-        tls_client_hello::read_sni(&mut client).map_err(|error| error.to_string())?;
-    client.set_read_timeout(None).ok();
+    let (hostname, peeked_length) = tls_client_hello::peek_sni(&client, CLIENT_HELLO_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    client
+        .set_read_timeout(None)
+        .map_err(|error| format!("cannot clear ClientHello timeout before handoff: {error}"))?;
 
     let cached = state
         .routes
@@ -553,28 +574,76 @@ fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<()
         .get(&hostname)
         .map(|route| route.backend.clone());
 
-    let (backend, upstream) = if let Some(backend) = cached {
-        match connect_backend(&backend) {
-            Ok(stream) => (backend, stream),
-            Err(_) => {
-                state
-                    .routes
-                    .write()
-                    .map_err(|_| "route table lock poisoned".to_string())?
-                    .remove(&hostname);
-                let backend = resolve_backend(&hostname, &state)?;
-                let upstream = connect_backend(&backend)
-                    .map_err(|error| format!("verified backend disappeared: {error}"))?;
-                (backend, upstream)
-            }
-        }
+    let mut backend = if let Some(backend) = cached.as_ref() {
+        backend.clone()
     } else {
-        let backend = resolve_backend(&hostname, &state)?;
-        let upstream = connect_backend(&backend)
-            .map_err(|error| format!("verified backend disappeared: {error}"))?;
-        (backend, upstream)
+        resolve_backend(&hostname, &state)?
     };
 
+    let mut connection_id = [0_u8; 16];
+    match getrandom::fill(&mut connection_id) {
+        Ok(()) => {
+            state.handoff_attempts.fetch_add(1, Ordering::Relaxed);
+            match handoff::try_transfer(
+                client,
+                &backend.project,
+                &backend.role,
+                &hostname,
+                peeked_length,
+                connection_id,
+                accepted_at_ns,
+            ) {
+                handoff::Outcome::Transferred => {
+                    state.successful_handoffs.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "Handed off {hostname} to {} ({})",
+                        backend.project, backend.role
+                    );
+                    return Ok(());
+                }
+                handoff::Outcome::Delivered(error) => {
+                    state
+                        .delivered_handoff_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(error);
+                }
+                handoff::Outcome::Unavailable(returned) => {
+                    state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    client = returned;
+                }
+            }
+        }
+        Err(error) => {
+            state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
+            eprintln!("TLS socket handoff unavailable: cannot create connection ID: {error}");
+        }
+    }
+
+    let upstream = match connect_backend(&backend) {
+        Ok(stream) => stream,
+        Err(_) if cached.is_some() => {
+            state
+                .routes
+                .write()
+                .map_err(|_| "route table lock poisoned".to_string())?
+                .remove(&hostname);
+            backend = resolve_backend(&hostname, &state)?;
+            connect_backend(&backend)
+                .map_err(|error| format!("verified backend disappeared: {error}"))?
+        }
+        Err(error) => return Err(format!("verified backend disappeared: {error}")),
+    };
+
+    let mut buffered = vec![0_u8; peeked_length];
+    client
+        .set_read_timeout(Some(CLIENT_HELLO_TIMEOUT))
+        .map_err(|error| format!("cannot restore ClientHello timeout: {error}"))?;
+    client
+        .read_exact(&mut buffered)
+        .map_err(|error| format!("cannot consume peeked ClientHello: {error}"))?;
+    client
+        .set_read_timeout(None)
+        .map_err(|error| format!("cannot clear ClientHello timeout: {error}"))?;
     eprintln!(
         "Routing {hostname} to 127.0.0.1:{} ({} {})",
         backend.port, backend.project, backend.role

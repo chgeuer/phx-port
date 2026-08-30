@@ -1,20 +1,31 @@
-use std::io::{self, Read};
+use std::io;
 use std::net::{IpAddr, TcpStream};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const MAX_CLIENT_HELLO: usize = 64 * 1024;
+const PEEK_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
 enum ParseResult {
     Incomplete,
     Complete(Option<String>),
 }
 
-pub fn read_sni(stream: &mut TcpStream) -> io::Result<(String, Vec<u8>)> {
-    let mut buffered = Vec::with_capacity(4096);
-    let mut chunk = [0_u8; 4096];
+pub fn peek_sni(stream: &TcpStream, timeout: Duration) -> io::Result<(String, usize)> {
+    let deadline = Instant::now() + timeout;
+    let mut buffered = vec![0_u8; MAX_CLIENT_HELLO];
+    let mut previous_length = 0;
 
     loop {
-        match parse_records(&buffered)? {
-            ParseResult::Complete(Some(hostname)) => return Ok((hostname, buffered)),
+        let length = stream.peek(&mut buffered)?;
+        if length == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before a complete TLS ClientHello",
+            ));
+        }
+        match parse_records(&buffered[..length])? {
+            ParseResult::Complete(Some(hostname)) => return Ok((hostname, length)),
             ParseResult::Complete(None) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -23,24 +34,22 @@ pub fn read_sni(stream: &mut TcpStream) -> io::Result<(String, Vec<u8>)> {
             }
             ParseResult::Incomplete => {}
         }
-
-        if buffered.len() >= MAX_CLIENT_HELLO {
+        if length >= MAX_CLIENT_HELLO {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "TLS ClientHello exceeds 64 KiB",
             ));
         }
-
-        let remaining = MAX_CLIENT_HELLO - buffered.len();
-        let read_len = remaining.min(chunk.len());
-        let read = stream.read(&mut chunk[..read_len])?;
-        if read == 0 {
+        if Instant::now() >= deadline {
             return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "connection closed before a complete TLS ClientHello",
+                io::ErrorKind::TimedOut,
+                "timed out waiting for a complete TLS ClientHello",
             ));
         }
-        buffered.extend_from_slice(&chunk[..read]);
+        if length == previous_length {
+            thread::sleep(PEEK_RETRY_INTERVAL);
+        }
+        previous_length = length;
     }
 }
 
@@ -198,7 +207,11 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParseResult, normalize_hostname, parse_records};
+    use super::{ParseResult, normalize_hostname, parse_records, peek_sni};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
 
     fn client_hello(hostname: Option<&str>) -> Vec<u8> {
         let mut body = vec![0x03, 0x03];
@@ -251,6 +264,27 @@ mod tests {
             ParseResult::Complete(Some(hostname)) => assert_eq!(hostname, "www.example.com"),
             _ => panic!("expected an SNI hostname"),
         }
+    }
+
+    #[test]
+    fn peeking_leaves_the_complete_client_hello_unconsumed() {
+        let input = client_hello(Some("www.contoso.com"));
+        let expected = input.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let writer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            stream.write_all(&input).unwrap();
+            let (mut accepted, _) = listener.accept().unwrap();
+            let (hostname, length) = peek_sni(&accepted, Duration::from_secs(1)).unwrap();
+            assert_eq!(hostname, "www.contoso.com");
+            assert_eq!(length, expected.len());
+
+            let mut received = vec![0; length];
+            accepted.read_exact(&mut received).unwrap();
+            assert_eq!(received, expected);
+        });
+
+        writer.join().unwrap();
     }
 
     #[test]
