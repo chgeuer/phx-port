@@ -1,5 +1,5 @@
 use std::io::{self, Read};
-use std::net::TcpStream;
+use std::net::{IpAddr, TcpStream};
 
 const MAX_CLIENT_HELLO: usize = 64 * 1024;
 
@@ -125,18 +125,38 @@ fn parse_server_name(extension: &[u8]) -> io::Result<ParseResult> {
         let name = list.take(name_len)?;
         if name_type == 0 {
             let hostname = std::str::from_utf8(name)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SNI is not UTF-8"))?
-                .trim_end_matches('.')
-                .to_ascii_lowercase();
-            if hostname.is_empty() || !hostname.is_ascii() || hostname.bytes().any(|byte| byte == 0)
-            {
-                return invalid("SNI hostname is invalid");
-            }
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SNI is not UTF-8"))?;
+            let hostname = normalize_hostname(hostname)?;
             return Ok(ParseResult::Complete(Some(hostname)));
         }
     }
 
     Ok(ParseResult::Complete(None))
+}
+
+pub fn normalize_hostname(hostname: &str) -> io::Result<String> {
+    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+    if hostname.is_empty()
+        || hostname.len() > 253
+        || !hostname.is_ascii()
+        || hostname.parse::<IpAddr>().is_ok()
+    {
+        return invalid("SNI hostname is invalid");
+    }
+
+    for label in hostname.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return invalid("SNI hostname is invalid");
+        }
+    }
+    Ok(hostname)
 }
 
 fn invalid<T>(message: &str) -> io::Result<T> {
@@ -178,7 +198,7 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParseResult, parse_records};
+    use super::{ParseResult, normalize_hostname, parse_records};
 
     fn client_hello(hostname: Option<&str>) -> Vec<u8> {
         let mut body = vec![0x03, 0x03];
@@ -249,5 +269,24 @@ mod tests {
             parse_records(&input[..input.len() - 1]).unwrap(),
             ParseResult::Incomplete
         ));
+    }
+
+    #[test]
+    fn normalizes_dns_names_and_rejects_non_dns_sni() {
+        assert_eq!(
+            normalize_hostname("WWW.Example.COM.").unwrap(),
+            "www.example.com"
+        );
+        for invalid in [
+            "",
+            "bad host.example",
+            "a/b.example",
+            "-bad.example",
+            "bad-.example",
+            "127.0.0.1",
+            "bad..example",
+        ] {
+            assert!(normalize_hostname(invalid).is_err(), "{invalid}");
+        }
     }
 }

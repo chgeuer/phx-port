@@ -138,8 +138,10 @@ phx-port proxy routes
 ```
 
 The daemon revalidates a persisted mapping before activating it in a new
-process. Eager default-certificate discovery, richer live status commands, and
-the optional Linux socket-handoff fast path are described in
+process. Newly active workloads that present a no-SNI default certificate are
+also discovered eagerly from their exact DNS SANs; strictly SNI-only workloads
+continue to use lazy discovery. Richer live status commands and the optional
+Linux socket-handoff fast path are described in
 [`docs/tls-proxy-design.md`](docs/tls-proxy-design.md) and
 [`docs/socket-forwarding-design.md`](docs/socket-forwarding-design.md).
 

@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+use x509_parser::extensions::GeneralName;
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(250);
@@ -239,6 +241,7 @@ pub fn run(listen_addresses: &[String]) -> Result<(), String> {
         thread::spawn(move || {
             loop {
                 thread::sleep(LIVENESS_INTERVAL);
+                reconcile_workloads(&state);
                 reconcile_routes(&state);
             }
         });
@@ -296,7 +299,7 @@ fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<()
 fn resolve_backend(hostname: &str, state: &ProxyState) -> Result<Backend, String> {
     let cached = route_cache::load(&state.config, hostname);
     let candidates = candidate_backends(&state.config, cached.as_ref());
-    invalidate_negative_cache_if_workloads_changed(state, &candidates);
+    observe_workloads(state, &candidates);
 
     {
         let mut negative = state
@@ -381,17 +384,114 @@ fn cache_negative(state: &ProxyState, hostname: &str) {
     }
 }
 
-fn invalidate_negative_cache_if_workloads_changed(state: &ProxyState, candidates: &[Backend]) {
+fn observe_workloads(state: &ProxyState, candidates: &[Backend]) -> Vec<Backend> {
     let mut snapshot = candidates.to_vec();
     snapshot.sort();
     if let Ok(mut workloads) = state.workloads.lock()
         && *workloads != snapshot
     {
+        let added = snapshot
+            .iter()
+            .filter(|backend| !workloads.contains(backend))
+            .cloned()
+            .collect();
         *workloads = snapshot;
         if let Ok(mut negative) = state.negative.lock() {
             negative.clear();
         }
+        return added;
     }
+    Vec::new()
+}
+
+fn reconcile_workloads(state: &ProxyState) {
+    let candidates = candidate_backends(&state.config, None);
+    let added = observe_workloads(state, &candidates);
+
+    for backend in added {
+        let names = match default_certificate_dns_names(state, &backend) {
+            Ok(names) => names,
+            Err(error) => {
+                eprintln!(
+                    "Eager TLS discovery unavailable at 127.0.0.1:{} ({} {}): {error}",
+                    backend.port, backend.project, backend.role
+                );
+                continue;
+            }
+        };
+
+        for hostname in names {
+            if state
+                .routes
+                .read()
+                .is_ok_and(|routes| routes.contains_key(&hostname))
+            {
+                continue;
+            }
+            let cached = route_cache::load(&state.config, &hostname);
+            let candidates = candidate_backends(&state.config, cached.as_ref());
+            let result = state.discover_once(&hostname, || {
+                discover_backend(&hostname, state, candidates, &state.config)
+            });
+            if let Err(error) = result {
+                eprintln!("Eager TLS discovery rejected {hostname}: {error}");
+            }
+        }
+    }
+}
+
+fn default_certificate_dns_names(
+    state: &ProxyState,
+    backend: &Backend,
+) -> Result<Vec<String>, String> {
+    let _permit = state
+        .probes
+        .acquire(Instant::now() + DISCOVERY_TIMEOUT)
+        .ok_or_else(|| "probe capacity unavailable".to_string())?;
+    let stream = connect_backend_with_timeout(backend, PROBE_TIMEOUT)
+        .map_err(|error| format!("TCP connection failed: {error}"))?;
+    let mut builder = TlsConnector::builder();
+    builder.use_sni(false);
+    builder.danger_accept_invalid_certs(true);
+    builder.danger_accept_invalid_hostnames(true);
+    let connector = builder
+        .build()
+        .map_err(|error| format!("cannot create TLS connector: {error}"))?;
+    let tls = connector
+        .connect("localhost", stream)
+        .map_err(|error| format!("no-SNI TLS handshake failed: {error}"))?;
+    let certificate = tls
+        .peer_certificate()
+        .map_err(|error| format!("cannot inspect default certificate: {error}"))?
+        .ok_or_else(|| "backend did not present a default certificate".to_string())?;
+    let der = certificate
+        .to_der()
+        .map_err(|error| format!("cannot encode default certificate: {error}"))?;
+    dns_names_from_certificate(&der)
+}
+
+fn dns_names_from_certificate(der: &[u8]) -> Result<Vec<String>, String> {
+    let (_, certificate) = X509Certificate::from_der(der)
+        .map_err(|error| format!("cannot parse default certificate: {error}"))?;
+    let san = certificate
+        .subject_alternative_name()
+        .map_err(|error| format!("cannot parse certificate SANs: {error}"))?
+        .ok_or_else(|| "default certificate has no Subject Alternative Name".to_string())?;
+
+    let mut names: Vec<String> = san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::DNSName(name) if !name.starts_with("*.") => {
+                tls_client_hello::normalize_hostname(name).ok()
+            }
+            _ => None,
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 fn reconcile_routes(state: &ProxyState) {
@@ -655,8 +755,7 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream, buffered: &[u8]) -> io:
 mod tests {
     use super::{
         ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, ProbeLimiter, ProxyState,
-        WaitingClient, cache_negative, invalidate_negative_cache_if_workloads_changed,
-        reconcile_routes,
+        WaitingClient, cache_negative, observe_workloads, reconcile_routes,
     };
     use crate::{route_cache, update_config};
     use std::net::TcpListener;
@@ -744,9 +843,24 @@ mod tests {
         cache_negative(&state, "www.example.com");
         assert!(!state.negative.lock().unwrap().is_empty());
 
-        invalidate_negative_cache_if_workloads_changed(&state, &[backend()]);
+        observe_workloads(&state, &[backend()]);
 
         assert!(state.negative.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn eager_discovery_extracts_exact_dns_sans_but_not_wildcards() {
+        let certificate = rcgen::generate_simple_self_signed(vec![
+            "www.example.com".to_string(),
+            "api.example.com".to_string(),
+            "*.example.com".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            super::dns_names_from_certificate(certificate.cert.der()).unwrap(),
+            ["api.example.com", "www.example.com"]
+        );
     }
 
     #[test]
