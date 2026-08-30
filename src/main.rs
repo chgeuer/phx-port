@@ -12,6 +12,8 @@ use toml_edit::{DocumentMut, value};
 
 #[cfg(test)]
 mod config_tests;
+#[cfg(test)]
+mod discover_tests;
 mod handoff;
 mod handoff_protocol;
 mod proxy;
@@ -707,10 +709,40 @@ struct RunningProject {
     dir: String,
     role: String,
     port: i64,
+    hostnames: Vec<String>,
 }
 
 fn get_running_projects(config: &Path) -> Vec<RunningProject> {
     let doc = read_config(config);
+    let mut hostnames_by_backend: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+
+    if let Some(routes) = doc.get("discovered_routes").and_then(|v| v.as_table()) {
+        for (hostname, route_value) in routes {
+            let Some(route) = route_value.as_table() else {
+                continue;
+            };
+            let Some(project) = route.get("project").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(role) = route.get("role").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if route
+                .get("certificate_fingerprint")
+                .and_then(|v| v.as_str())
+                .is_none()
+            {
+                continue;
+            }
+            if let Ok(hostname) = tls_client_hello::normalize_hostname(hostname) {
+                hostnames_by_backend
+                    .entry((project.to_string(), role.to_string()))
+                    .or_default()
+                    .insert(hostname);
+            }
+        }
+    }
+
     let table = match doc.get("ports").and_then(|v| v.as_table()) {
         Some(t) => t,
         None => return Vec::new(),
@@ -726,6 +758,11 @@ fn get_running_projects(config: &Path) -> Vec<RunningProject> {
                         dir: dir.to_string(),
                         role: role.to_string(),
                         port,
+                        hostnames: hostnames_by_backend
+                            .remove(&(dir.to_string(), role.to_string()))
+                            .map(BTreeSet::into_iter)
+                            .unwrap_or_default()
+                            .collect(),
                     });
                 }
             }
@@ -765,19 +802,28 @@ fn build_discover_html(projects: &[RunningProject]) -> String {
             let role_suffix = if p.role == DEFAULT_ROLE {
                 String::new()
             } else {
-                format!(" <span class=\"role\">({})</span>", p.role)
+                format!(" <span class=\"role\">({})</span>", escape_html(&p.role))
             };
+            items.push_str("    <li>");
             items.push_str(&format!(
-                "    <li><a href=\"http://localhost:{port}\">\
-                 <span class=\"port\">:{port}</span> \
-                 {name}{role}\
-                 <div class=\"dir\">{dir}</div>\
-                 </a></li>\n",
+                "<div class=\"project\"><strong>{name}{role}</strong>\
+                 <div class=\"dir\">{dir}</div></div>\
+                 <div class=\"links\">\
+                 <a class=\"endpoint local\" href=\"http://localhost:{port}\">\
+                 http://localhost:{port}</a>",
                 port = p.port,
-                name = name,
+                name = escape_html(name),
                 role = role_suffix,
-                dir = p.dir,
+                dir = escape_html(&p.dir),
             ));
+            for hostname in &p.hostnames {
+                let hostname = escape_html(hostname);
+                items.push_str(&format!(
+                    "<a class=\"endpoint tls\" href=\"https://{hostname}/\">\
+                     https://{hostname}/</a>"
+                ));
+            }
+            items.push_str("</div></li>\n");
         }
     }
 
@@ -791,11 +837,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
        background: #1a1a2e; color: #eee; padding: 2rem; min-height: 100vh; }
 h1 { font-size: 1.4rem; margin-bottom: 1.5rem; color: #e94560; }
 ul { list-style: none; }
-li { margin-bottom: 0.5rem; }
-a { display: block; padding: 0.75rem 1rem; background: #16213e; border-radius: 6px;
-    color: #eee; text-decoration: none; transition: background 0.2s; }
-a:hover { background: #0f3460; }
-.port { color: #e94560; font-weight: 600; margin-right: 0.5rem; }
+li { margin-bottom: 0.75rem; padding: 0.9rem 1rem; background: #16213e;
+     border-radius: 6px; }
+.project { margin-bottom: 0.65rem; }
+.links { display: flex; flex-wrap: wrap; gap: 0.45rem; }
+.endpoint { display: inline-block; padding: 0.45rem 0.65rem; background: #0f3460;
+            border-radius: 4px; color: #eee; text-decoration: none;
+            transition: background 0.2s; font-family: ui-monospace, monospace;
+            font-size: 0.85rem; }
+.endpoint:hover { background: #16518f; }
+.endpoint.tls { color: #9ee6b8; }
 .dir { color: #888; font-size: 0.85rem; margin-top: 0.25rem; }
 .role { color: #aaa; }
 .empty { color: #888; padding: 0.75rem 1rem; }
@@ -826,6 +877,15 @@ document.querySelectorAll('a').forEach(a => {
 </html>"#;
 
     template.replace("ITEMS_PLACEHOLDER", &items)
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn cmd_discover(config: &Path) {
@@ -983,6 +1043,7 @@ fn main() {
                     }
                 }
             }
+
             if listen_addresses.is_empty() {
                 listen_addresses.extend(["0.0.0.0:443".to_string(), "[::]:443".to_string()]);
             }

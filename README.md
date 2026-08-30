@@ -97,13 +97,13 @@ $ phx-port running
   http://localhost:4004   /home/user/projects/shop (debug)
 ```
 
-`phx-port discover` starts a temporary local web server on a random free port and opens your default browser with a page listing all running projects. Click any project to jump straight to it:
+`phx-port discover` starts a temporary local web server on a random free port and opens your default browser with a page listing all running projects. Each project shows its assigned localhost endpoint and any certificate-verified HTTPS hostnames discovered by the TLS daemon:
 
 <p align="center">
   <img src="docs/discover-screenshot.png" alt="phx-port discover — browser view of running projects" width="700">
 </p>
 
-The list is rebuilt on every page load, so projects that start or stop between refreshes are always reflected. Each link points directly to the target app (e.g. `http://localhost:4001`) — no redirect involved. When you click a link, the browser navigates there naturally while a background `sendBeacon('/shutdown')` call tells the discover server to exit.
+The list is rebuilt on every page load, so projects that start or stop between refreshes are always reflected. Links point directly to the target app (for example, `http://localhost:4001` and `https://www.contoso.com/`) — no redirect is involved. HTTPS links appear only when a persisted, certificate-verified route matches that live project's exact role. When you click a link, the browser navigates there naturally while a background `sendBeacon('/shutdown')` call tells the discover server to exit.
 
 On [Omarchy](https://omarchy.com), `phx-port discover` is registered as a desktop application called **Disco**, so you can launch it directly from the app launcher (<kbd>Super</kbd>+<kbd>Space</kbd>):
 
