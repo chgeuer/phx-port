@@ -4,7 +4,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,8 +13,11 @@ const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(250);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_PROBES: usize = 32;
+const MAX_WAITING_CLIENTS: usize = 64;
+const MAX_NEGATIVE_ROUTES: usize = 1024;
+const NEGATIVE_TTL: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct Backend {
     project: String,
     role: String,
@@ -25,10 +29,169 @@ struct ProbeMatch {
     certificate_fingerprint: String,
 }
 
-type Routes = Arc<RwLock<HashMap<String, Backend>>>;
+struct DiscoveryFlight {
+    result: Mutex<Option<Result<Backend, String>>>,
+    ready: Condvar,
+}
+
+impl DiscoveryFlight {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn complete(&self, result: Result<Backend, String>) {
+        if let Ok(mut slot) = self.result.lock() {
+            *slot = Some(result);
+            self.ready.notify_all();
+        }
+    }
+
+    fn wait(&self, deadline: Instant) -> Result<Backend, String> {
+        let mut slot = self
+            .result
+            .lock()
+            .map_err(|_| "discovery result lock poisoned".to_string())?;
+        loop {
+            if let Some(result) = slot.as_ref() {
+                return result.clone();
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err("hostname discovery timed out".to_string());
+            };
+            let (next, timeout) = self
+                .ready
+                .wait_timeout(slot, remaining)
+                .map_err(|_| "discovery result lock poisoned".to_string())?;
+            slot = next;
+            if timeout.timed_out() && slot.is_none() {
+                return Err("hostname discovery timed out".to_string());
+            }
+        }
+    }
+}
+
+struct ProbeLimiter {
+    in_use: Mutex<usize>,
+    available: Condvar,
+}
+
+impl ProbeLimiter {
+    fn new() -> Self {
+        Self {
+            in_use: Mutex::new(0),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self, deadline: Instant) -> Option<ProbePermit<'_>> {
+        let mut in_use = self.in_use.lock().ok()?;
+        while *in_use >= MAX_PROBES {
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            let (next, timeout) = self.available.wait_timeout(in_use, remaining).ok()?;
+            in_use = next;
+            if timeout.timed_out() && *in_use >= MAX_PROBES {
+                return None;
+            }
+        }
+        *in_use += 1;
+        Some(ProbePermit { limiter: self })
+    }
+}
+
+struct ProbePermit<'a> {
+    limiter: &'a ProbeLimiter,
+}
+
+impl Drop for ProbePermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut in_use) = self.limiter.in_use.lock() {
+            *in_use = in_use.saturating_sub(1);
+            self.limiter.available.notify_one();
+        }
+    }
+}
+
+struct ProxyState {
+    routes: RwLock<HashMap<String, Backend>>,
+    flights: Mutex<HashMap<String, Arc<DiscoveryFlight>>>,
+    negative: Mutex<HashMap<String, Instant>>,
+    workloads: Mutex<Vec<Backend>>,
+    waiting_clients: AtomicUsize,
+    probes: Arc<ProbeLimiter>,
+}
+
+impl ProxyState {
+    fn new() -> Self {
+        Self {
+            routes: RwLock::new(HashMap::new()),
+            flights: Mutex::new(HashMap::new()),
+            negative: Mutex::new(HashMap::new()),
+            workloads: Mutex::new(Vec::new()),
+            waiting_clients: AtomicUsize::new(0),
+            probes: Arc::new(ProbeLimiter::new()),
+        }
+    }
+
+    fn discover_once(
+        &self,
+        hostname: &str,
+        discover: impl FnOnce() -> Result<Backend, String>,
+    ) -> Result<Backend, String> {
+        let _waiting = WaitingClient::acquire(&self.waiting_clients)?;
+        let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+        let (flight, leader) = {
+            let mut flights = self
+                .flights
+                .lock()
+                .map_err(|_| "discovery map lock poisoned".to_string())?;
+            if let Some(flight) = flights.get(hostname) {
+                (Arc::clone(flight), false)
+            } else {
+                let flight = Arc::new(DiscoveryFlight::new());
+                flights.insert(hostname.to_string(), Arc::clone(&flight));
+                (flight, true)
+            }
+        };
+
+        if !leader {
+            return flight.wait(deadline);
+        }
+
+        let result = discover();
+        flight.complete(result.clone());
+        if let Ok(mut flights) = self.flights.lock() {
+            flights.remove(hostname);
+        }
+        result
+    }
+}
+
+struct WaitingClient<'a> {
+    count: &'a AtomicUsize,
+}
+
+impl<'a> WaitingClient<'a> {
+    fn acquire(count: &'a AtomicUsize) -> Result<Self, String> {
+        count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_WAITING_CLIENTS).then_some(current + 1)
+            })
+            .map_err(|_| "too many clients are waiting for hostname discovery".to_string())?;
+        Ok(Self { count })
+    }
+}
+
+impl Drop for WaitingClient<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub fn run(listen_addresses: &[String]) -> Result<(), String> {
-    let routes = Arc::new(RwLock::new(HashMap::new()));
+    let state = Arc::new(ProxyState::new());
     let mut listeners = Vec::new();
 
     for address in listen_addresses {
@@ -39,14 +202,14 @@ pub fn run(listen_addresses: &[String]) -> Result<(), String> {
     }
 
     for listener in listeners {
-        let routes = Arc::clone(&routes);
+        let state = Arc::clone(&state);
         thread::spawn(move || {
             for accepted in listener.incoming() {
                 match accepted {
                     Ok(stream) => {
-                        let routes = Arc::clone(&routes);
+                        let state = Arc::clone(&state);
                         thread::spawn(move || {
-                            if let Err(error) = handle_connection(stream, routes) {
+                            if let Err(error) = handle_connection(stream, state) {
                                 eprintln!("TLS proxy connection rejected: {error}");
                             }
                         });
@@ -62,7 +225,7 @@ pub fn run(listen_addresses: &[String]) -> Result<(), String> {
     }
 }
 
-fn handle_connection(mut client: TcpStream, routes: Routes) -> Result<(), String> {
+fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<(), String> {
     client
         .set_read_timeout(Some(CLIENT_HELLO_TIMEOUT))
         .map_err(|error| format!("cannot set ClientHello timeout: {error}"))?;
@@ -70,7 +233,8 @@ fn handle_connection(mut client: TcpStream, routes: Routes) -> Result<(), String
         tls_client_hello::read_sni(&mut client).map_err(|error| error.to_string())?;
     client.set_read_timeout(None).ok();
 
-    let cached = routes
+    let cached = state
+        .routes
         .read()
         .map_err(|_| "route table lock poisoned".to_string())?
         .get(&hostname)
@@ -80,15 +244,22 @@ fn handle_connection(mut client: TcpStream, routes: Routes) -> Result<(), String
         match connect_backend(&backend) {
             Ok(stream) => (backend, stream),
             Err(_) => {
-                routes
+                state
+                    .routes
                     .write()
                     .map_err(|_| "route table lock poisoned".to_string())?
                     .remove(&hostname);
-                discover_and_connect(&hostname, &routes)?
+                let backend = resolve_backend(&hostname, &state)?;
+                let upstream = connect_backend(&backend)
+                    .map_err(|error| format!("verified backend disappeared: {error}"))?;
+                (backend, upstream)
             }
         }
     } else {
-        discover_and_connect(&hostname, &routes)?
+        let backend = resolve_backend(&hostname, &state)?;
+        let upstream = connect_backend(&backend)
+            .map_err(|error| format!("verified backend disappeared: {error}"))?;
+        (backend, upstream)
     };
 
     eprintln!(
@@ -98,29 +269,57 @@ fn handle_connection(mut client: TcpStream, routes: Routes) -> Result<(), String
     relay(client, upstream, &buffered).map_err(|error| format!("relay failed: {error}"))
 }
 
-fn discover_and_connect(hostname: &str, routes: &Routes) -> Result<(Backend, TcpStream), String> {
+fn resolve_backend(hostname: &str, state: &ProxyState) -> Result<Backend, String> {
     let config = config_path();
     let cached = route_cache::load(&config, hostname);
     let candidates = candidate_backends(cached.as_ref());
-    let matches = probe_candidates(hostname, candidates);
+    invalidate_negative_cache_if_workloads_changed(state, &candidates);
+
+    {
+        let mut negative = state
+            .negative
+            .lock()
+            .map_err(|_| "negative route cache lock poisoned".to_string())?;
+        let now = Instant::now();
+        negative.retain(|_, expires_at| *expires_at > now);
+        if negative.contains_key(hostname) {
+            return Err(format!(
+                "no unique trusted backend was found recently for {hostname}"
+            ));
+        }
+    }
+
+    state.discover_once(hostname, || {
+        discover_backend(hostname, state, candidates, &config)
+    })
+}
+
+fn discover_backend(
+    hostname: &str,
+    state: &ProxyState,
+    candidates: Vec<Backend>,
+    config: &std::path::Path,
+) -> Result<Backend, String> {
+    let matches = probe_candidates(hostname, candidates, state);
 
     if matches.len() != 1 {
-        return Err(match matches.len() {
+        let error = match matches.len() {
             0 => format!("no active backend presents a trusted certificate for {hostname}"),
             count => format!("{count} active backends present trusted certificates for {hostname}"),
-        });
+        };
+        cache_negative(state, hostname);
+        return Err(error);
     }
 
     let matched = matches.into_iter().next().unwrap();
     let backend = matched.backend;
-    let upstream = connect_backend(&backend)
-        .map_err(|error| format!("verified backend disappeared before relay: {error}"))?;
-    routes
+    state
+        .routes
         .write()
         .map_err(|_| "route table lock poisoned".to_string())?
         .insert(hostname.to_string(), backend.clone());
     route_cache::store(
-        &config,
+        config,
         hostname,
         &backend.project,
         &backend.role,
@@ -130,7 +329,38 @@ fn discover_and_connect(hostname: &str, routes: &Routes) -> Result<(Backend, Tcp
         "Discovered {hostname} at 127.0.0.1:{} ({} {})",
         backend.port, backend.project, backend.role
     );
-    Ok((backend, upstream))
+    Ok(backend)
+}
+
+fn cache_negative(state: &ProxyState, hostname: &str) {
+    if let Ok(mut negative) = state.negative.lock() {
+        if negative.len() >= MAX_NEGATIVE_ROUTES {
+            let now = Instant::now();
+            negative.retain(|_, expires_at| *expires_at > now);
+            if negative.len() >= MAX_NEGATIVE_ROUTES
+                && let Some(oldest) = negative
+                    .iter()
+                    .min_by_key(|(_, expires_at)| **expires_at)
+                    .map(|(hostname, _)| hostname.clone())
+            {
+                negative.remove(&oldest);
+            }
+        }
+        negative.insert(hostname.to_string(), Instant::now() + NEGATIVE_TTL);
+    }
+}
+
+fn invalidate_negative_cache_if_workloads_changed(state: &ProxyState, candidates: &[Backend]) {
+    let mut snapshot = candidates.to_vec();
+    snapshot.sort();
+    if let Ok(mut workloads) = state.workloads.lock()
+        && *workloads != snapshot
+    {
+        *workloads = snapshot;
+        if let Ok(mut negative) = state.negative.lock() {
+            negative.clear();
+        }
+    }
 }
 
 fn candidate_backends(cached: Option<&route_cache::CachedRoute>) -> Vec<Backend> {
@@ -175,25 +405,35 @@ fn candidate_backends(cached: Option<&route_cache::CachedRoute>) -> Vec<Backend>
     candidates.into_iter().take(MAX_PROBES).collect()
 }
 
-fn probe_candidates(hostname: &str, candidates: Vec<Backend>) -> Vec<ProbeMatch> {
+fn probe_candidates(
+    hostname: &str,
+    candidates: Vec<Backend>,
+    state: &ProxyState,
+) -> Vec<ProbeMatch> {
     let (sender, receiver) = mpsc::channel();
     let deadline = Instant::now() + DISCOVERY_TIMEOUT;
 
     for backend in candidates {
         let sender = sender.clone();
         let hostname = hostname.to_string();
-        thread::spawn(move || match probe_backend(&hostname, &backend) {
-            Ok(certificate_fingerprint) => {
-                let _ = sender.send(ProbeMatch {
-                    backend,
-                    certificate_fingerprint,
-                });
-            }
-            Err(error) => {
-                eprintln!(
-                    "Probe rejected {hostname} at 127.0.0.1:{} ({} {}): {error}",
-                    backend.port, backend.project, backend.role
-                );
+        let probes = Arc::clone(&state.probes);
+        thread::spawn(move || {
+            let Some(_permit) = probes.acquire(deadline) else {
+                return;
+            };
+            match probe_backend(&hostname, &backend) {
+                Ok(certificate_fingerprint) => {
+                    let _ = sender.send(ProbeMatch {
+                        backend,
+                        certificate_fingerprint,
+                    });
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Probe rejected {hostname} at 127.0.0.1:{} ({} {}): {error}",
+                        backend.port, backend.project, backend.role
+                    );
+                }
             }
         });
     }
@@ -267,4 +507,87 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream, buffered: &[u8]) -> io:
     upstream_to_client?;
     client_to_upstream?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Backend, MAX_PROBES, MAX_WAITING_CLIENTS, ProbeLimiter, ProxyState, WaitingClient,
+        cache_negative, invalidate_negative_cache_if_workloads_changed,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn backend() -> Backend {
+        Backend {
+            project: "/project".to_string(),
+            role: "https".to_string(),
+            port: 4401,
+        }
+    }
+
+    #[test]
+    fn concurrent_requests_share_one_hostname_discovery() {
+        let state = Arc::new(ProxyState::new());
+        let barrier = Arc::new(Barrier::new(10));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut clients = Vec::new();
+
+        for _ in 0..10 {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            let calls = Arc::clone(&calls);
+            clients.push(thread::spawn(move || {
+                barrier.wait();
+                state
+                    .discover_once("www.example.com", || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(30));
+                        Ok(backend())
+                    })
+                    .unwrap()
+            }));
+        }
+
+        for client in clients {
+            assert_eq!(client.join().unwrap(), backend());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn waiting_client_limit_fails_closed() {
+        let count = AtomicUsize::new(MAX_WAITING_CLIENTS);
+        assert!(WaitingClient::acquire(&count).is_err());
+        assert_eq!(count.load(Ordering::SeqCst), MAX_WAITING_CLIENTS);
+    }
+
+    #[test]
+    fn probe_limiter_releases_capacity() {
+        let limiter = ProbeLimiter::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let permits: Vec<_> = (0..MAX_PROBES)
+            .map(|_| limiter.acquire(deadline).unwrap())
+            .collect();
+        assert!(
+            limiter
+                .acquire(Instant::now() + Duration::from_millis(1))
+                .is_none()
+        );
+        drop(permits);
+        assert!(limiter.acquire(deadline).is_some());
+    }
+
+    #[test]
+    fn workload_change_invalidates_negative_routes() {
+        let state = ProxyState::new();
+        cache_negative(&state, "www.example.com");
+        assert!(!state.negative.lock().unwrap().is_empty());
+
+        invalidate_negative_cache_if_workloads_changed(&state, &[backend()]);
+
+        assert!(state.negative.lock().unwrap().is_empty());
+    }
 }
