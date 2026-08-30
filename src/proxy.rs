@@ -1,6 +1,7 @@
 use crate::{config_path, is_port_open, read_config, route_cache, tls_client_hello};
 use native_tls::TlsConnector;
 use sha2::{Digest, Sha256};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -213,7 +214,7 @@ pub fn run(listen_addresses: &[String]) -> Result<(), String> {
     let mut listeners = Vec::new();
 
     for address in listen_addresses {
-        let listener = TcpListener::bind(address)
+        let listener = bind_listener(address)
             .map_err(|error| format!("cannot listen on {address}: {error}"))?;
         eprintln!("TLS proxy listening on {}", listener.local_addr().unwrap());
         listeners.push(listener);
@@ -252,6 +253,27 @@ pub fn run(listen_addresses: &[String]) -> Result<(), String> {
     loop {
         thread::park();
     }
+}
+
+fn bind_listener(address: &str) -> io::Result<TcpListener> {
+    let address: SocketAddr = address.parse().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid socket address: {error}"),
+        )
+    })?;
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    if address.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.bind(&address.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
 }
 
 fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<(), String> {
@@ -823,8 +845,8 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream, buffered: &[u8]) -> io:
 mod tests {
     use super::{
         ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, ProbeLimiter, ProxyState,
-        WaitingClient, cache_negative, clear_conflict, observe_workloads, reconcile_routes,
-        record_conflict,
+        WaitingClient, bind_listener, cache_negative, clear_conflict, observe_workloads,
+        reconcile_routes, record_conflict,
     };
     use crate::{route_cache, update_config};
     use std::net::TcpListener;
@@ -944,6 +966,18 @@ mod tests {
 
         clear_conflict(&state, "www.example.com");
         assert!(state.conflicts.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ipv6_listener_is_v6_only_so_ipv4_can_share_its_port() {
+        let Ok(ipv6) = bind_listener("[::]:0") else {
+            return;
+        };
+        let port = ipv6.local_addr().unwrap().port();
+        let ipv4 = bind_listener(&format!("0.0.0.0:{port}")).unwrap();
+
+        assert!(ipv6.local_addr().unwrap().is_ipv6());
+        assert!(ipv4.local_addr().unwrap().is_ipv4());
     }
 
     #[test]
