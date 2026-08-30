@@ -14,6 +14,7 @@ use toml_edit::{DocumentMut, value};
 mod config_tests;
 mod proxy;
 mod route_cache;
+mod systemd_service;
 mod tls_client_hello;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -40,6 +41,10 @@ USAGE:
     phx-port proxy status       Show live daemon state and counters
     phx-port proxy routes       Show persistently discovered TLS routes
     phx-port proxy stop         Gracefully stop the running daemon
+    phx-port proxy install-service
+                                Install and start the systemd user service
+    phx-port proxy uninstall-service
+                                Stop and remove the systemd user service
     phx-port open               Open default browser for the current directory's port
     phx-port open debug         Open browser for a named port role
     phx-port launch             Alias for 'open'
@@ -1003,8 +1008,24 @@ fn main() {
                     process::exit(1);
                 }
             },
+            Some("install-service") if args.len() == 2 => match systemd_service::install(&config) {
+                Ok(path) => println!("Installed and started {}", path.display()),
+                Err(error) => {
+                    eprintln!("Failed to install systemd user service: {error}");
+                    process::exit(1);
+                }
+            },
+            Some("uninstall-service") if args.len() == 2 => match systemd_service::uninstall() {
+                Ok(path) => println!("Stopped and removed {}", path.display()),
+                Err(error) => {
+                    eprintln!("Failed to uninstall systemd user service: {error}");
+                    process::exit(1);
+                }
+            },
             _ => {
-                eprintln!("Usage: phx-port proxy <status|routes|stop>");
+                eprintln!(
+                    "Usage: phx-port proxy <status|routes|stop|install-service|uninstall-service>"
+                );
                 process::exit(1);
             }
         },

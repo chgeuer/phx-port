@@ -151,6 +151,15 @@ restart policy, startup, logging, and supervision. On systems that do not
 permit an unprivileged process to bind port 443, startup fails with a clear
 privilege diagnostic rather than attempting privilege escalation.
 
+On Linux, `phx-port proxy install-service` writes the user unit under
+`$XDG_CONFIG_HOME/systemd/user` (falling back to
+`~/.config/systemd/user`), with absolute paths for both the current executable
+and registry. It then runs `systemctl --user daemon-reload` and
+`systemctl --user enable --now phx-port.service`. The unit uses
+`Restart=on-failure` and allows 35 seconds for the daemon's bounded shutdown
+drain. `phx-port proxy uninstall-service` disables and stops the service,
+removes the unit, and reloads the user manager.
+
 HTTPS workloads use a conventional named role:
 
 ```bash

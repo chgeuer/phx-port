@@ -137,12 +137,21 @@ inspected alongside live daemon health:
 phx-port proxy status
 phx-port proxy routes
 phx-port proxy stop
+phx-port proxy install-service
+phx-port proxy uninstall-service
 ```
 
 `proxy routes` uses the daemon's live route table when it is running and falls
 back to persisted routes otherwise. The control socket is available only to the
 current user at `$XDG_RUNTIME_DIR/phx-port/control.sock`, or under the
 configuration directory when `XDG_RUNTIME_DIR` is unavailable.
+
+On Linux, `install-service` writes
+`$XDG_CONFIG_HOME/systemd/user/phx-port.service` (or
+`~/.config/systemd/user/phx-port.service`), records absolute executable and
+registry paths, reloads the user manager, and enables and starts the service.
+The unit runs the daemon in the foreground with `Restart=on-failure`.
+`uninstall-service` disables and stops the service before removing the unit.
 
 The daemon revalidates a persisted mapping before activating it in a new
 process. Newly active workloads that present a no-SNI default certificate are
