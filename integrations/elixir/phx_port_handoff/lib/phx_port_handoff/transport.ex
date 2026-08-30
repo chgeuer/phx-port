@@ -96,7 +96,7 @@ defmodule PhxPortHandoff.Transport do
     :gen_tcp.close(socket)
   end
 
-  def close({_broker, _tls_options, _public_address}), do: :ok
+  def close({broker, _tls_options, _public_address}), do: Native.close_listener(broker)
   def close(socket), do: :ssl.close(socket)
 
   @impl true

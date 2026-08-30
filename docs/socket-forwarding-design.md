@@ -8,10 +8,12 @@ handoff-only second-server architecture described below.
 The version 1 wire codec, endpoint derivation, same-UID capability handshake,
 Rust `SCM_RIGHTS` sender, Rustler receiver, and Thousand Island TLS transport
 are implemented. Two independently certificated Phoenix endpoints have
-completed HTTP/1.1 and HTTP/2 requests through dynamic SNI routing over
-original port-443 sockets. The daemon peeks without consuming the ClientHello,
-automatically attempts handoff at a derived `SOCK_SEQPACKET` endpoint, and
-falls back to its ordinary TLS relay only before a descriptor is delivered.
+completed HTTP/1.1, HTTP/2, and LiveView WebSocket upgrades through dynamic SNI
+routing over original port-443 sockets. Concurrent cross-site requests and an
+in-VM handoff listener restart also complete without relay traffic. The daemon
+peeks without consuming the ClientHello, automatically attempts handoff at a
+derived `SOCK_SEQPACKET` endpoint, and falls back to its ordinary TLS relay only
+before a descriptor is delivered.
 
 Combining ordinary TCP and handed-off connections within one native accept
 broker remains future work. The current package runs an additional
@@ -269,9 +271,9 @@ to distinguish listener state, raw sockets, and negotiated TLS sockets.
 
 The implemented `PhxPortHandoff.Transport` is handoff-only. It uses the same
 raw and negotiated socket callbacks described below but creates only the
-protected Unix-domain handoff listener. Multiple acceptors serialize entry
-into the blocking native accept NIF so they do not exhaust the dirty I/O
-scheduler pool.
+protected Unix-domain handoff listener. Its child-spec helper configures one
+acceptor because entry into the blocking native accept NIF is serialized; this
+avoids exhausting the dirty I/O scheduler pool.
 
 ### Future `listen/2`
 
@@ -503,7 +505,9 @@ The fixed-length hash prevents collisions between repositories with the same
 basename, avoids exposing project names, and remains within Unix socket path
 limits. Before removing an existing path, the backend attempts to connect: a
 live receiver makes startup fail, while an unreachable entry is treated as
-stale and replaced.
+stale and replaced. The broker monitors the BEAM listener process that created
+it; listener exit shuts down the Unix listener, wakes a blocked native accept,
+and removes the endpoint before a supervisor restart can bind its replacement.
 
 When a `main` or `https` TLS workload becomes active, the daemon attempts a
 version handshake at the derived path. Connection refusal or a missing path
@@ -715,7 +719,8 @@ The original remote address remains the standard connection peer metadata.
 3. [x] Transfer untouched client sockets through the versioned PHXP protocol.
 4. [x] Prove TLS, HTTP/1.1, HTTP/2, peer-address preservation, and closure.
 5. [x] Add automatic handoff selection and safe pre-delivery relay fallback.
-6. [ ] Add LiveView/WebSocket, sustained concurrency, and lifecycle tests.
+6. [x] Prove LiveView WebSocket upgrade, concurrent cross-site traffic, and
+   in-VM listener restart.
 7. [ ] Replace serialized blocking accepts with a supervised native worker and
    queue if benchmarks show it is needed.
 8. [ ] Evaluate combining ordinary TCP and handoff acceptance in one hybrid

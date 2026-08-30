@@ -58,4 +58,43 @@ defmodule PhxPortHandoffTest do
     assert is_reference(broker)
     assert File.stat!(path).type == :other
   end
+
+  test "closing a broker unblocks its pending accept and removes the endpoint" do
+    path =
+      Path.join([
+        System.tmp_dir!(),
+        "phxp-#{System.unique_integer([:positive])}",
+        "handoff.sock"
+      ])
+
+    assert {:ok, broker} = Native.listen(path)
+    accept = Task.async(fn -> Native.accept(broker) end)
+    assert :ok = Native.close_listener(broker)
+    assert {:error, :closed} = Task.await(accept)
+    refute File.exists?(path)
+  end
+
+  test "listener owner exit closes the broker even while another process is accepting" do
+    path =
+      Path.join([
+        System.tmp_dir!(),
+        "phxp-#{System.unique_integer([:positive])}",
+        "handoff.sock"
+      ])
+
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, broker} = Native.listen(path)
+        send(parent, {:broker, broker})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:broker, broker}
+    accept = Task.async(fn -> Native.accept(broker) end)
+    Process.exit(owner, :kill)
+    assert {:error, :closed} = Task.await(accept)
+    refute File.exists?(path)
+  end
 end

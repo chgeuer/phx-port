@@ -58,7 +58,8 @@ $XDG_RUNTIME_DIR/phx-port/handoff/
 
 Use the same canonical project path and role that the workload registered with
 phx-port. The helper uses public port `443` in Bandit's connection metadata and
-does not bind TCP port 443 itself.
+does not bind TCP port 443 itself. It configures one Thousand Island acceptor
+because the current native receive path is deliberately serialized.
 
 ## Security and ownership
 
@@ -66,7 +67,9 @@ The native broker creates a `0600` `SOCK_SEQPACKET` endpoint in a `0700`
 directory, verifies the daemon with Linux `SO_PEERCRED`, accepts exactly one
 connected stream descriptor per handoff, and rejects duplicate connection
 identifiers. It refuses to unlink a live receiver endpoint but replaces a
-stale filesystem entry.
+stale filesystem entry. The broker monitors its owning Thousand Island
+listener process so supervisor shutdown wakes a blocked native accept and
+releases the endpoint before an in-VM restart.
 
 `phx-port` inspects ClientHello with `MSG_PEEK`; the backend's TLS stack still
 reads the original bytes and performs authoritative SNI certificate selection.
@@ -79,5 +82,5 @@ rather than falling back to relay.
 - The package starts a second, handoff-only Bandit supervisor. A future hybrid
   accept broker may combine direct TCP and handed-off accepts under one
   Thousand Island server.
-- Blocking native accepts are serialized to avoid exhausting dirty I/O
-  schedulers. A queued native worker is a future scalability improvement.
+- One blocking native accept is used to avoid exhausting dirty I/O schedulers.
+  A queued native worker is a future scalability improvement.

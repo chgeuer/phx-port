@@ -33,6 +33,7 @@ defmodule PhxPortHandoff do
       thousand_island_options
       |> Keyword.put(:transport_module, PhxPortHandoff.Transport)
       |> Keyword.put(:transport_options, [handoff_path: handoff_path] ++ transport_options)
+      |> Keyword.put(:num_acceptors, 1)
 
     options =
       tls_options

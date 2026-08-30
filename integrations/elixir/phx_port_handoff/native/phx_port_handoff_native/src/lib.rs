@@ -1,9 +1,9 @@
 use nix::sys::socket::{
-    AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, SockaddrStorage,
-    UnixAddr, accept4, bind, connect, getpeername, getsockopt, listen as socket_listen, recv,
-    recvmsg, send, setsockopt, socket, sockopt,
+    AddressFamily, Backlog, ControlMessageOwned, MsgFlags, Shutdown, SockFlag, SockType,
+    SockaddrStorage, UnixAddr, accept4, bind, connect, getpeername, getsockopt,
+    listen as socket_listen, recv, recvmsg, send, setsockopt, shutdown, socket, sockopt,
 };
-use rustler::{Atom, Error, NifResult, ResourceArc};
+use rustler::{Atom, Env, Error, LocalPid, Monitor, NifResult, ResourceArc};
 use std::collections::HashSet;
 use std::fs;
 use std::io::IoSliceMut;
@@ -11,6 +11,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAGIC: &[u8; 4] = b"PHXP";
 const VERSION: u8 = 1;
@@ -25,6 +26,7 @@ const TYPE_REJECTED: u8 = 5;
 mod atoms {
     rustler::atoms! {
         ok,
+        closed,
         error,
         econnaborted,
     }
@@ -33,15 +35,31 @@ mod atoms {
 struct Broker {
     listener: OwnedFd,
     path: PathBuf,
+    closed: AtomicBool,
     connection_ids: Mutex<HashSet<[u8; 16]>>,
 }
 
 #[rustler::resource_impl]
-impl rustler::Resource for Broker {}
+impl rustler::Resource for Broker {
+    const IMPLEMENTS_DOWN: bool = true;
+
+    fn down(&self, _env: Env<'_>, _pid: LocalPid, _monitor: Monitor) {
+        self.close();
+    }
+}
 
 impl Drop for Broker {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        self.close();
+    }
+}
+
+impl Broker {
+    fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let _ = shutdown(self.listener.as_raw_fd(), Shutdown::Both);
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -64,7 +82,7 @@ impl Drop for Receipt {
 }
 
 #[rustler::nif]
-fn listen(path: String) -> NifResult<(Atom, ResourceArc<Broker>)> {
+fn listen(env: Env<'_>, path: String) -> NifResult<(Atom, ResourceArc<Broker>)> {
     let path = PathBuf::from(path);
     let parent = path
         .parent()
@@ -100,22 +118,41 @@ fn listen(path: String) -> NifResult<(Atom, ResourceArc<Broker>)> {
     )
     .map_err(|error| failure(format!("cannot listen on handoff socket: {error}")))?;
 
-    Ok((
-        atoms::ok(),
-        ResourceArc::new(Broker {
-            listener,
-            path,
-            connection_ids: Mutex::new(HashSet::new()),
-        }),
-    ))
+    let broker = ResourceArc::new(Broker {
+        listener,
+        path,
+        closed: AtomicBool::new(false),
+        connection_ids: Mutex::new(HashSet::new()),
+    });
+    env.monitor(&broker, &env.pid())
+        .ok_or_else(|| failure("cannot monitor handoff listener owner"))?;
+    Ok((atoms::ok(), broker))
+}
+
+#[rustler::nif]
+fn close_listener(broker: ResourceArc<Broker>) -> NifResult<Atom> {
+    broker.close();
+    Ok(atoms::ok())
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn accept(
     broker: ResourceArc<Broker>,
 ) -> NifResult<(Atom, ResourceArc<Receipt>, i32, String, u32)> {
-    let control = accept4(broker.listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC)
-        .map_err(|error| failure(format!("cannot accept handoff connection: {error}")))?;
+    if broker.closed.load(Ordering::Acquire) {
+        return Err(Error::Term(Box::new(atoms::closed())));
+    }
+    let control = match accept4(broker.listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC) {
+        Ok(control) => control,
+        Err(_) if broker.closed.load(Ordering::Acquire) => {
+            return Err(Error::Term(Box::new(atoms::closed())));
+        }
+        Err(error) => {
+            return Err(failure(format!(
+                "cannot accept handoff connection: {error}"
+            )));
+        }
+    };
     let control = unsafe { OwnedFd::from_raw_fd(control) };
     let credentials = getsockopt(&control, sockopt::PeerCredentials)
         .map_err(|error| failure(format!("cannot inspect handoff peer: {error}")))?;
