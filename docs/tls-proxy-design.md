@@ -39,8 +39,9 @@ The design is not specific to Elixir, Phoenix, Bandit, or HTTP.
 3. Backends use HTTPS and retain ownership of their certificates and private
    keys.
 4. The daemon discovers when registered HTTPS workloads start and stop.
-5. The daemon eagerly discovers hostnames from each new workload's default
-   certificate when that workload supports a TLS handshake without SNI.
+5. The daemon eagerly discovers hostnames from each new `https` workload's
+   default certificate when that workload supports a TLS handshake without
+   SNI.
 6. When a client requests an unknown SNI hostname, the daemon probes all
    active HTTPS workloads using that hostname as SNI.
 7. A hostname is routed only when exactly one backend presents a valid,
@@ -179,11 +180,13 @@ https: [
 ]
 ```
 
-The initial implementation probes both `https` and `main` roles for TLS.
-`https` is preferred when both roles in one project validly serve the same
-hostname; `main` provides compatibility for projects that already use their
-default role for HTTPS. Matching roles in different projects still invoke the
-hostname-conflict policy.
+Lazy discovery probes both `https` and `main` roles for TLS. `https` is
+preferred when both roles in one project validly serve the same hostname;
+`main` provides compatibility for projects that already use their default role
+for HTTPS. Eager no-SNI discovery is restricted to `https`, avoiding
+speculative TLS traffic and warnings on ordinary clear-HTTP `main` listeners.
+Matching roles in different projects still invoke the hostname-conflict
+policy.
 
 The daemon exposes a current-user-only Unix control socket and supports:
 
@@ -236,10 +239,11 @@ arbitrary network destinations.
 
 ## Eager hostname discovery
 
-When an HTTPS workload becomes ready, the daemon attempts to connect without
-SNI and examine the default certificate presented by that workload. This is
-opportunistic: strictly SNI-only servers may reject that handshake, in which
-case the workload remains discoverable through the lazy path.
+When an explicit `https` workload becomes ready, the daemon attempts to connect
+without SNI and examine the default certificate presented by that workload.
+This is opportunistic: strictly SNI-only servers may reject that handshake, in
+which case the workload remains discoverable through the lazy path. Workloads
+serving HTTPS through the compatibility `main` role also use lazy discovery.
 
 Every exact DNS Subject Alternative Name (SAN) in the certificate becomes a
 candidate. The daemon then performs an SNI-specific TLS probe for each
@@ -365,10 +369,13 @@ snapshot of the selected route:
 - Existing connections continue until either endpoint closes.
 - Workload restart does not forcibly terminate unrelated connections.
 
-TLS revalidation uses the known hostname as SNI, allowing the daemon to detect
-certificate expiration, hostname removal, or certificate rotation without
-performing a full handshake every second. Rotated certificates are served
-immediately by the backend because phx-port does not terminate TLS.
+TLS revalidation first probes only the incumbent using the known hostname as
+SNI, allowing the daemon to detect certificate expiration, hostname removal,
+or certificate rotation without generating TLS traffic against unrelated
+clear-HTTP workloads. A failed incumbent triggers full candidate fan-out for
+failover. Newly added explicit `https` workloads are checked for conflicts
+through eager discovery. Rotated certificates are served immediately by the
+backend because phx-port does not terminate TLS.
 
 ## Conflicts
 
@@ -520,7 +527,7 @@ to the correct backend.
 
 `phx-port` will become a dynamic, framework-independent SNI passthrough proxy.
 Applications continue to terminate TLS on stable, loopback-bound HTTPS ports.
-The daemon discovers default certificate names eagerly and discovers
+The daemon discovers explicit `https` default certificate names eagerly and discovers
 non-default certificate names lazily by probing every active backend with the
 unknown hostname as SNI. Verified routes are cached as derived state and are
 activated only while their workloads remain healthy.

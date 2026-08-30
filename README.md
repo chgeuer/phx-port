@@ -154,9 +154,11 @@ The unit runs the daemon in the foreground with `Restart=on-failure`.
 `uninstall-service` disables and stops the service before removing the unit.
 
 The daemon revalidates a persisted mapping before activating it in a new
-process. Newly active workloads that present a no-SNI default certificate are
-also discovered eagerly from their exact DNS SANs; strictly SNI-only workloads
-continue to use lazy discovery.
+process. Newly active `https` workloads that present a no-SNI default
+certificate are also discovered eagerly from their exact DNS SANs; strictly
+SNI-only workloads and HTTPS servers using the compatibility `main` role
+continue to use lazy discovery. This avoids sending speculative TLS handshakes
+to ordinary clear-HTTP `main` listeners.
 
 On Linux, the daemon also checks the route's derived `SOCK_SEQPACKET` endpoint
 for a version-compatible, same-user socket-handoff receiver. When present, it

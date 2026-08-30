@@ -778,6 +778,9 @@ fn reconcile_workloads(state: &ProxyState) {
     let added = observe_workloads(state, &candidates);
 
     for backend in added {
+        if !supports_eager_discovery(&backend) {
+            continue;
+        }
         let names = match default_certificate_dns_names(state, &backend) {
             Ok(names) => names,
             Err(error) => {
@@ -813,6 +816,10 @@ fn reconcile_workloads(state: &ProxyState) {
             }
         }
     }
+}
+
+fn supports_eager_discovery(backend: &Backend) -> bool {
+    backend.role == "https"
 }
 
 fn default_certificate_dns_names(
@@ -902,31 +909,33 @@ fn reconcile_routes(state: &ProxyState) {
 }
 
 fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRoute) {
-    let cached = route_cache::load(&state.config, hostname);
-    let candidates = candidate_backends(&state.config, cached.as_ref());
-    let mut matches = probe_candidates(hostname, candidates, state);
-
-    if let Some(index) = matches
-        .iter()
-        .position(|matched| matched.backend == incumbent.backend)
+    if let Some(_permit) = state.probes.acquire(Instant::now() + DISCOVERY_TIMEOUT)
+        && let Ok(certificate_fingerprint) = probe_backend(hostname, &incumbent.backend)
     {
-        let matched = matches.swap_remove(index);
-        if matches.is_empty() {
-            clear_conflict(state, hostname);
-        } else {
-            let mut owners = vec![matched.backend.clone()];
-            owners.extend(matches.into_iter().map(|contender| contender.backend));
-            record_conflict(state, hostname, owners);
-        }
-        if matched.certificate_fingerprint != incumbent.certificate_fingerprint {
+        clear_conflict(state, hostname);
+        if certificate_fingerprint != incumbent.certificate_fingerprint {
             eprintln!(
                 "Observed certificate rotation for {hostname} at 127.0.0.1:{}",
                 incumbent.backend.port
             );
         }
-        install_active_route(state, hostname, matched);
+        install_active_route(
+            state,
+            hostname,
+            ProbeMatch {
+                backend: incumbent.backend.clone(),
+                certificate_fingerprint,
+            },
+        );
         return;
     }
+
+    let cached = route_cache::load(&state.config, hostname);
+    let candidates = candidate_backends(&state.config, cached.as_ref())
+        .into_iter()
+        .filter(|backend| backend != &incumbent.backend)
+        .collect();
+    let mut matches = probe_candidates(hostname, candidates, state);
 
     match matches.len() {
         0 => {
@@ -1208,7 +1217,7 @@ mod tests {
         ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, ProbeLimiter, ProbeMatch,
         ProxyState, WaitingClient, bind_listener, cache_negative, clear_conflict,
         observe_workloads, prefer_https_per_project, reconcile_routes, record_conflict,
-        render_control_response,
+        render_control_response, supports_eager_discovery,
     };
     use crate::{route_cache, update_config};
     use std::net::TcpListener;
@@ -1378,6 +1387,15 @@ mod tests {
             super::dns_names_from_certificate(certificate.cert.der()).unwrap(),
             ["api.example.com", "www.example.com"]
         );
+    }
+
+    #[test]
+    fn eager_discovery_never_probes_compatibility_main_ports() {
+        let mut main = backend();
+        main.role = "main".to_string();
+
+        assert!(!supports_eager_discovery(&main));
+        assert!(supports_eager_discovery(&backend()));
     }
 
     #[test]
