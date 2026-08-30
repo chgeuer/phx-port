@@ -131,6 +131,7 @@ impl Drop for ProbePermit<'_> {
 struct ProxyState {
     config: PathBuf,
     routes: RwLock<HashMap<String, ActiveRoute>>,
+    conflicts: RwLock<HashMap<String, Vec<Backend>>>,
     flights: Mutex<HashMap<String, Arc<DiscoveryFlight>>>,
     negative: Mutex<HashMap<String, Instant>>,
     workloads: Mutex<Vec<Backend>>,
@@ -143,6 +144,7 @@ impl ProxyState {
         Self {
             config,
             routes: RwLock::new(HashMap::new()),
+            conflicts: RwLock::new(HashMap::new()),
             flights: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
             workloads: Mutex::new(Vec::new()),
@@ -315,20 +317,27 @@ fn resolve_backend(hostname: &str, state: &ProxyState) -> Result<Backend, String
         }
     }
 
-    state.discover_once(hostname, || {
-        discover_backend(hostname, state, candidates, &state.config)
-    })
+    state.discover_once(hostname, || discover_backend(hostname, state, candidates))
 }
 
 fn discover_backend(
     hostname: &str,
     state: &ProxyState,
     candidates: Vec<Backend>,
-    config: &Path,
 ) -> Result<Backend, String> {
     let matches = probe_candidates(hostname, candidates, state);
 
     if matches.len() != 1 {
+        if matches.len() > 1 {
+            record_conflict(
+                state,
+                hostname,
+                matches
+                    .iter()
+                    .map(|matched| matched.backend.clone())
+                    .collect(),
+            );
+        }
         let error = match matches.len() {
             0 => format!("no active backend presents a trusted certificate for {hostname}"),
             count => format!("{count} active backends present trusted certificates for {hostname}"),
@@ -338,27 +347,9 @@ fn discover_backend(
     }
 
     let matched = matches.into_iter().next().unwrap();
-    let backend = matched.backend;
-    state
-        .routes
-        .write()
-        .map_err(|_| "route table lock poisoned".to_string())?
-        .insert(
-            hostname.to_string(),
-            ActiveRoute {
-                backend: backend.clone(),
-                certificate_fingerprint: matched.certificate_fingerprint.clone(),
-                last_tls_check: Instant::now(),
-                tcp_failures: 0,
-            },
-        );
-    route_cache::store(
-        config,
-        hostname,
-        &backend.project,
-        &backend.role,
-        &matched.certificate_fingerprint,
-    );
+    let backend = matched.backend.clone();
+    clear_conflict(state, hostname);
+    install_active_route(state, hostname, matched);
     eprintln!(
         "Discovered {hostname} at 127.0.0.1:{} ({} {})",
         backend.port, backend.project, backend.role
@@ -381,6 +372,26 @@ fn cache_negative(state: &ProxyState, hostname: &str) {
             }
         }
         negative.insert(hostname.to_string(), Instant::now() + NEGATIVE_TTL);
+    }
+}
+
+fn record_conflict(state: &ProxyState, hostname: &str, mut backends: Vec<Backend>) {
+    backends.sort();
+    backends.dedup();
+    if let Ok(mut conflicts) = state.conflicts.write() {
+        conflicts.insert(hostname.to_string(), backends.clone());
+    }
+    let owners = backends
+        .iter()
+        .map(|backend| format!("{} {}:{}", backend.project, backend.role, backend.port))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!("TLS route conflict for {hostname}: {owners}");
+}
+
+fn clear_conflict(state: &ProxyState, hostname: &str) {
+    if let Ok(mut conflicts) = state.conflicts.write() {
+        conflicts.remove(hostname);
     }
 }
 
@@ -421,18 +432,24 @@ fn reconcile_workloads(state: &ProxyState) {
         };
 
         for hostname in names {
-            if state
+            let incumbent = state
                 .routes
                 .read()
-                .is_ok_and(|routes| routes.contains_key(&hostname))
-            {
+                .ok()
+                .and_then(|routes| routes.get(&hostname).cloned());
+            if let Some(incumbent) = incumbent {
+                if incumbent.backend != backend
+                    && let Some(_permit) = state.probes.acquire(Instant::now() + DISCOVERY_TIMEOUT)
+                    && probe_backend(&hostname, &backend).is_ok()
+                {
+                    record_conflict(state, &hostname, vec![incumbent.backend, backend.clone()]);
+                }
                 continue;
             }
             let cached = route_cache::load(&state.config, &hostname);
             let candidates = candidate_backends(&state.config, cached.as_ref());
-            let result = state.discover_once(&hostname, || {
-                discover_backend(&hostname, state, candidates, &state.config)
-            });
+            let result =
+                state.discover_once(&hostname, || discover_backend(&hostname, state, candidates));
             if let Err(error) = result {
                 eprintln!("Eager TLS discovery rejected {hostname}: {error}");
             }
@@ -517,45 +534,96 @@ fn reconcile_routes(state: &ProxyState) {
         let recovered = route.tcp_failures > 0;
         let tls_due = route.last_tls_check.elapsed() >= TLS_REVALIDATION_INTERVAL;
         if recovered || tls_due {
-            let Some(_permit) = state.probes.acquire(Instant::now() + DISCOVERY_TIMEOUT) else {
-                continue;
-            };
-            match probe_backend(&hostname, &route.backend) {
-                Ok(fingerprint) => {
-                    if fingerprint != route.certificate_fingerprint {
-                        eprintln!(
-                            "Observed certificate rotation for {hostname} at 127.0.0.1:{}",
-                            route.backend.port
-                        );
-                    }
-                    if let Ok(mut routes) = state.routes.write()
-                        && let Some(active) = routes.get_mut(&hostname)
-                    {
-                        active.tcp_failures = 0;
-                        active.last_tls_check = Instant::now();
-                        active.certificate_fingerprint = fingerprint.clone();
-                    }
-                    route_cache::store(
-                        &state.config,
-                        &hostname,
-                        &route.backend.project,
-                        &route.backend.role,
-                        &fingerprint,
-                    );
-                }
-                Err(error) => {
-                    eprintln!(
-                        "Deactivating TLS route {hostname} after certificate revalidation failed: {error}"
-                    );
-                    deactivate_route(state, &hostname, false, "TLS revalidation failed");
-                }
-            }
+            revalidate_hostname(state, &hostname, &route);
         } else if let Ok(mut routes) = state.routes.write()
             && let Some(active) = routes.get_mut(&hostname)
         {
             active.tcp_failures = 0;
         }
     }
+}
+
+fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRoute) {
+    let cached = route_cache::load(&state.config, hostname);
+    let candidates = candidate_backends(&state.config, cached.as_ref());
+    let mut matches = probe_candidates(hostname, candidates, state);
+
+    if let Some(index) = matches
+        .iter()
+        .position(|matched| matched.backend == incumbent.backend)
+    {
+        let matched = matches.swap_remove(index);
+        if matches.is_empty() {
+            clear_conflict(state, hostname);
+        } else {
+            let mut owners = vec![matched.backend.clone()];
+            owners.extend(matches.into_iter().map(|contender| contender.backend));
+            record_conflict(state, hostname, owners);
+        }
+        if matched.certificate_fingerprint != incumbent.certificate_fingerprint {
+            eprintln!(
+                "Observed certificate rotation for {hostname} at 127.0.0.1:{}",
+                incumbent.backend.port
+            );
+        }
+        install_active_route(state, hostname, matched);
+        return;
+    }
+
+    match matches.len() {
+        0 => {
+            clear_conflict(state, hostname);
+            deactivate_route(state, hostname, false, "TLS revalidation failed");
+        }
+        1 => {
+            clear_conflict(state, hostname);
+            let replacement = matches.pop().unwrap();
+            eprintln!(
+                "Moving TLS route {hostname} from {} {}:{} to {} {}:{} after revalidation",
+                incumbent.backend.project,
+                incumbent.backend.role,
+                incumbent.backend.port,
+                replacement.backend.project,
+                replacement.backend.role,
+                replacement.backend.port
+            );
+            install_active_route(state, hostname, replacement);
+        }
+        _ => {
+            record_conflict(
+                state,
+                hostname,
+                matches.into_iter().map(|matched| matched.backend).collect(),
+            );
+            deactivate_route(
+                state,
+                hostname,
+                false,
+                "incumbent is invalid and multiple contenders remain",
+            );
+        }
+    }
+}
+
+fn install_active_route(state: &ProxyState, hostname: &str, matched: ProbeMatch) {
+    if let Ok(mut routes) = state.routes.write() {
+        routes.insert(
+            hostname.to_string(),
+            ActiveRoute {
+                backend: matched.backend.clone(),
+                certificate_fingerprint: matched.certificate_fingerprint.clone(),
+                last_tls_check: Instant::now(),
+                tcp_failures: 0,
+            },
+        );
+    }
+    route_cache::store(
+        &state.config,
+        hostname,
+        &matched.backend.project,
+        &matched.backend.role,
+        &matched.certificate_fingerprint,
+    );
 }
 
 fn registration_matches(config: &Path, backend: &Backend) -> bool {
@@ -755,7 +823,8 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream, buffered: &[u8]) -> io:
 mod tests {
     use super::{
         ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, ProbeLimiter, ProxyState,
-        WaitingClient, cache_negative, observe_workloads, reconcile_routes,
+        WaitingClient, cache_negative, clear_conflict, observe_workloads, reconcile_routes,
+        record_conflict,
     };
     use crate::{route_cache, update_config};
     use std::net::TcpListener;
@@ -846,6 +915,35 @@ mod tests {
         observe_workloads(&state, &[backend()]);
 
         assert!(state.negative.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn conflicts_are_recorded_deterministically_and_can_be_cleared() {
+        let directory = tempdir().unwrap();
+        let state = ProxyState::new(directory.path().join("ports.toml"));
+        let mut contender = backend();
+        contender.project = "/contender".to_string();
+        contender.port = 4402;
+
+        record_conflict(
+            &state,
+            "www.example.com",
+            vec![contender.clone(), backend(), contender],
+        );
+
+        let conflicts = state.conflicts.read().unwrap();
+        let mut expected = vec![backend(), {
+            let mut contender = backend();
+            contender.project = "/contender".to_string();
+            contender.port = 4402;
+            contender
+        }];
+        expected.sort();
+        assert_eq!(conflicts["www.example.com"], expected);
+        drop(conflicts);
+
+        clear_conflict(&state, "www.example.com");
+        assert!(state.conflicts.read().unwrap().is_empty());
     }
 
     #[test]
