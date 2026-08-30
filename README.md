@@ -111,6 +111,31 @@ On [Omarchy](https://omarchy.com), `phx-port discover` is registered as a deskto
   <img src="docs/omarchy-super-space.png" alt="Launching Disco from the Omarchy app launcher" width="550">
 </p>
 
+### TLS/SNI proxy
+
+The experimental daemon routes TLS connections to live registered workloads
+without terminating TLS or reading their private keys:
+
+```bash
+# Workload
+HTTPS_PORT="$(phx-port https)" my-https-server
+
+# Foreground proxy; repeat --listen for additional addresses
+phx-port daemon --listen 0.0.0.0:443 --listen '[::]:443'
+```
+
+For an unknown SNI hostname, `phx-port` probes active `https` and `main`
+workloads over loopback using that exact hostname. It routes only when exactly
+one backend completes a system-trusted, hostname-valid TLS handshake. The
+original ClientHello is then relayed unchanged, so the backend remains the TLS
+endpoint and retains its own certificate and private key.
+
+The current first implementation keeps successful routes in memory. Persistent
+route caching, eager default-certificate discovery, route inspection commands,
+and the optional Linux socket-handoff fast path are described in
+[`docs/tls-proxy-design.md`](docs/tls-proxy-design.md) and
+[`docs/socket-forwarding-design.md`](docs/socket-forwarding-design.md).
+
 ### Managing registrations
 
 ```bash

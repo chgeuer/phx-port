@@ -8,6 +8,9 @@ use std::process;
 use std::time::{Duration, Instant};
 use toml_edit::{DocumentMut, value};
 
+mod proxy;
+mod tls_client_hello;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_ROLE: &str = "main";
 
@@ -27,6 +30,8 @@ USAGE:
     phx-port delete <X> debug   Remove a specific port role
     phx-port running            Show which registered projects are currently running
     phx-port discover           Open a browser page to pick a running project
+    phx-port daemon [--listen ADDRESS]...
+                                Route TLS by SNI to live https/main workloads
     phx-port open               Open default browser for the current directory's port
     phx-port open debug         Open browser for a named port role
     phx-port launch             Alias for 'open'
@@ -47,7 +52,9 @@ fn home_dir() -> PathBuf {
         if let (Ok(drive), Ok(path)) = (env::var("HOMEDRIVE"), env::var("HOMEPATH")) {
             return PathBuf::from(format!("{}{}", drive, path));
         }
-        eprintln!("Error: could not determine home directory (USERPROFILE or HOMEDRIVE+HOMEPATH not set)");
+        eprintln!(
+            "Error: could not determine home directory (USERPROFILE or HOMEDRIVE+HOMEPATH not set)"
+        );
         process::exit(1);
     }
     #[cfg(not(target_family = "windows"))]
@@ -60,14 +67,14 @@ fn home_dir() -> PathBuf {
     }
 }
 
-fn config_path() -> PathBuf {
+pub(crate) fn config_path() -> PathBuf {
     if let Ok(custom) = env::var("PHX_PORT_CONFIG") {
         return PathBuf::from(custom);
     }
     home_dir().join(".config").join("phx-ports.toml")
 }
 
-fn read_config(path: &PathBuf) -> DocumentMut {
+pub(crate) fn read_config(path: &PathBuf) -> DocumentMut {
     let mut doc = if path.exists() {
         let content = fs::read_to_string(path).unwrap_or_else(|e| {
             eprintln!("Error reading {}: {}", path.display(), e);
@@ -254,7 +261,13 @@ struct TreeLine {
     name_end: usize,
 }
 
-fn collect_tree_lines(node: &TreeNode, prefix: &str, depth: usize, as_url: bool, lines: &mut Vec<TreeLine>) {
+fn collect_tree_lines(
+    node: &TreeNode,
+    prefix: &str,
+    depth: usize,
+    as_url: bool,
+    lines: &mut Vec<TreeLine>,
+) {
     let children: Vec<(&String, &TreeNode)> = node.children.iter().collect();
     for (i, (name, child)) in children.iter().enumerate() {
         let is_last = i == children.len() - 1;
@@ -334,7 +347,11 @@ fn cmd_list_tree(config: &PathBuf, as_url: bool) {
 
     if render_node.children.is_empty() {
         if !render_node.ports.is_empty() {
-            println!("{} .. {}", display_root, format_ports(&render_node.ports, as_url));
+            println!(
+                "{} .. {}",
+                display_root,
+                format_ports(&render_node.ports, as_url)
+            );
         }
         return;
     }
@@ -355,7 +372,13 @@ fn cmd_list_tree(config: &PathBuf, as_url: bool) {
         match &line.port_info {
             Some(ports) => {
                 let dots = target.saturating_sub(line.name_end).max(2);
-                println!("{}{} {} {}", line.prefix, line.name, ".".repeat(dots), ports);
+                println!(
+                    "{}{} {} {}",
+                    line.prefix,
+                    line.name,
+                    ".".repeat(dots),
+                    ports
+                );
             }
             None => {
                 println!("{}{}", line.prefix, line.name);
@@ -456,7 +479,10 @@ fn cmd_delete(config: &PathBuf, arg: &str, role: Option<&str>) {
             }
         }
         if let Some((dir, found_role)) = found {
-            doc["ports"][&dir].as_table_mut().unwrap().remove(&found_role);
+            doc["ports"][&dir]
+                .as_table_mut()
+                .unwrap()
+                .remove(&found_role);
             if doc["ports"][&dir].as_table().is_none_or(|t| t.is_empty()) {
                 doc["ports"].as_table_mut().unwrap().remove(&dir);
             }
@@ -612,7 +638,7 @@ fn cmd_open(config: &PathBuf, role: &str) {
     }
 }
 
-fn is_port_open(port: i64) -> bool {
+pub(crate) fn is_port_open(port: i64) -> bool {
     let addr: SocketAddr = ([127, 0, 0, 1], port as u16).into();
     TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok()
 }
@@ -877,6 +903,33 @@ fn main() {
         }
         Some("discover") => {
             cmd_discover(&config);
+        }
+        Some("daemon") => {
+            let mut listen_addresses = Vec::new();
+            let mut index = 1;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--listen" => {
+                        let Some(address) = args.get(index + 1) else {
+                            eprintln!("Usage: phx-port daemon [--listen ADDRESS]...");
+                            process::exit(1);
+                        };
+                        listen_addresses.push(address.clone());
+                        index += 2;
+                    }
+                    other => {
+                        eprintln!("Unknown argument for 'daemon': {}", other);
+                        process::exit(1);
+                    }
+                }
+            }
+            if listen_addresses.is_empty() {
+                listen_addresses.extend(["0.0.0.0:443".to_string(), "[::]:443".to_string()]);
+            }
+            if let Err(error) = proxy::run(&listen_addresses) {
+                eprintln!("Failed to start TLS proxy: {error}");
+                process::exit(1);
+            }
         }
         Some(other) if other.starts_with('-') => {
             eprintln!("Unknown option: {}", other);

@@ -12,4 +12,5 @@ strip = true
 panic = "abort"
 
 [dependencies]
+native-tls = "0.2"
 toml_edit = "0.22"
