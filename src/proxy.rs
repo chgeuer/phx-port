@@ -2,7 +2,7 @@ use crate::{config_path, is_port_open, read_config, route_cache, tls_client_hell
 use native_tls::TlsConnector;
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -698,7 +698,7 @@ fn deactivate_route(state: &ProxyState, hostname: &str, remove_cached: bool, rea
 
 fn candidate_backends(config: &Path, cached: Option<&route_cache::CachedRoute>) -> Vec<Backend> {
     let document = read_config(config);
-    let mut by_project = BTreeMap::<String, Backend>::new();
+    let mut candidates = Vec::new();
 
     if let Some(projects) = document.get("ports").and_then(|value| value.as_table()) {
         for (project, roles) in projects {
@@ -721,12 +721,17 @@ fn candidate_backends(config: &Path, cached: Option<&route_cache::CachedRoute>) 
                     role: role.to_string(),
                     port,
                 };
-                by_project.entry(project.to_string()).or_insert(candidate);
+                candidates.push(candidate);
             }
         }
     }
 
-    let mut candidates: Vec<_> = by_project.into_values().collect();
+    candidates.sort_by(|left, right| {
+        left.project
+            .cmp(&right.project)
+            .then_with(|| (left.role != "https").cmp(&(right.role != "https")))
+            .then_with(|| left.port.cmp(&right.port))
+    });
     if let Some(cached) = cached
         && let Some(index) = candidates
             .iter()
@@ -778,7 +783,27 @@ fn probe_candidates(
             Err(mpsc::RecvTimeoutError::Disconnected | mpsc::RecvTimeoutError::Timeout) => break,
         }
     }
-    matches
+    prefer_https_per_project(matches)
+}
+
+fn prefer_https_per_project(matches: Vec<ProbeMatch>) -> Vec<ProbeMatch> {
+    let mut by_project = HashMap::<String, ProbeMatch>::new();
+    for matched in matches {
+        by_project
+            .entry(matched.backend.project.clone())
+            .and_modify(|current| {
+                if matched.backend.role == "https" && current.backend.role != "https" {
+                    *current = ProbeMatch {
+                        backend: matched.backend.clone(),
+                        certificate_fingerprint: matched.certificate_fingerprint.clone(),
+                    };
+                }
+            })
+            .or_insert(matched);
+    }
+    let mut preferred: Vec<_> = by_project.into_values().collect();
+    preferred.sort_by(|left, right| left.backend.cmp(&right.backend));
+    preferred
 }
 
 fn probe_backend(hostname: &str, backend: &Backend) -> Result<String, String> {
@@ -844,9 +869,9 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream, buffered: &[u8]) -> io:
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, ProbeLimiter, ProxyState,
-        WaitingClient, bind_listener, cache_negative, clear_conflict, observe_workloads,
-        reconcile_routes, record_conflict,
+        ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, ProbeLimiter, ProbeMatch,
+        ProxyState, WaitingClient, bind_listener, cache_negative, clear_conflict,
+        observe_workloads, prefer_https_per_project, reconcile_routes, record_conflict,
     };
     use crate::{route_cache, update_config};
     use std::net::TcpListener;
@@ -992,6 +1017,42 @@ mod tests {
         assert_eq!(
             super::dns_names_from_certificate(certificate.cert.der()).unwrap(),
             ["api.example.com", "www.example.com"]
+        );
+    }
+
+    #[test]
+    fn https_is_preferred_only_after_both_project_roles_validate() {
+        let mut main_backend = backend();
+        main_backend.role = "main".to_string();
+        let main = ProbeMatch {
+            backend: main_backend,
+            certificate_fingerprint: "MAIN".to_string(),
+        };
+        let mut https_backend = backend();
+        https_backend.role = "https".to_string();
+        https_backend.port = 4402;
+        let https = ProbeMatch {
+            backend: https_backend.clone(),
+            certificate_fingerprint: "HTTPS".to_string(),
+        };
+        let mut other_backend = backend();
+        other_backend.project = "/other".to_string();
+        other_backend.port = 4403;
+        let other = ProbeMatch {
+            backend: other_backend.clone(),
+            certificate_fingerprint: "OTHER".to_string(),
+        };
+
+        let preferred = prefer_https_per_project(vec![main, other, https]);
+
+        assert_eq!(preferred.len(), 2);
+        assert!(preferred.iter().any(|matched| {
+            matched.backend == https_backend && matched.certificate_fingerprint == "HTTPS"
+        }));
+        assert!(
+            preferred
+                .iter()
+                .any(|matched| matched.backend == other_backend)
         );
     }
 
