@@ -1,0 +1,14 @@
+[package]
+name = "phx_port_handoff_native"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "phx_port_handoff_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+nix = { version = "0.30", features = ["fs", "socket", "uio", "user"] }
+rustler = "0.38"
+
+[workspace]

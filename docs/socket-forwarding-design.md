@@ -2,14 +2,20 @@
 
 ## Status
 
-Implementation in progress for an optional, cooperative Linux fast path.
+The optional, cooperative Linux fast path is implemented through the
+handoff-only second-server architecture described below.
 
 The version 1 wire codec, endpoint derivation, same-UID capability handshake,
-and Rust `SCM_RIGHTS` sender are implemented. The daemon peeks without
-consuming the ClientHello, automatically attempts handoff at a derived
-`SOCK_SEQPACKET` endpoint, and falls back to its ordinary TLS relay only before
-a descriptor is delivered. The Rustler/Thousand Island receiving adapter
-remains to be implemented.
+Rust `SCM_RIGHTS` sender, Rustler receiver, and Thousand Island TLS transport
+are implemented. A Phoenix endpoint has completed HTTP/1.1 and HTTP/2 requests
+with its production SNI certificate configuration over original port-443
+sockets. The daemon peeks without consuming the ClientHello, automatically
+attempts handoff at a derived `SOCK_SEQPACKET` endpoint, and falls back to its
+ordinary TLS relay only before a descriptor is delivered.
+
+Combining ordinary TCP and handed-off connections within one native accept
+broker remains future work. The current package runs an additional
+handoff-only Bandit supervisor beside the ordinary Phoenix endpoint.
 
 This design complements
 [`tls-proxy-design.md`](tls-proxy-design.md). The generic TLS proxy remains
@@ -113,28 +119,26 @@ The backend uses a custom `ThousandIsland.Transport` implementation that
 accepts connections from two sources:
 
 ```text
-                              ordinary TCP accept
-Client ---------------------> backend :4001 ---------+
-                                                     |
-Client ---> phx-port :443 ---> SCM_RIGHTS over UDS --+--> hybrid transport
-                                                            |
-                                                            v
-                                             ThousandIsland.Connection
-                                                            |
-                                                            v
-                                                   server-side TLS
-                                                            |
-                                                            v
-                                                  Bandit.InitialHandler
-                                                            |
-                                                            v
-                                                   Phoenix endpoint
+Client ---------------------> ordinary endpoint :4001
+                                      |
+                                      +------> Phoenix endpoint Plug
+                                      |
+Client ---> phx-port :443 ---> handoff-only Bandit
+                                      |
+                                      v
+                           ThousandIsland.Connection
+                                      |
+                                      v
+                              server-side TLS
+                                      |
+                                      v
+                              Phoenix endpoint Plug
 ```
 
-Both paths produce a raw connected TCP socket. The custom transport passes that
-socket into the standard Thousand Island connection process. Its `handshake/1`
-callback upgrades the raw socket to TLS with the same server options in both
-cases.
+The ordinary endpoint uses Bandit's standard TLS transport. The handoff-only
+server imports a raw connected TCP descriptor and passes it into the standard
+Thousand Island connection process. Its `handshake/1` callback upgrades the
+raw socket to TLS with the same server options as the ordinary endpoint.
 
 The result is an ordinary Bandit connection after the transport handshake.
 Bandit's HTTP/1.1, HTTP/2, WebSocket, Plug, and Phoenix behavior does not need a
@@ -197,7 +201,8 @@ The backend transport:
 1. Accepts the Unix-domain control connection.
 2. Reads the versioned handoff header and receives the FD with `recvmsg(2)`.
 3. Validates the message and peer credentials.
-4. Wraps the descriptor as an Erlang `:socket` socket.
+4. Wraps the descriptor as an Erlang `:gen_tcp` socket with
+   `:gen_tcp.fdopen/2`.
 5. Returns a tagged raw socket from its `accept/1` callback.
 6. Allows Thousand Island to start the normal connection process.
 7. Transfers socket ownership to that connection process through the
@@ -248,9 +253,9 @@ calling the internal `ThousandIsland.Connection` module directly. That keeps
 connection limits, supervision, telemetry, shutdown behavior, and future
 Thousand Island changes centralized.
 
-## Hybrid transport
+## Future hybrid transport
 
-The conceptual backend module is:
+The future conceptual backend module is:
 
 ```text
 PhxPort.ThousandIsland.HandoffTransport
@@ -259,7 +264,13 @@ PhxPort.ThousandIsland.HandoffTransport
 It implements every `ThousandIsland.Transport` callback and uses tagged values
 to distinguish listener state, raw sockets, and negotiated TLS sockets.
 
-### `listen/2`
+The implemented `PhxPortHandoff.Transport` is handoff-only. It uses the same
+raw and negotiated socket callbacks described below but creates only the
+protected Unix-domain handoff listener. Multiple acceptors serialize entry
+into the blocking native accept NIF so they do not exhaust the dirty I/O
+scheduler pool.
+
+### Future `listen/2`
 
 `listen/2` receives the assigned backend port and the TLS transport options. It
 creates:
@@ -273,7 +284,7 @@ but TLS-only options such as certificates, SNI callbacks, ALPN, and cipher
 configuration are retained for `handshake/1` rather than passed to the TCP
 listener.
 
-### `accept/1`
+### Future `accept/1`
 
 `accept/1` waits for either:
 
@@ -318,9 +329,8 @@ case :ssl.handshake(raw_socket, tls_options, handshake_timeout) do
 end
 ```
 
-OTP 29 defines the server-side handshake socket as either a
-`:gen_tcp` socket or a `:socket` socket, making an FD wrapped with
-`:socket.open/2` suitable for this upgrade path.
+OTP 29 accepts a `:gen_tcp` socket in the server-side handshake, making an FD
+wrapped with `:gen_tcp.fdopen/2` suitable for this upgrade path.
 
 The initial adapter supports OTP 29. Support for earlier releases is added only
 after the complete handoff path passes compatibility testing on those releases.
@@ -379,18 +389,19 @@ https: [
 ]
 ```
 
-The adapter derives its handoff socket from the canonical project path and
-role rather than accepting a configured certificate or socket path.
+`PhxPortHandoff.bandit_child_spec/4` derives its handoff socket from the
+canonical project path and role, preserves the endpoint's existing nested
+Thousand Island TLS options, and installs the handoff transport. It does not
+accept certificate paths separately.
 
-The final Phoenix configuration shape must be verified against how
-`Phoenix.Endpoint` passes adapter options to Bandit. The implementation should
-provide a small integration package or helper rather than require each
-application to reconstruct low-level Bandit options.
+For SNI-only configurations, the transport calls the configured `sni_fun` with
+the informational requested hostname to seed the base `certs_keys` required by
+OTP before handshake. The callback remains installed and selects the
+authoritative certificate from the untouched ClientHello.
 
 ## Alternative prototype: two server instances
 
-The multiplexing hybrid transport is the target design. A lower-risk prototype
-can use two server instances:
+The implemented package uses two server instances:
 
 1. The ordinary Phoenix HTTPS endpoint listens on its assigned TCP port.
 2. A second Bandit instance uses a handoff-only transport and the same Phoenix
@@ -399,7 +410,7 @@ can use two server instances:
 Both instances run the same Bandit handlers and application endpoint, but they
 have separate Thousand Island listener and connection supervisors.
 
-This prototype proves:
+This architecture proves:
 
 - FD reception and wrapping.
 - Socket ownership transfer.
@@ -408,8 +419,8 @@ This prototype proves:
 - HTTP/1.1, HTTP/2, LiveView, and WebSocket operation.
 - Correct close behavior.
 
-Once proven, the ordinary and handoff accept paths can be combined in the
-hybrid transport.
+The ordinary and handoff accept paths may later be combined in a hybrid
+transport if sharing one connection limit and accept queue proves worthwhile.
 
 ## Handoff protocol
 
@@ -487,7 +498,9 @@ $XDG_RUNTIME_DIR/phx-port/handoff/<sha256(project-path NUL role)>.sock
 
 The fixed-length hash prevents collisions between repositories with the same
 basename, avoids exposing project names, and remains within Unix socket path
-limits. The backend atomically removes a stale node before binding.
+limits. Before removing an existing path, the backend attempts to connect: a
+live receiver makes startup fail, while an unreachable entry is treated as
+stale and replaced.
 
 When a `main` or `https` TLS workload becomes active, the daemon attempts a
 version handshake at the derived path. Connection refusal or a missing path
@@ -692,18 +705,19 @@ The original remote address remains the standard connection peer metadata.
 - Compare descriptor counts before and after sustained load to detect leaks.
 - Compare latency and CPU utilization with generic TCP relay.
 
-## Delivery plan
+## Delivery status
 
-1. Build a minimal handoff-only Thousand Island transport.
-2. Start a second Bandit instance using the Phoenix endpoint as its Plug.
-3. Transfer one untouched client socket from a small Rust sender.
-4. Prove TLS, HTTP/1.1, peer-address preservation, and correct closure.
-5. Add HTTP/2, WebSocket, concurrency, and failure tests.
-6. Implement the versioned handoff protocol and derived endpoint convention.
-7. Add optional handoff selection and relay fallback to the phx-port daemon.
-8. Combine ordinary TCP and handoff acceptance into the hybrid transport.
-9. Benchmark and harden before enabling handoff by default for capable
-   backends.
+1. [x] Build a handoff-only Thousand Island transport.
+2. [x] Start a second Bandit instance using the Phoenix endpoint as its Plug.
+3. [x] Transfer untouched client sockets through the versioned PHXP protocol.
+4. [x] Prove TLS, HTTP/1.1, HTTP/2, peer-address preservation, and closure.
+5. [x] Add automatic handoff selection and safe pre-delivery relay fallback.
+6. [ ] Add LiveView/WebSocket, sustained concurrency, and lifecycle tests.
+7. [ ] Replace serialized blocking accepts with a supervised native worker and
+   queue if benchmarks show it is needed.
+8. [ ] Evaluate combining ordinary TCP and handoff acceptance in one hybrid
+   transport.
+9. [ ] Benchmark and harden before making handoff a general default.
 
 ## Resolved implementation choices
 
@@ -737,11 +751,12 @@ phx-port can inspect SNI with `MSG_PEEK`, transfer the untouched client socket
 through `SCM_RIGHTS`, and leave the backend talking directly to the original
 client connection.
 
-For Phoenix applications, a custom `ThousandIsland.Transport` can accept both
-ordinary TCP sockets and handed-off descriptors, perform the same server-side
-TLS handshake for both, and feed both into the normal Bandit connection
-pipeline. This preserves the client's real peer address and removes phx-port
-from the established connection's data path.
+For Phoenix applications, a custom `ThousandIsland.Transport` accepts handed
+off descriptors, performs the server-side TLS handshake, and feeds them into
+the normal Bandit connection pipeline. The ordinary Phoenix endpoint continues
+to accept direct TLS traffic separately. Both paths use the same Phoenix Plug
+and TLS configuration. This preserves the client's real peer address and
+removes phx-port from the established connection's data path.
 
 Because this requires a backend adapter and Unix descriptor passing, it is an
 optional optimization. The framework-independent TCP relay defined in the TLS

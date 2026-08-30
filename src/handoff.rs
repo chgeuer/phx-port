@@ -13,7 +13,7 @@ mod linux {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    const CONTROL_TIMEOUT: Duration = Duration::from_millis(200);
+    const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
     pub enum Outcome {
         Unavailable(TcpStream),
