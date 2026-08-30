@@ -46,6 +46,14 @@ pub fn store(
     });
 }
 
+pub fn remove(path: &Path, hostname: &str) {
+    update_config(path, |document| {
+        if let Some(routes) = document.get_mut(TABLE).and_then(|item| item.as_table_mut()) {
+            routes.remove(hostname);
+        }
+    });
+}
+
 pub fn remove_for_registration(document: &mut DocumentMut, project: &str, role: Option<&str>) {
     let Some(routes) = document.get_mut(TABLE).and_then(|item| item.as_table_mut()) else {
         return;
@@ -99,7 +107,7 @@ pub fn print(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{load, remove_for_registration, store};
+    use super::{load, remove, remove_for_registration, store};
     use crate::{read_config, update_config};
     use tempfile::tempdir;
     use toml_edit::value;
@@ -134,6 +142,19 @@ mod tests {
         update_config(&path, |document| {
             remove_for_registration(document, "/one", Some("https"));
         });
+
+        assert!(load(&path, "one.example.com").is_none());
+        assert!(load(&path, "two.example.com").is_some());
+    }
+
+    #[test]
+    fn removes_one_hostname() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ports.toml");
+        store(&path, "one.example.com", "/one", "https", "11");
+        store(&path, "two.example.com", "/one", "https", "22");
+
+        remove(&path, "one.example.com");
 
         assert!(load(&path, "one.example.com").is_none());
         assert!(load(&path, "two.example.com").is_some());

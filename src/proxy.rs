@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread;
@@ -16,6 +17,9 @@ const MAX_PROBES: usize = 32;
 const MAX_WAITING_CLIENTS: usize = 64;
 const MAX_NEGATIVE_ROUTES: usize = 1024;
 const NEGATIVE_TTL: Duration = Duration::from_secs(30);
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
+const TLS_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
+const TCP_FAILURE_THRESHOLD: u8 = 3;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct Backend {
@@ -27,6 +31,14 @@ struct Backend {
 struct ProbeMatch {
     backend: Backend,
     certificate_fingerprint: String,
+}
+
+#[derive(Clone)]
+struct ActiveRoute {
+    backend: Backend,
+    certificate_fingerprint: String,
+    last_tls_check: Instant,
+    tcp_failures: u8,
 }
 
 struct DiscoveryFlight {
@@ -115,7 +127,8 @@ impl Drop for ProbePermit<'_> {
 }
 
 struct ProxyState {
-    routes: RwLock<HashMap<String, Backend>>,
+    config: PathBuf,
+    routes: RwLock<HashMap<String, ActiveRoute>>,
     flights: Mutex<HashMap<String, Arc<DiscoveryFlight>>>,
     negative: Mutex<HashMap<String, Instant>>,
     workloads: Mutex<Vec<Backend>>,
@@ -124,8 +137,9 @@ struct ProxyState {
 }
 
 impl ProxyState {
-    fn new() -> Self {
+    fn new(config: PathBuf) -> Self {
         Self {
+            config,
             routes: RwLock::new(HashMap::new()),
             flights: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
@@ -191,7 +205,7 @@ impl Drop for WaitingClient<'_> {
 }
 
 pub fn run(listen_addresses: &[String]) -> Result<(), String> {
-    let state = Arc::new(ProxyState::new());
+    let state = Arc::new(ProxyState::new(config_path()));
     let mut listeners = Vec::new();
 
     for address in listen_addresses {
@@ -220,6 +234,16 @@ pub fn run(listen_addresses: &[String]) -> Result<(), String> {
         });
     }
 
+    {
+        let state = Arc::clone(&state);
+        thread::spawn(move || {
+            loop {
+                thread::sleep(LIVENESS_INTERVAL);
+                reconcile_routes(&state);
+            }
+        });
+    }
+
     loop {
         thread::park();
     }
@@ -238,7 +262,7 @@ fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<()
         .read()
         .map_err(|_| "route table lock poisoned".to_string())?
         .get(&hostname)
-        .cloned();
+        .map(|route| route.backend.clone());
 
     let (backend, upstream) = if let Some(backend) = cached {
         match connect_backend(&backend) {
@@ -270,9 +294,8 @@ fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<()
 }
 
 fn resolve_backend(hostname: &str, state: &ProxyState) -> Result<Backend, String> {
-    let config = config_path();
-    let cached = route_cache::load(&config, hostname);
-    let candidates = candidate_backends(cached.as_ref());
+    let cached = route_cache::load(&state.config, hostname);
+    let candidates = candidate_backends(&state.config, cached.as_ref());
     invalidate_negative_cache_if_workloads_changed(state, &candidates);
 
     {
@@ -290,7 +313,7 @@ fn resolve_backend(hostname: &str, state: &ProxyState) -> Result<Backend, String
     }
 
     state.discover_once(hostname, || {
-        discover_backend(hostname, state, candidates, &config)
+        discover_backend(hostname, state, candidates, &state.config)
     })
 }
 
@@ -298,7 +321,7 @@ fn discover_backend(
     hostname: &str,
     state: &ProxyState,
     candidates: Vec<Backend>,
-    config: &std::path::Path,
+    config: &Path,
 ) -> Result<Backend, String> {
     let matches = probe_candidates(hostname, candidates, state);
 
@@ -317,7 +340,15 @@ fn discover_backend(
         .routes
         .write()
         .map_err(|_| "route table lock poisoned".to_string())?
-        .insert(hostname.to_string(), backend.clone());
+        .insert(
+            hostname.to_string(),
+            ActiveRoute {
+                backend: backend.clone(),
+                certificate_fingerprint: matched.certificate_fingerprint.clone(),
+                last_tls_check: Instant::now(),
+                tcp_failures: 0,
+            },
+        );
     route_cache::store(
         config,
         hostname,
@@ -363,9 +394,120 @@ fn invalidate_negative_cache_if_workloads_changed(state: &ProxyState, candidates
     }
 }
 
-fn candidate_backends(cached: Option<&route_cache::CachedRoute>) -> Vec<Backend> {
-    let config = config_path();
-    let document = read_config(&config);
+fn reconcile_routes(state: &ProxyState) {
+    let routes: Vec<(String, ActiveRoute)> = match state.routes.read() {
+        Ok(routes) => routes
+            .iter()
+            .map(|(hostname, route)| (hostname.clone(), route.clone()))
+            .collect(),
+        Err(_) => return,
+    };
+
+    for (hostname, route) in routes {
+        if !registration_matches(&state.config, &route.backend) {
+            deactivate_route(state, &hostname, true, "registration was removed");
+            continue;
+        }
+
+        if !is_port_open(i64::from(route.backend.port)) {
+            record_tcp_failure(state, &hostname);
+            continue;
+        }
+
+        let recovered = route.tcp_failures > 0;
+        let tls_due = route.last_tls_check.elapsed() >= TLS_REVALIDATION_INTERVAL;
+        if recovered || tls_due {
+            let Some(_permit) = state.probes.acquire(Instant::now() + DISCOVERY_TIMEOUT) else {
+                continue;
+            };
+            match probe_backend(&hostname, &route.backend) {
+                Ok(fingerprint) => {
+                    if fingerprint != route.certificate_fingerprint {
+                        eprintln!(
+                            "Observed certificate rotation for {hostname} at 127.0.0.1:{}",
+                            route.backend.port
+                        );
+                    }
+                    if let Ok(mut routes) = state.routes.write()
+                        && let Some(active) = routes.get_mut(&hostname)
+                    {
+                        active.tcp_failures = 0;
+                        active.last_tls_check = Instant::now();
+                        active.certificate_fingerprint = fingerprint.clone();
+                    }
+                    route_cache::store(
+                        &state.config,
+                        &hostname,
+                        &route.backend.project,
+                        &route.backend.role,
+                        &fingerprint,
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Deactivating TLS route {hostname} after certificate revalidation failed: {error}"
+                    );
+                    deactivate_route(state, &hostname, false, "TLS revalidation failed");
+                }
+            }
+        } else if let Ok(mut routes) = state.routes.write()
+            && let Some(active) = routes.get_mut(&hostname)
+        {
+            active.tcp_failures = 0;
+        }
+    }
+}
+
+fn registration_matches(config: &Path, backend: &Backend) -> bool {
+    let document = read_config(config);
+    document
+        .get("ports")
+        .and_then(|item| item.as_table())
+        .and_then(|projects| projects.get(&backend.project))
+        .and_then(|item| item.as_table())
+        .and_then(|roles| roles.get(&backend.role))
+        .and_then(|item| item.as_integer())
+        .and_then(|port| u16::try_from(port).ok())
+        == Some(backend.port)
+}
+
+fn record_tcp_failure(state: &ProxyState, hostname: &str) {
+    let failures = if let Ok(mut routes) = state.routes.write() {
+        routes.get_mut(hostname).map(|route| {
+            route.tcp_failures = route.tcp_failures.saturating_add(1);
+            route.tcp_failures
+        })
+    } else {
+        None
+    };
+
+    if failures.is_some_and(|failures| failures >= TCP_FAILURE_THRESHOLD) {
+        deactivate_route(
+            state,
+            hostname,
+            false,
+            "backend failed three consecutive TCP checks",
+        );
+    }
+}
+
+fn deactivate_route(state: &ProxyState, hostname: &str, remove_cached: bool, reason: &str) {
+    let removed = state
+        .routes
+        .write()
+        .ok()
+        .and_then(|mut routes| routes.remove(hostname))
+        .is_some();
+    if removed {
+        eprintln!("Deactivated TLS route {hostname}: {reason}");
+    }
+    if remove_cached {
+        route_cache::remove(&state.config, hostname);
+    }
+}
+
+fn candidate_backends(config: &Path, cached: Option<&route_cache::CachedRoute>) -> Vec<Backend> {
+    let document = read_config(config);
     let mut by_project = BTreeMap::<String, Backend>::new();
 
     if let Some(projects) = document.get("ports").and_then(|value| value.as_table()) {
@@ -512,13 +654,18 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream, buffered: &[u8]) -> io:
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, MAX_PROBES, MAX_WAITING_CLIENTS, ProbeLimiter, ProxyState, WaitingClient,
-        cache_negative, invalidate_negative_cache_if_workloads_changed,
+        ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, ProbeLimiter, ProxyState,
+        WaitingClient, cache_negative, invalidate_negative_cache_if_workloads_changed,
+        reconcile_routes,
     };
+    use crate::{route_cache, update_config};
+    use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
+    use tempfile::tempdir;
+    use toml_edit::value;
 
     fn backend() -> Backend {
         Backend {
@@ -528,9 +675,19 @@ mod tests {
         }
     }
 
+    fn active_route(backend: Backend) -> ActiveRoute {
+        ActiveRoute {
+            backend,
+            certificate_fingerprint: "AA:BB".to_string(),
+            last_tls_check: Instant::now(),
+            tcp_failures: 0,
+        }
+    }
+
     #[test]
     fn concurrent_requests_share_one_hostname_discovery() {
-        let state = Arc::new(ProxyState::new());
+        let directory = tempdir().unwrap();
+        let state = Arc::new(ProxyState::new(directory.path().join("ports.toml")));
         let barrier = Arc::new(Barrier::new(10));
         let calls = Arc::new(AtomicUsize::new(0));
         let mut clients = Vec::new();
@@ -582,12 +739,63 @@ mod tests {
 
     #[test]
     fn workload_change_invalidates_negative_routes() {
-        let state = ProxyState::new();
+        let directory = tempdir().unwrap();
+        let state = ProxyState::new(directory.path().join("ports.toml"));
         cache_negative(&state, "www.example.com");
         assert!(!state.negative.lock().unwrap().is_empty());
 
         invalidate_negative_cache_if_workloads_changed(&state, &[backend()]);
 
         assert!(state.negative.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn removed_registration_deactivates_and_forgets_the_route() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ports.toml");
+        let state = ProxyState::new(path.clone());
+        state
+            .routes
+            .write()
+            .unwrap()
+            .insert("www.example.com".to_string(), active_route(backend()));
+        route_cache::store(&path, "www.example.com", "/project", "https", "AA:BB");
+
+        reconcile_routes(&state);
+
+        assert!(state.routes.read().unwrap().is_empty());
+        assert!(route_cache::load(&path, "www.example.com").is_none());
+    }
+
+    #[test]
+    fn three_tcp_failures_deactivate_but_retain_the_cached_route() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ports.toml");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        update_config(&path, |document| {
+            document["ports"]["/project"] = toml_edit::table();
+            document["ports"]["/project"]["https"] = value(i64::from(port));
+        });
+        route_cache::store(&path, "www.example.com", "/project", "https", "AA:BB");
+
+        let state = ProxyState::new(path.clone());
+        let mut backend = backend();
+        backend.port = port;
+        state
+            .routes
+            .write()
+            .unwrap()
+            .insert("www.example.com".to_string(), active_route(backend));
+
+        reconcile_routes(&state);
+        reconcile_routes(&state);
+        assert!(!state.routes.read().unwrap().is_empty());
+        reconcile_routes(&state);
+
+        assert!(state.routes.read().unwrap().is_empty());
+        assert!(route_cache::load(&path, "www.example.com").is_some());
     }
 }
