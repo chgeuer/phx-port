@@ -290,7 +290,7 @@ Conceptual cache entry:
 project = "/home/user/projects/contoso_web"
 role = "https"
 certificate_fingerprint = "A7:9A:77:DA:F6:4F:21:0E:..."
-last_verified = "2026-08-30T18:32:10Z"
+last_verified_unix = 1788114730
 ```
 
 The cache stores a project identity and role rather than only a socket address.

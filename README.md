@@ -130,9 +130,16 @@ one backend completes a system-trusted, hostname-valid TLS handshake. The
 original ClientHello is then relayed unchanged, so the backend remains the TLS
 endpoint and retains its own certificate and private key.
 
-The current first implementation keeps successful routes in memory. Persistent
-route caching, eager default-certificate discovery, route inspection commands,
-and the optional Linux socket-handoff fast path are described in
+Successful discoveries are cached in the registry as derived state and can be
+inspected with:
+
+```bash
+phx-port proxy routes
+```
+
+The daemon revalidates a persisted mapping before activating it in a new
+process. Eager default-certificate discovery, richer live status commands, and
+the optional Linux socket-handoff fast path are described in
 [`docs/tls-proxy-design.md`](docs/tls-proxy-design.md) and
 [`docs/socket-forwarding-design.md`](docs/socket-forwarding-design.md).
 

@@ -1,5 +1,6 @@
-use crate::{config_path, is_port_open, read_config, tls_client_hello};
+use crate::{config_path, is_port_open, read_config, route_cache, tls_client_hello};
 use native_tls::TlsConnector;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -17,6 +18,11 @@ struct Backend {
     project: String,
     role: String,
     port: u16,
+}
+
+struct ProbeMatch {
+    backend: Backend,
+    certificate_fingerprint: String,
 }
 
 type Routes = Arc<RwLock<HashMap<String, Backend>>>;
@@ -93,7 +99,9 @@ fn handle_connection(mut client: TcpStream, routes: Routes) -> Result<(), String
 }
 
 fn discover_and_connect(hostname: &str, routes: &Routes) -> Result<(Backend, TcpStream), String> {
-    let candidates = candidate_backends();
+    let config = config_path();
+    let cached = route_cache::load(&config, hostname);
+    let candidates = candidate_backends(cached.as_ref());
     let matches = probe_candidates(hostname, candidates);
 
     if matches.len() != 1 {
@@ -103,13 +111,21 @@ fn discover_and_connect(hostname: &str, routes: &Routes) -> Result<(Backend, Tcp
         });
     }
 
-    let backend = matches.into_iter().next().unwrap();
+    let matched = matches.into_iter().next().unwrap();
+    let backend = matched.backend;
     let upstream = connect_backend(&backend)
         .map_err(|error| format!("verified backend disappeared before relay: {error}"))?;
     routes
         .write()
         .map_err(|_| "route table lock poisoned".to_string())?
         .insert(hostname.to_string(), backend.clone());
+    route_cache::store(
+        &config,
+        hostname,
+        &backend.project,
+        &backend.role,
+        &matched.certificate_fingerprint,
+    );
     eprintln!(
         "Discovered {hostname} at 127.0.0.1:{} ({} {})",
         backend.port, backend.project, backend.role
@@ -117,7 +133,7 @@ fn discover_and_connect(hostname: &str, routes: &Routes) -> Result<(Backend, Tcp
     Ok((backend, upstream))
 }
 
-fn candidate_backends() -> Vec<Backend> {
+fn candidate_backends(cached: Option<&route_cache::CachedRoute>) -> Vec<Backend> {
     let config = config_path();
     let document = read_config(&config);
     let mut by_project = BTreeMap::<String, Backend>::new();
@@ -148,10 +164,18 @@ fn candidate_backends() -> Vec<Backend> {
         }
     }
 
-    by_project.into_values().take(MAX_PROBES).collect()
+    let mut candidates: Vec<_> = by_project.into_values().collect();
+    if let Some(cached) = cached
+        && let Some(index) = candidates
+            .iter()
+            .position(|backend| backend.project == cached.project && backend.role == cached.role)
+    {
+        candidates.swap(0, index);
+    }
+    candidates.into_iter().take(MAX_PROBES).collect()
 }
 
-fn probe_candidates(hostname: &str, candidates: Vec<Backend>) -> Vec<Backend> {
+fn probe_candidates(hostname: &str, candidates: Vec<Backend>) -> Vec<ProbeMatch> {
     let (sender, receiver) = mpsc::channel();
     let deadline = Instant::now() + DISCOVERY_TIMEOUT;
 
@@ -159,8 +183,11 @@ fn probe_candidates(hostname: &str, candidates: Vec<Backend>) -> Vec<Backend> {
         let sender = sender.clone();
         let hostname = hostname.to_string();
         thread::spawn(move || match probe_backend(&hostname, &backend) {
-            Ok(()) => {
-                let _ = sender.send(backend);
+            Ok(certificate_fingerprint) => {
+                let _ = sender.send(ProbeMatch {
+                    backend,
+                    certificate_fingerprint,
+                });
             }
             Err(error) => {
                 eprintln!(
@@ -182,15 +209,28 @@ fn probe_candidates(hostname: &str, candidates: Vec<Backend>) -> Vec<Backend> {
     matches
 }
 
-fn probe_backend(hostname: &str, backend: &Backend) -> Result<(), String> {
+fn probe_backend(hostname: &str, backend: &Backend) -> Result<String, String> {
     let stream = connect_backend_with_timeout(backend, PROBE_TIMEOUT)
         .map_err(|error| format!("TCP connection failed: {error}"))?;
     let connector =
         TlsConnector::new().map_err(|error| format!("cannot create TLS connector: {error}"))?;
-    connector
+    let tls = connector
         .connect(hostname, stream)
-        .map(|_| ())
-        .map_err(|error| format!("TLS validation failed: {error}"))
+        .map_err(|error| format!("TLS validation failed: {error}"))?;
+    let certificate = tls
+        .peer_certificate()
+        .map_err(|error| format!("cannot inspect peer certificate: {error}"))?
+        .ok_or_else(|| "backend did not present a certificate".to_string())?;
+    let digest = Sha256::digest(
+        certificate
+            .to_der()
+            .map_err(|error| format!("cannot encode peer certificate: {error}"))?,
+    );
+    Ok(digest
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":"))
 }
 
 fn connect_backend(backend: &Backend) -> io::Result<TcpStream> {

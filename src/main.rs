@@ -1,14 +1,19 @@
+use atomicwrites::{AllowOverwrite, AtomicFile};
+use fs2::FileExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, Instant};
 use toml_edit::{DocumentMut, value};
 
+#[cfg(test)]
+mod config_tests;
 mod proxy;
+mod route_cache;
 mod tls_client_hello;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,6 +37,7 @@ USAGE:
     phx-port discover           Open a browser page to pick a running project
     phx-port daemon [--listen ADDRESS]...
                                 Route TLS by SNI to live https/main workloads
+    phx-port proxy routes       Show persistently discovered TLS routes
     phx-port open               Open default browser for the current directory's port
     phx-port open debug         Open browser for a named port role
     phx-port launch             Alias for 'open'
@@ -74,7 +80,35 @@ pub(crate) fn config_path() -> PathBuf {
     home_dir().join(".config").join("phx-ports.toml")
 }
 
-pub(crate) fn read_config(path: &PathBuf) -> DocumentMut {
+fn ensure_config_parent(path: &Path) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|e| {
+            eprintln!("Error creating {}: {}", parent.display(), e);
+            process::exit(1);
+        });
+    }
+}
+
+fn config_lock(path: &Path) -> File {
+    ensure_config_parent(path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("phx-ports.toml");
+    let lock_path = path.with_file_name(format!("{file_name}.lock"));
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap_or_else(|e| {
+            eprintln!("Error opening config lock {}: {}", lock_path.display(), e);
+            process::exit(1);
+        })
+}
+
+fn load_config(path: &Path) -> DocumentMut {
     let mut doc = if path.exists() {
         let content = fs::read_to_string(path).unwrap_or_else(|e| {
             eprintln!("Error reading {}: {}", path.display(), e);
@@ -88,7 +122,6 @@ pub(crate) fn read_config(path: &PathBuf) -> DocumentMut {
         "[ports]\n".parse::<DocumentMut>().unwrap()
     };
 
-    // Migrate old flat format (dir = port) to new nested format (dir.role = port)
     ensure_ports_table(&mut doc);
     let old_entries: Vec<(String, i64)> = doc["ports"]
         .as_table()
@@ -103,23 +136,40 @@ pub(crate) fn read_config(path: &PathBuf) -> DocumentMut {
             doc["ports"][dir] = toml_edit::table();
             doc["ports"][dir][DEFAULT_ROLE] = value(*port);
         }
-        write_config(path, &doc);
     }
 
     doc
 }
 
-fn write_config(path: &PathBuf, doc: &DocumentMut) {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap_or_else(|e| {
-            eprintln!("Error creating {}: {}", parent.display(), e);
-            process::exit(1);
-        });
-    }
-    fs::write(path, doc.to_string()).unwrap_or_else(|e| {
-        eprintln!("Error writing {}: {}", path.display(), e);
+pub(crate) fn read_config(path: &Path) -> DocumentMut {
+    let lock = config_lock(path);
+    FileExt::lock_shared(&lock).unwrap_or_else(|e| {
+        eprintln!("Error locking {} for reading: {}", path.display(), e);
         process::exit(1);
     });
+    let doc = load_config(path);
+    FileExt::unlock(&lock).ok();
+    doc
+}
+
+pub(crate) fn update_config<R>(path: &Path, update: impl FnOnce(&mut DocumentMut) -> R) -> R {
+    let lock = config_lock(path);
+    FileExt::lock_exclusive(&lock).unwrap_or_else(|e| {
+        eprintln!("Error locking {} for update: {}", path.display(), e);
+        process::exit(1);
+    });
+
+    let mut doc = load_config(path);
+    let result = update(&mut doc);
+    let content = doc.to_string();
+    AtomicFile::new(path, AllowOverwrite)
+        .write(|file| file.write_all(content.as_bytes()))
+        .unwrap_or_else(|e| {
+            eprintln!("Error atomically writing {}: {}", path.display(), e);
+            process::exit(1);
+        });
+    FileExt::unlock(&lock).ok();
+    result
 }
 
 fn cwd_string() -> String {
@@ -160,7 +210,7 @@ fn next_port(doc: &DocumentMut) -> i64 {
     port
 }
 
-fn cmd_list(config: &PathBuf) {
+fn cmd_list(config: &Path) {
     let doc = read_config(config);
     if let Some(table) = doc.get("ports").and_then(|v| v.as_table()) {
         let mut entries: Vec<(i64, String, String)> = Vec::new();
@@ -296,7 +346,7 @@ fn collect_tree_lines(
     }
 }
 
-fn cmd_list_tree(config: &PathBuf, as_url: bool) {
+fn cmd_list_tree(config: &Path, as_url: bool) {
     let doc = read_config(config);
     let table = match doc.get("ports").and_then(|v| v.as_table()) {
         Some(t) => t,
@@ -387,42 +437,43 @@ fn cmd_list_tree(config: &PathBuf, as_url: bool) {
     }
 }
 
-fn cmd_register(config: &PathBuf, role: &str) {
+fn cmd_register(config: &Path, role: &str) {
     let cwd_str = cwd_string();
-    let mut doc = read_config(config);
-    ensure_ports_table(&mut doc);
+    let (port, created) = update_config(config, |doc| {
+        ensure_ports_table(doc);
 
-    if let Some(port) = doc["ports"]
-        .as_table()
-        .and_then(|t| t.get(&cwd_str))
-        .and_then(|v| v.as_table())
-        .and_then(|t| t.get(role))
-        .and_then(|v| v.as_integer())
-    {
-        if role == DEFAULT_ROLE {
-            eprintln!("Already registered: {} → port {}", cwd_str, port);
-        } else {
-            eprintln!("Already registered: {} ({}) → port {}", cwd_str, role, port);
+        if let Some(port) = doc["ports"]
+            .as_table()
+            .and_then(|t| t.get(&cwd_str))
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get(role))
+            .and_then(|v| v.as_integer())
+        {
+            return (port, false);
         }
-        println!("{}", port);
-        return;
-    }
 
-    let new_port = next_port(&doc);
-    if doc["ports"]
-        .as_table()
-        .is_none_or(|t| !t.contains_key(&cwd_str))
-    {
-        doc["ports"][&cwd_str] = toml_edit::table();
-    }
-    doc["ports"][&cwd_str][role] = value(new_port);
-    write_config(config, &doc);
-    if role == DEFAULT_ROLE {
-        eprintln!("Registered {} → port {}", cwd_str, new_port);
+        let new_port = next_port(doc);
+        if doc["ports"]
+            .as_table()
+            .is_none_or(|t| !t.contains_key(&cwd_str))
+        {
+            doc["ports"][&cwd_str] = toml_edit::table();
+        }
+        doc["ports"][&cwd_str][role] = value(new_port);
+        (new_port, true)
+    });
+
+    let action = if created {
+        "Registered"
     } else {
-        eprintln!("Registered {} ({}) → port {}", cwd_str, role, new_port);
+        "Already registered:"
+    };
+    if role == DEFAULT_ROLE {
+        eprintln!("{} {} → port {}", action, cwd_str, port);
+    } else {
+        eprintln!("{} {} ({}) → port {}", action, cwd_str, role, port);
     }
-    println!("{}", new_port);
+    println!("{}", port);
 }
 
 fn resolve_dir(doc: &DocumentMut, arg: &str) -> Option<String> {
@@ -460,25 +511,26 @@ fn resolve_dir(doc: &DocumentMut, arg: &str) -> Option<String> {
     }
 }
 
-fn cmd_delete(config: &PathBuf, arg: &str, role: Option<&str>) {
-    let mut doc = read_config(config);
-    ensure_ports_table(&mut doc);
-
-    // Delete by port number: find the dir+role that owns this port
+fn cmd_delete(config: &Path, arg: &str, role: Option<&str>) {
     if let Ok(port_num) = arg.parse::<i64>() {
-        let mut found = None;
-        if let Some(table) = doc["ports"].as_table() {
-            for (dir, dir_value) in table.iter() {
-                if let Some(dir_table) = dir_value.as_table() {
-                    for (r, port_value) in dir_table.iter() {
-                        if port_value.as_integer() == Some(port_num) {
-                            found = Some((dir.to_string(), r.to_string()));
+        let (dir, found_role) = update_config(config, |doc| {
+            ensure_ports_table(doc);
+            let mut found = None;
+            if let Some(table) = doc["ports"].as_table() {
+                for (dir, dir_value) in table.iter() {
+                    if let Some(dir_table) = dir_value.as_table() {
+                        for (r, port_value) in dir_table.iter() {
+                            if port_value.as_integer() == Some(port_num) {
+                                found = Some((dir.to_string(), r.to_string()));
+                            }
                         }
                     }
                 }
             }
-        }
-        if let Some((dir, found_role)) = found {
+            let Some((dir, found_role)) = found else {
+                eprintln!("No mapping found for port {}", port_num);
+                process::exit(1);
+            };
             doc["ports"][&dir]
                 .as_table_mut()
                 .unwrap()
@@ -486,63 +538,61 @@ fn cmd_delete(config: &PathBuf, arg: &str, role: Option<&str>) {
             if doc["ports"][&dir].as_table().is_none_or(|t| t.is_empty()) {
                 doc["ports"].as_table_mut().unwrap().remove(&dir);
             }
-            write_config(config, &doc);
-            if found_role == DEFAULT_ROLE {
-                eprintln!("Removed {} (was port {})", dir, port_num);
-            } else {
-                eprintln!("Removed {} ({}) (was port {})", dir, found_role, port_num);
-            }
+            route_cache::remove_for_registration(doc, &dir, Some(&found_role));
+            (dir, found_role)
+        });
+        if found_role == DEFAULT_ROLE {
+            eprintln!("Removed {} (was port {})", dir, port_num);
         } else {
-            eprintln!("No mapping found for port {}", port_num);
-            process::exit(1);
+            eprintln!("Removed {} ({}) (was port {})", dir, found_role, port_num);
         }
         return;
     }
 
-    // Resolve target to a directory key
-    let key = match resolve_dir(&doc, arg) {
-        Some(k) => k,
-        None => process::exit(1),
-    };
-
     if let Some(role) = role {
-        // Delete a specific role
-        if let Some(port) = doc["ports"]
-            .as_table()
-            .and_then(|t| t.get(&key))
-            .and_then(|v| v.as_table())
-            .and_then(|t| t.get(role))
-            .and_then(|v| v.as_integer())
-        {
+        let (key, port) = update_config(config, |doc| {
+            ensure_ports_table(doc);
+            let key = resolve_dir(doc, arg).unwrap_or_else(|| process::exit(1));
+            let Some(port) = doc["ports"]
+                .as_table()
+                .and_then(|t| t.get(&key))
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get(role))
+                .and_then(|v| v.as_integer())
+            else {
+                eprintln!("No {} port registered for {}", role, key);
+                process::exit(1);
+            };
             doc["ports"][&key].as_table_mut().unwrap().remove(role);
             if doc["ports"][&key].as_table().is_none_or(|t| t.is_empty()) {
                 doc["ports"].as_table_mut().unwrap().remove(&key);
             }
-            write_config(config, &doc);
-            if role == DEFAULT_ROLE {
-                eprintln!("Removed {} (was port {})", key, port);
-            } else {
-                eprintln!("Removed {} ({}) (was port {})", key, role, port);
-            }
+            route_cache::remove_for_registration(doc, &key, Some(role));
+            (key, port)
+        });
+        if role == DEFAULT_ROLE {
+            eprintln!("Removed {} (was port {})", key, port);
         } else {
-            eprintln!("No {} port registered for {}", role, key);
-            process::exit(1);
+            eprintln!("Removed {} ({}) (was port {})", key, role, port);
         }
     } else {
-        // Delete all roles for this directory
-        let ports: Vec<(String, i64)> = doc["ports"]
-            .as_table()
-            .and_then(|t| t.get(&key))
-            .and_then(|v| v.as_table())
-            .map(|t| {
-                t.iter()
-                    .filter_map(|(r, v)| v.as_integer().map(|p| (r.to_string(), p)))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        doc["ports"].as_table_mut().unwrap().remove(&key);
-        write_config(config, &doc);
+        let (key, ports) = update_config(config, |doc| {
+            ensure_ports_table(doc);
+            let key = resolve_dir(doc, arg).unwrap_or_else(|| process::exit(1));
+            let ports: Vec<(String, i64)> = doc["ports"]
+                .as_table()
+                .and_then(|t| t.get(&key))
+                .and_then(|v| v.as_table())
+                .map(|t| {
+                    t.iter()
+                        .filter_map(|(r, v)| v.as_integer().map(|p| (r.to_string(), p)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            doc["ports"].as_table_mut().unwrap().remove(&key);
+            route_cache::remove_for_registration(doc, &key, None);
+            (key, ports)
+        });
         for (role, port) in &ports {
             if role == DEFAULT_ROLE {
                 eprintln!("Removed {} (was port {})", key, port);
@@ -553,37 +603,38 @@ fn cmd_delete(config: &PathBuf, arg: &str, role: Option<&str>) {
     }
 }
 
-fn cmd_port(config: &PathBuf, role: &str) {
+fn cmd_port(config: &Path, role: &str) {
     let cwd_str = cwd_string();
-    let mut doc = read_config(config);
-    ensure_ports_table(&mut doc);
+    let (port, created) = update_config(config, |doc| {
+        ensure_ports_table(doc);
+        if let Some(port) = doc["ports"]
+            .as_table()
+            .and_then(|t| t.get(&cwd_str))
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get(role))
+            .and_then(|v| v.as_integer())
+        {
+            return (port, false);
+        }
 
-    if let Some(port) = doc["ports"]
-        .as_table()
-        .and_then(|t| t.get(&cwd_str))
-        .and_then(|v| v.as_table())
-        .and_then(|t| t.get(role))
-        .and_then(|v| v.as_integer())
-    {
-        println!("{}", port);
-        return;
+        let new_port = next_port(doc);
+        if doc["ports"]
+            .as_table()
+            .is_none_or(|t| !t.contains_key(&cwd_str))
+        {
+            doc["ports"][&cwd_str] = toml_edit::table();
+        }
+        doc["ports"][&cwd_str][role] = value(new_port);
+        (new_port, true)
+    });
+    if created {
+        if role == DEFAULT_ROLE {
+            eprintln!("Registered {} → port {}", cwd_str, port);
+        } else {
+            eprintln!("Registered {} ({}) → port {}", cwd_str, role, port);
+        }
     }
-
-    let new_port = next_port(&doc);
-    if doc["ports"]
-        .as_table()
-        .is_none_or(|t| !t.contains_key(&cwd_str))
-    {
-        doc["ports"][&cwd_str] = toml_edit::table();
-    }
-    doc["ports"][&cwd_str][role] = value(new_port);
-    write_config(config, &doc);
-    if role == DEFAULT_ROLE {
-        eprintln!("Registered {} → port {}", cwd_str, new_port);
-    } else {
-        eprintln!("Registered {} ({}) → port {}", cwd_str, role, new_port);
-    }
-    println!("{}", new_port);
+    println!("{}", port);
 }
 
 fn open_url(url: &str) -> std::io::Result<process::Child> {
@@ -598,7 +649,7 @@ fn open_url(url: &str) -> std::io::Result<process::Child> {
     }
 }
 
-fn cmd_open(config: &PathBuf, role: &str) {
+fn cmd_open(config: &Path, role: &str) {
     let cwd_str = cwd_string();
     let doc = read_config(config);
 
@@ -649,7 +700,7 @@ struct RunningProject {
     port: i64,
 }
 
-fn get_running_projects(config: &PathBuf) -> Vec<RunningProject> {
+fn get_running_projects(config: &Path) -> Vec<RunningProject> {
     let doc = read_config(config);
     let table = match doc.get("ports").and_then(|v| v.as_table()) {
         Some(t) => t,
@@ -675,7 +726,7 @@ fn get_running_projects(config: &PathBuf) -> Vec<RunningProject> {
     running
 }
 
-fn cmd_running(config: &PathBuf) {
+fn cmd_running(config: &Path) {
     let running = get_running_projects(config);
     if running.is_empty() {
         eprintln!("No registered projects are currently running.");
@@ -768,7 +819,7 @@ document.querySelectorAll('a').forEach(a => {
     template.replace("ITEMS_PLACEHOLDER", &items)
 }
 
-fn cmd_discover(config: &PathBuf) {
+fn cmd_discover(config: &Path) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| {
         eprintln!("Failed to start server: {}", e);
         process::exit(1);
@@ -931,6 +982,13 @@ fn main() {
                 process::exit(1);
             }
         }
+        Some("proxy") => match args.get(1).map(String::as_str) {
+            Some("routes") if args.len() == 2 => route_cache::print(&config),
+            _ => {
+                eprintln!("Usage: phx-port proxy routes");
+                process::exit(1);
+            }
+        },
         Some(other) if other.starts_with('-') => {
             eprintln!("Unknown option: {}", other);
             eprintln!();
@@ -949,6 +1007,7 @@ fn main() {
                 cmd_port(&config, args[0].as_str());
             }
         }
+
         None => {
             if std::io::stdout().is_terminal() {
                 println!("{}", HELP);
