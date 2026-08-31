@@ -712,6 +712,10 @@ struct RunningProject {
     hostnames: Vec<String>,
 }
 
+fn scheme_for_role(role: &str) -> &'static str {
+    if role == "https" { "https" } else { "http" }
+}
+
 fn get_running_projects(config: &Path) -> Vec<RunningProject> {
     let doc = read_config(config);
     let mut hostnames_by_backend: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
@@ -779,10 +783,14 @@ fn cmd_running(config: &Path) {
         return;
     }
     for r in &running {
+        let scheme = scheme_for_role(&r.role);
         if r.role == DEFAULT_ROLE {
-            println!("  http://localhost:{:<5}  {}", r.port, r.dir);
+            println!("  {scheme}://localhost:{:<5}  {}", r.port, r.dir);
         } else {
-            println!("  http://localhost:{:<5}  {} ({})", r.port, r.dir, r.role);
+            println!(
+                "  {scheme}://localhost:{:<5}  {} ({})",
+                r.port, r.dir, r.role
+            );
         }
     }
 }
@@ -804,13 +812,14 @@ fn build_discover_html(projects: &[RunningProject]) -> String {
             } else {
                 format!(" <span class=\"role\">({})</span>", escape_html(&p.role))
             };
+            let local_scheme = scheme_for_role(&p.role);
             items.push_str("    <li>");
             items.push_str(&format!(
                 "<div class=\"project\"><strong>{name}{role}</strong>\
                  <div class=\"dir\">{dir}</div></div>\
                  <div class=\"links\">\
-                 <a class=\"endpoint local\" href=\"http://localhost:{port}\">\
-                 http://localhost:{port}</a>",
+                 <a class=\"endpoint local\" href=\"{local_scheme}://localhost:{port}\">\
+                 {local_scheme}://localhost:{port}</a>",
                 port = p.port,
                 name = escape_html(name),
                 role = role_suffix,

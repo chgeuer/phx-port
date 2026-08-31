@@ -52,9 +52,21 @@ fn renders_local_and_confirmed_tls_links_with_escaped_labels() {
         hostnames: vec!["contoso.com".to_string(), "www.contoso.com".to_string()],
     }]);
 
-    assert!(html.contains("href=\"http://localhost:4401\""));
+    assert!(html.contains("href=\"https://localhost:4401\""));
     assert!(html.contains("href=\"https://contoso.com/\""));
     assert!(html.contains("href=\"https://www.contoso.com/\""));
     assert!(html.contains("/srv/contoso&lt;&amp;"));
     assert!(!html.contains("/srv/contoso<&"));
+}
+
+#[test]
+fn renders_non_https_roles_as_cleartext_local_links() {
+    let html = build_discover_html(&[RunningProject {
+        dir: "/srv/contoso".to_string(),
+        role: "main".to_string(),
+        port: 4400,
+        hostnames: vec![],
+    }]);
+
+    assert!(html.contains("href=\"http://localhost:4400\""));
 }
