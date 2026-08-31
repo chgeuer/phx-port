@@ -54,10 +54,9 @@ connection, phx-port can transfer the accepted client socket to a cooperating
 backend. The backend then terminates TLS and communicates directly over the
 original kernel TCP connection.
 
-An existing socket-handoff proof of concept demonstrates the core
-descriptor-transfer mechanism between BEAM processes. Applying it to phx-port
-additionally requires integration with a production server such as Bandit and
-Thousand Island.
+The earlier socket-handoff proof of concept demonstrated descriptor transfer
+between BEAM processes. The implemented package now carries that mechanism
+through a production Bandit and Thousand Island connection lifecycle.
 
 ## Requirements
 
@@ -120,24 +119,18 @@ Thousand Island.
 
 ## Chosen architecture
 
-The backend uses a custom `ThousandIsland.Transport` implementation that
-accepts connections from two sources:
+The backend exposes two ingress paths: its ordinary Phoenix HTTPS endpoint and
+a second Bandit server using a custom `ThousandIsland.Transport`:
 
-```text
-Client ---------------------> ordinary endpoint :4001
-                                      |
-                                      +------> Phoenix endpoint Plug
-                                      |
-Client ---> phx-port :443 ---> handoff-only Bandit
-                                      |
-                                      v
-                           ThousandIsland.Connection
-                                      |
-                                      v
-                              server-side TLS
-                                      |
-                                      v
-                              Phoenix endpoint Plug
+```mermaid
+flowchart LR
+    Direct["Direct client"] -->|TCP :4001| Ordinary["Ordinary Bandit TLS listener"]
+    Public["Public client"] -->|TCP :443| Router["phx-port"]
+    Router -->|SCM_RIGHTS over PHXP| Handoff["Handoff-only Bandit listener"]
+    Ordinary --> Endpoint["Phoenix endpoint Plug"]
+    Handoff --> Connection["ThousandIsland.Connection"]
+    Connection --> TLS["Server-side TLS"]
+    TLS --> Endpoint
 ```
 
 The ordinary endpoint uses Bandit's standard TLS transport. The handoff-only
@@ -183,10 +176,11 @@ For an active route whose backend advertises socket-handoff capability:
 5. Connect to the backend's Unix-domain control socket.
 6. Send a small versioned handoff header and the connected client FD using
    `SCM_RIGHTS`.
-7. Wait for a bounded acknowledgement that the backend received and adopted
-   the socket.
-8. Close phx-port's descriptor without calling `shutdown(2)`.
-9. Close the Unix-domain control connection.
+7. Treat successful `sendmsg` as the ownership boundary and immediately close
+   phx-port's descriptor without calling `shutdown(2)`.
+8. Wait for a bounded acknowledgement that reports whether the backend adopted
+   the already-delivered socket.
+9. Close the Unix-domain control connection after the response or timeout.
 10. Remove all per-connection state from phx-port.
 
 After successful `sendmsg`, the receiving process owns a duplicate descriptor
@@ -198,6 +192,28 @@ Unlike a BEAM-side release that must leave an Erlang port driver with a valid
 descriptor, the Rust daemon can normally release its descriptor with
 `close(2)`. It must not call `shutdown(2)`, because shutdown changes the shared
 socket state for every descriptor referring to that connection.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Daemon as phx-port
+    participant NIF as Rustler receiver
+    participant TI as Thousand Island
+    participant Bandit
+
+    Client->>Daemon: TCP connection + TLS ClientHello
+    Daemon->>Daemon: MSG_PEEK and resolve SNI
+    Daemon->>NIF: HELLO
+    NIF-->>Daemon: READY
+    Daemon->>NIF: HANDOFF metadata + FD via SCM_RIGHTS
+    Note over Daemon,NIF: Successful sendmsg is the ownership boundary
+    Daemon->>Daemon: close(FD), never shutdown(FD)
+    NIF->>TI: gen_tcp.fdopen(FD)
+    TI->>TI: Transfer controlling process
+    NIF-->>Daemon: ADOPTED
+    TI->>Bandit: Server-side TLS, then normal connection pipeline
+    Bandit-->>Client: HTTP over the original port-443 socket
+```
 
 ## Backend handoff sequence
 
@@ -220,8 +236,9 @@ The backend transport:
     pipeline.
 
 If the receiver cannot wrap or adopt the descriptor, it closes its copy and
-returns a negative acknowledgement. phx-port then applies the configured
-failure policy.
+returns a negative acknowledgement. Because descriptor delivery already
+crossed the ownership boundary, phx-port records the failure and closes the
+connection; it does not attempt relay fallback.
 
 ## Thousand Island integration
 
@@ -253,8 +270,8 @@ transport.handshake(raw_socket)
 This is the required seam: connection setup after `accept/1` does not depend on
 whether the raw socket came from a TCP listener or `SCM_RIGHTS`.
 
-The handoff integration should use the public transport behavior rather than
-calling the internal `ThousandIsland.Connection` module directly. That keeps
+The handoff integration uses the public transport behavior rather than calling
+the internal `ThousandIsland.Connection` module directly. That keeps
 connection limits, supervision, telemetry, shutdown behavior, and future
 Thousand Island changes centralized.
 
@@ -309,8 +326,7 @@ exactly one acceptor.
 ### `controlling_process/2`
 
 Before the TLS handshake, this callback transfers ownership of the raw TCP or
-`:socket` socket to the newly started Thousand Island connection process.
-After negotiation it delegates to `:ssl.controlling_process/2`.
+`:gen_tcp` socket to the newly started Thousand Island connection process.
 
 The transport's tagged socket representation determines which operation is
 appropriate.
@@ -321,24 +337,31 @@ Both ordinary and handed-off connections reach this callback as raw connected
 sockets. The callback performs a server-side upgrade:
 
 ```elixir
-case :ssl.handshake(raw_socket, tls_options, handshake_timeout) do
+case :ssl.handshake(raw_socket, tls_options) do
   {:ok, ssl_socket} ->
     {:ok, negotiated_socket(ssl_socket)}
 
   {:ok, ssl_socket, _protocol_extensions} ->
     {:ok, negotiated_socket(ssl_socket)}
 
-  {:error, reason} = error ->
-    close_raw_socket(raw_socket)
-    error
+  other ->
+    other
 end
 ```
 
 OTP 29 accepts a `:gen_tcp` socket in the server-side handshake, making an FD
 wrapped with `:gen_tcp.fdopen/2` suitable for this upgrade path.
 
-The initial adapter supports OTP 29. Support for earlier releases is added only
-after the complete handoff path passes compatibility testing on those releases.
+The implemented transport records `:inet.peername/1` and `:inet.sockname/1`
+before TLS upgrade. On imported descriptors, OTP 29 may return `:ebadf` from
+the corresponding `:ssl` address calls after a successful handshake. The
+transport uses the cached kernel addresses only for that failure mode, while
+returning the plain negotiated SSL socket expected by Thousand Island's active
+message handling.
+
+The implemented adapter supports OTP 29. Support for earlier releases would be
+added only after the complete handoff path passes compatibility testing on
+those releases.
 
 The options must be the same options that an ordinary Bandit HTTPS listener
 would use, including:
@@ -404,9 +427,9 @@ the informational requested hostname to seed the base `certs_keys` required by
 OTP before handshake. The callback remains installed and selects the
 authoritative certificate from the untouched ClientHello.
 
-## Alternative prototype: two server instances
+## Implemented two-server architecture
 
-The implemented package uses two server instances:
+The package uses two server instances:
 
 1. The ordinary Phoenix HTTPS endpoint listens on its assigned TCP port.
 2. A second Bandit instance uses a handoff-only transport and the same Phoenix
@@ -555,9 +578,8 @@ The backend either:
 - Closes its descriptor and rejects it.
 - Disconnects before responding.
 
-The control protocol must define timeout behavior for the ambiguous case where
-the descriptor was delivered but the acknowledgement was lost. The safest
-initial policy is:
+The implementation handles the ambiguous case where the descriptor was
+delivered but the acknowledgement was lost as follows:
 
 - The backend treats descriptor receipt as ownership transfer.
 - phx-port closes its descriptor when `sendmsg` succeeds, regardless of a lost
@@ -597,7 +619,7 @@ post-`sendmsg` close.
 
 Relay fallback is safe only while phx-port still owns the sole usable
 descriptor and no consuming read has occurred. Once a descriptor has been
-successfully sent, the initial implementation must not attempt to convert that
+successfully sent, the implementation does not attempt to convert that
 connection into a relay.
 
 ## Security
@@ -612,7 +634,7 @@ health endpoint.
 - Verify peer credentials with `SO_PEERCRED` or the platform equivalent.
 - Require the daemon and backend to have the same UID.
 - Use unpredictable or project-bound socket names.
-- Reject stale capability registrations after process-generation changes.
+- Treat a missing or unreachable receiver endpoint as unavailable capability.
 - Permit only one descriptor per handoff request.
 - Validate that received descriptors refer to connected stream sockets.
 - Bound control-message and ancillary-data sizes.
@@ -625,7 +647,7 @@ outside the initial threat model.
 
 ## Portability
 
-`SCM_RIGHTS` is Unix-specific. The initial implementation targets Linux,
+`SCM_RIGHTS` is Unix-specific. The implementation targets Linux,
 matching the existing socket-handoff proof of concept.
 
 The capability must be detected at build time and runtime:
@@ -649,27 +671,27 @@ Compared with generic relay:
   kernel socket.
 - Long-lived WebSocket, HTTP/2, gRPC, and streaming connections benefit most.
 
-The design should be benchmarked against the generic relay before it becomes
-the default for capable backends. Connection setup rate, tail latency,
-descriptor pressure, scheduler impact, and failure behavior are more important
-than synthetic bulk throughput alone.
+The implementation currently prefers handoff automatically when a compatible
+receiver is present. It should still be benchmarked against the generic relay
+before being presented as a general production default. Connection setup rate,
+tail latency, descriptor pressure, scheduler impact, and failure behavior are
+more important than synthetic bulk throughput alone.
 
 ## Observability
 
-phx-port should expose counters and structured events for:
+`phx-port proxy status` currently exposes counters for:
 
 - Connections accepted on port 443.
-- Successful SNI route lookups.
-- Lazy route discoveries.
+- Successful certificate-verified route discoveries.
 - Handoff attempts.
 - Successful descriptor transfers.
-- Handoff unavailability and relay fallback.
-- Failures before and after `sendmsg`.
-- Handoff acknowledgement latency.
-- Active backend capabilities.
+- Handoff unavailability and pre-delivery relay fallback.
+- Failures after descriptor delivery.
+- Relayed and rejected connections.
 
-The backend transport should identify connection origin in Thousand Island
-telemetry metadata:
+Structured events, acknowledgement-latency histograms, active-capability
+reporting, and explicit ingress metadata in Thousand Island telemetry remain
+future observability work. The intended metadata shape is:
 
 ```text
 ingress = direct | phx_port_handoff
@@ -681,15 +703,14 @@ The original remote address remains the standard connection peer metadata.
 
 ### Transport tests
 
-- Accept an ordinary TCP socket and complete a TLS handshake.
 - Receive an FD over `SCM_RIGHTS` and complete the same TLS handshake.
-- Confirm both paths invoke the same Bandit handler.
+- Confirm direct and handoff server instances invoke the same Bandit handler.
 - Confirm `peername` reports the original client for handed-off sockets.
 - Confirm `sockname` reports port 443 for handed-off sockets.
 - Exercise certificate selection through backend SNI configuration.
 - Exercise ALPN negotiation for HTTP/1.1 and HTTP/2.
 - Verify socket closure on every failure branch.
-- Run multiple acceptors concurrently without duplicate descriptor delivery.
+- Verify duplicate connection identifiers are rejected.
 
 ### phx-port tests
 
@@ -712,6 +733,11 @@ The original remote address remains the standard connection peer metadata.
 - Compare descriptor counts before and after sustained load to detect leaks.
 - Compare latency and CPU utilization with generic TCP relay.
 
+The HTTP/1.1, HTTP/2, LiveView WebSocket, original peer-address, concurrent
+cross-site, and in-VM listener restart scenarios have been exercised end to
+end. Certificate rotation under load, sustained descriptor-leak testing, and
+comparative performance benchmarks remain outstanding.
+
 ## Delivery status
 
 1. [x] Build a handoff-only Thousand Island transport.
@@ -725,7 +751,8 @@ The original remote address remains the standard connection peer metadata.
    queue if benchmarks show it is needed.
 8. [ ] Evaluate combining ordinary TCP and handoff acceptance in one hybrid
    transport.
-9. [ ] Benchmark and harden before making handoff a general default.
+9. [ ] Benchmark and harden before presenting handoff as a general production
+   default.
 
 ## Resolved implementation choices
 
@@ -734,8 +761,9 @@ The original remote address remains the standard connection peer metadata.
 - Implement the wire encoding independently in the daemon and NIF against one
   written specification.
 - Use a Rustler resource-backed native accept broker supervised from Elixir.
-- Share one Thousand Island connection supervisor and connection limit between
-  direct and handed-off traffic in the final hybrid transport.
+- Keep separate Thousand Island listener and connection supervisors in the
+  implemented two-server architecture; sharing them remains a possible hybrid
+  transport refinement.
 - Support OTP 29 initially.
 - Derive the handoff socket path from the canonical project path and role.
 - Prefer handoff automatically when its endpoint is healthy.
@@ -743,14 +771,17 @@ The original remote address remains the standard connection peer metadata.
 - Treat successful `sendmsg` as the ownership boundary.
 - Infer backend shutdown through daemon health checks rather than an explicit
   draining message.
-- Prototype with a handoff-only second Bandit server before implementing the
-  hybrid listener.
+- Use a handoff-only second Bandit server now; implement a hybrid listener only
+  if shared limits or measured performance justify the additional complexity.
 - Keep the Elixir adapter as an independently versioned Mix package under
   `integrations/elixir/phx_port_handoff` in this repository.
 
-The remaining questions are empirical rather than architectural: exact queue
-sizes inside the native broker, scheduler impact, socket option compatibility,
-and whether tested OTP releases older than 29 can be supported later.
+The remaining questions are empirical rather than architectural: scheduler
+impact, socket option compatibility, comparative performance, sustained
+descriptor behavior, and whether tested OTP releases older than 29 can be
+supported later. Rustler 0.38 also requires a separate ownership investigation:
+it produced `tcp_inet` descriptor-control conflicts after successful request
+handling, so the verified integration remains pinned to Rustler 0.36.2.
 
 ## Decision summary
 

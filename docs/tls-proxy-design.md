@@ -2,7 +2,14 @@
 
 ## Status
 
-Chosen design for implementation.
+Implemented. The daemon, eager and lazy certificate discovery, persistent
+derived routes, conflict handling, health reconciliation, control socket,
+systemd user-service management, and generic TLS relay are operational.
+
+On Linux, a compatible workload can additionally receive the original client
+descriptor through the optional socket-handoff path described in
+[`socket-forwarding-design.md`](socket-forwarding-design.md). The generic relay
+remains the framework-independent baseline.
 
 ## Context
 
@@ -17,9 +24,9 @@ https://contoso.com:443      -> https://127.0.0.1:4001
 https://www.fabrikam.com:443 -> https://127.0.0.1:4002
 ```
 
-Only one process can bind TCP port 443. `phx-port` will therefore gain a
-long-running daemon that routes incoming TLS connections to active registered
-workloads according to Server Name Indication (SNI).
+Only one process can bind TCP port 443. `phx-port` therefore runs a long-lived
+daemon that routes incoming TLS connections to active registered workloads
+according to Server Name Indication (SNI).
 
 For example, a workload at `/home/user/projects/contoso_web` may serve two
 hostnames using two certificates selected by its TLS SNI callback:
@@ -42,8 +49,8 @@ The design is not specific to Elixir, Phoenix, Bandit, or HTTP.
 5. The daemon eagerly discovers hostnames from each new `https` workload's
    default certificate when that workload supports a TLS handshake without
    SNI.
-6. When a client requests an unknown SNI hostname, the daemon probes all
-   active HTTPS workloads using that hostname as SNI.
+6. When a client requests an unknown SNI hostname, the daemon probes a bounded
+   set of active HTTPS workloads using that hostname as SNI.
 7. A hostname is routed only when exactly one backend presents a valid,
    matching certificate.
 8. Successful lazy discoveries are cached persistently.
@@ -102,25 +109,30 @@ The design is not specific to Elixir, Phoenix, Bandit, or HTTP.
 The daemon is a layer-4 TCP proxy with TLS ClientHello inspection. It does not
 terminate TLS:
 
-```text
-Client
-  |
-  | TLS ClientHello, SNI=www.contoso.com
-  v
-phx-port daemon, 0.0.0.0:443
-  |
-  | inspect SNI, select active route, forward original bytes
-  v
-contoso_web, 127.0.0.1:4001
-  |
-  | terminate TLS and select the certificate
-  v
-Application
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Router as phx-port :443
+    participant Backend as contoso_web :4001
+
+    Client->>Router: TCP connection + TLS ClientHello
+    Router->>Router: MSG_PEEK, parse SNI, select active route
+    Router->>Backend: Open backend TCP connection
+    Router->>Backend: Forward the original ClientHello
+    Backend-->>Client: Complete TLS handshake through opaque relay
+    loop Until either endpoint closes
+        Client->>Router: Encrypted TLS records
+        Router->>Backend: Copy records
+        Backend->>Router: Encrypted TLS records
+        Router->>Client: Copy records
+    end
 ```
 
-The daemon buffers a bounded ClientHello, extracts its SNI hostname, selects a
-route, opens the backend TCP connection, writes the original buffered bytes
-unchanged, and then copies bytes bidirectionally until either side closes.
+The daemon peeks at a bounded ClientHello without consuming it, extracts its
+SNI hostname, and selects a route. If socket handoff is unavailable, it opens
+the backend TCP connection, consumes exactly the bytes that were peeked,
+writes them unchanged to the backend, and then copies bytes bidirectionally
+until either side closes.
 
 Because the original handshake reaches the backend:
 
@@ -203,29 +215,28 @@ The socket is `$XDG_RUNTIME_DIR/phx-port/control.sock` when
 to replace one whose daemon responds.
 
 `status` reports listener addresses, route and conflict counts, bounded
-discovery resource usage, and connection/discovery counters. `routes` returns
-the live active and conflicting route table while the daemon is reachable,
-then falls back to cached registry state for offline diagnostics. `stop`
-requests graceful shutdown: listeners and reconciliation stop accepting new
-work, existing relays receive up to 30 seconds to finish, and the control
+discovery resource usage, connection/discovery counters, and handoff outcomes.
+`routes` returns the live active and conflicting route table while the daemon
+is reachable, then falls back to cached registry state for offline diagnostics.
+`stop` requests graceful shutdown: listeners and reconciliation stop accepting
+new work, existing relays receive up to 30 seconds to finish, and the control
 socket is removed.
 
 ## Workload discovery
 
-The daemon watches the existing port registry and also reconciles it
-periodically. Filesystem notifications reduce activation latency, while
-periodic reconciliation covers missed events, atomic file replacement, and
-platform differences.
+The daemon rereads and reconciles the existing port registry once per second.
+This simple polling model also handles atomic registry replacement without
+requiring platform-specific filesystem notification behavior.
 
 For each registered `https` or `main` role, the daemon tracks:
 
 - Canonical project path.
-- Assigned port.
+- Port role and assigned port.
 - TCP listener availability.
-- TLS readiness.
-- Last successful probe.
-- Hostnames currently verified for the workload.
-- Current leaf-certificate fingerprints and validity periods.
+- Hostnames currently verified for the workload and their leaf-certificate
+  fingerprints.
+- Last TLS verification time and consecutive TCP failure count for active
+  routes.
 
 A TCP connect alone is insufficient for routing. A workload becomes eligible
 for a hostname after one complete TLS probe for that hostname succeeds with
@@ -272,14 +283,36 @@ discovery.
 For an incoming ClientHello with an unknown hostname:
 
 1. Validate and normalize the requested DNS hostname.
-2. Buffer the original ClientHello without replying to the client.
+2. Peek at the original ClientHello without consuming it or replying.
 3. Join any discovery already in progress for that hostname.
-4. Concurrently probe all active HTTPS workloads, using the requested hostname
-   as SNI.
+4. Concurrently probe up to 32 active HTTPS workloads, using the requested
+   hostname as SNI.
 5. Validate each returned certificate and handshake against that hostname.
 6. If exactly one backend matches, atomically add the route.
-7. Connect to that backend and forward the original ClientHello unchanged.
+7. Deliver the untouched connection by socket handoff when available;
+   otherwise connect to the backend and forward the original ClientHello
+   unchanged.
 8. Persist the successful mapping as derived cache state.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Router as phx-port
+    participant A as HTTPS workload A
+    participant B as HTTPS workload B
+
+    Client->>Router: ClientHello for unknown contoso.com
+    Router->>Router: MSG_PEEK and join/create single-flight
+    par Bounded certificate probes
+        Router->>A: TLS probe with SNI contoso.com
+        A-->>Router: Trusted matching certificate
+    and
+        Router->>B: TLS probe with SNI contoso.com
+        B-->>Router: Certificate mismatch
+    end
+    Router->>Router: Require exactly one match and persist route
+    Router-->>Client: Continue through handoff or relay
+```
 
 The original client socket waits for at most 250 milliseconds while discovery
 runs. At most 64 client connections may wait for discovery, and at most 32
@@ -337,12 +370,24 @@ cached hostname also removes the route.
 
 ## Route lifecycle
 
-Routes have the following conceptual states:
+Routes have the following conceptual states. The implementation stores active
+routes plus their failure counters rather than materializing every state as a
+separate enum:
 
-```text
-cached -> probing -> active -> unhealthy -> inactive
-                     |
-                     +-> conflict
+```mermaid
+stateDiagram-v2
+    [*] --> Cached: persisted derived route
+    Cached --> Probing: daemon or workload starts
+    Probing --> Active: one trusted backend
+    Probing --> Conflict: multiple trusted backends
+    Probing --> Inactive: no trusted backend
+    Active --> Active: successful liveness and TLS checks
+    Active --> Unhealthy: TCP check fails
+    Unhealthy --> Active: backend recovers
+    Unhealthy --> Inactive: third consecutive TCP failure
+    Active --> Active: quarantine valid contender and record conflict
+    Conflict --> Active: one valid owner remains
+    Inactive --> Probing: workload set changes
 ```
 
 - **Cached:** Persisted mapping has not yet been verified in this daemon
@@ -395,7 +440,7 @@ never be used as an implicit tie-breaker.
 
 ## Trust policy
 
-By default, probe validation should use the operating system's trusted root
+Probe validation uses the operating system's trusted root
 store and standard DNS hostname verification. This proves that a local
 workload holds a certificate trusted for the requested public name.
 
@@ -410,23 +455,19 @@ tolerating conventional extra certificates after the usable chain.
 ## Abuse resistance and resource limits
 
 Lazy discovery turns an unknown SNI value into fan-out work and therefore
-requires strict bounds:
+requires strict bounds. The implementation currently:
 
 - Reject malformed, non-DNS, oversized, or missing SNI values.
-- Limit the ClientHello size and handshake read time.
-- Give discovery a 250 millisecond deadline.
-- Permit at most 64 waiting clients and 32 concurrent backend probes.
-- Use single-flight discovery per normalized hostname.
-- Maintain a bounded negative cache for names with no match.
-- Cache misses for 30 seconds.
-- Invalidate negative entries when a new TLS workload activates or a backend
-  certificate fingerprint changes.
-- Rate-limit unknown-host discoveries globally and per source address.
-- Bound the number of buffered client connections awaiting discovery.
-- Bound positive and negative cache sizes.
-- Do not follow backend redirects or make HTTP requests during discovery.
-- Never expose certificate contents, key material, or sensitive paths in
-  routine logs.
+- Limits ClientHello inspection to 64 KiB and two seconds.
+- Gives discovery a 250 millisecond deadline.
+- Permits at most 64 waiting clients and 32 concurrent backend probes.
+- Probes at most 32 live candidate registrations per discovery.
+- Uses one single-flight operation per normalized hostname.
+- Keeps at most 1,024 negative entries for 30 seconds.
+- Invalidates negative entries when the live workload set changes.
+- Performs only loopback TCP/TLS probes; it does not follow redirects or make
+  HTTP requests.
+- Does not log certificate contents, key material, or TLS payload.
 
 Once a route exists, forwarding does not require additional TLS parsing beyond
 the initial ClientHello.
@@ -435,77 +476,83 @@ A wildcard certificate may validate a concrete hostname during lazy
 discovery, but the daemon caches only that observed hostname. It never creates
 an implicit wildcard route from the certificate.
 
+Per-source admission control and a bound on positive persisted routes remain
+possible hardening work if hostile local or public traffic makes the current
+global bounds insufficient.
+
 ## Failure behavior
 
 | Condition | Behavior |
 |---|---|
 | Missing SNI | Close the connection |
 | Malformed ClientHello | Close the connection and record a bounded diagnostic |
-| Known active hostname | Connect and proxy immediately |
+| Known active hostname | Attempt handoff, then relay if handoff is unavailable |
 | Cached but inactive hostname | Revalidate the cached backend, then fan out if needed |
 | Unknown hostname | Run bounded lazy discovery |
 | No matching backend | Negative-cache and close |
-| Multiple matching backends | Mark conflict and close |
+| Multiple matching backends without a valid incumbent | Mark conflict and close |
+| Valid incumbent plus a new matching contender | Preserve incumbent and quarantine contender |
 | Backend stops | Deactivate its routes after the failure threshold |
 | Backend restarts | Revalidate cached routes and reactivate |
 | Certificate rotates validly | Update fingerprint and retain the route |
 | Certificate expires or drops hostname | Deactivate the affected route |
 
-## Implementation outline
+## Implemented components
 
-The daemon should be implemented natively in Rust. The expected components are:
+The daemon is implemented in Rust with OS threads and synchronized shared
+state. Each accepted connection gets a worker thread; bounded probe permits and
+single-flight discovery prevent unknown SNI traffic from creating unbounded
+certificate-probe work. The implementation consists of:
 
-- An asynchronous runtime for listener, probe, timer, and signal handling.
-- A registry watcher plus periodic reconciler.
-- A TLS probe client using the system trust roots.
-- A bounded ClientHello reader and SNI parser.
-- An immutable route table published through an atomic swap.
-- Single-flight lazy discovery with bounded parallel probes.
-- Bidirectional TCP copying after forwarding the buffered ClientHello.
-- Atomic persistent-cache reads and writes.
-- Graceful shutdown and structured diagnostics.
-
-The ingress parser may feed a copy of the buffered bytes to a TLS ClientHello
-parser while retaining the original bytes for the backend. It must never
-complete a server-side handshake or synthesize a replacement ClientHello.
-
-Implementation should be split into independently testable modules rather than
-extending the existing single source file indefinitely:
+- `proxy.rs` for listeners, reconciliation, discovery, route health, control,
+  handoff selection, and relay.
+- `tls_client_hello.rs` for bounded, non-consuming ClientHello inspection.
+- `route_cache.rs` for atomically persisted derived routes.
+- `handoff.rs` and `handoff_protocol.rs` for the optional Linux descriptor
+  transfer path.
+- The existing registry helpers in `main.rs` for stable project/role ports.
 
 ```text
 src/
   main.rs
-  registry.rs
-  daemon.rs
-  client_hello.rs
-  discovery.rs
-  probe.rs
-  routes.rs
+  proxy.rs
+  tls_client_hello.rs
   route_cache.rs
+  handoff.rs
+  handoff_protocol.rs
 ```
+
+The ingress parser never completes a server-side handshake or synthesizes a
+replacement ClientHello. `MSG_PEEK` leaves the original bytes queued for
+handoff; the relay path consumes and forwards those same bytes only after
+handoff is unavailable.
 
 ## Validation strategy
 
-Automated tests should cover:
+Automated tests currently cover:
 
-- ClientHello fragmentation across TCP reads.
+- ClientHello fragmentation across TLS records and incomplete reads.
 - SNI extraction and hostname normalization.
 - Oversized and malformed ClientHello rejection.
-- Eager SAN discovery.
-- Lazy discovery of a non-default SNI certificate.
-- No match, one match, and multiple-match outcomes.
+- Non-consuming ClientHello inspection.
+- Exact-SAN extraction without eager wildcard expansion.
+- Suppression of eager TLS probes against compatibility `main` roles.
 - Single-flight behavior under concurrent first requests.
-- Positive and negative cache expiration.
-- Route removal and reactivation as a backend stops and starts.
-- Certificate rotation, expiration, and hostname removal.
-- Preservation of original TLS bytes.
-- Long-lived connection draining after route deactivation.
-- Registry and route-cache concurrent updates.
-- WebSocket, HTTP/2, gRPC, and non-HTTP TLS passthrough.
+- Waiting-client and concurrent-probe limits.
+- Deterministic conflict recording and `https` role preference.
+- Persistent route creation and removal with registry changes.
+- Deactivation after three failed TCP checks while retaining the cached hint.
+- Independent IPv4 and IPv6 listener binding.
+- Control status and stop behavior.
 
-An end-to-end fixture should start at least two local TLS servers with distinct
-SNI certificates and prove that a single daemon listener routes each hostname
-to the correct backend.
+End-to-end validation with independently certificated Phoenix sites has covered
+eager and lazy SNI routing, direct TLS access, HTTP/1.1, HTTP/2, LiveView
+WebSocket upgrades, route persistence, multiple simultaneous sites, and
+certificate rotation through application-owned TLS configuration.
+
+Additional automated coverage remains desirable for sustained connection
+draining, concurrent registry writers under load, gRPC or other non-HTTP TLS
+protocols, and certificate expiration or hostname removal.
 
 ## Limitations
 
@@ -525,13 +572,15 @@ to the correct backend.
 
 ## Decision summary
 
-`phx-port` will become a dynamic, framework-independent SNI passthrough proxy.
+`phx-port` is a dynamic, framework-independent SNI passthrough proxy.
 Applications continue to terminate TLS on stable, loopback-bound HTTPS ports.
-The daemon discovers explicit `https` default certificate names eagerly and discovers
-non-default certificate names lazily by probing every active backend with the
-unknown hostname as SNI. Verified routes are cached as derived state and are
-activated only while their workloads remain healthy.
+The daemon discovers explicit `https` default certificate names eagerly and
+discovers non-default certificate names lazily by probing active backends with
+the unknown hostname as SNI. Verified routes are cached as derived state and
+are activated only while their workloads remain healthy.
 
 This design provides dynamic routing and certificate hot-reloading without
 centralizing private keys, parsing application configuration, depending on
-nginx, or implementing an HTTP reverse proxy.
+nginx, or implementing an HTTP reverse proxy. Compatible Linux workloads may
+receive the original socket directly; all others continue through opaque TLS
+relay.

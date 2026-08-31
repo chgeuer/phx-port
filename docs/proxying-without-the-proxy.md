@@ -110,16 +110,23 @@ Knowing the route is only half the job. The portable way to deliver the
 connection is TLS passthrough. Once `phx-port` knows that `www.contoso.com`
 belongs to port 4008, the implementation is straightforward:
 
-```text
-browser
-   |
-   | TLS for www.contoso.com
-   v
-phx-port :443
-   |
-   | opaque TLS bytes
-   v
-Contoso :4008
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant Proxy as phx-port :443
+    participant App as Contoso :4008
+
+    Browser->>Proxy: TCP connection + TLS ClientHello
+    Proxy->>Proxy: Peek SNI = www.contoso.com
+    Proxy->>App: Open second TCP connection
+    Proxy->>App: Forward original ClientHello
+    App-->>Browser: Complete end-to-end TLS handshake via relay
+    loop For the lifetime of the connection
+        Browser->>Proxy: Encrypted TLS records
+        Proxy->>App: Copy encrypted TLS records
+        App->>Proxy: Encrypted TLS records
+        Proxy->>Browser: Copy encrypted TLS records
+    end
 ```
 
 `phx-port` does not terminate TLS. It forwards the original ClientHello and
@@ -178,14 +185,24 @@ That turns `phx-port` into a proxy only during connection establishment. It
 accepts the connection, identifies the application, transfers the socket, and
 gets out of the way:
 
-```text
-                            routing only
-browser ---> phx-port :443 -------------+
-                                           \
-                                            v
-                                      Bandit / Phoenix
-                                           |
-                         original TCP socket, direct to browser
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant Router as phx-port :443
+    participant Receiver as PHXP receiver
+    participant Phoenix as Bandit / Phoenix
+
+    Browser->>Router: TCP connection + TLS ClientHello
+    Router->>Router: MSG_PEEK and resolve SNI route
+    Router->>Receiver: HELLO
+    Receiver-->>Router: READY
+    Router->>Receiver: HANDOFF + client FD via SCM_RIGHTS
+    Note over Router,Receiver: Successful sendmsg transfers ownership
+    Router->>Router: Close daemon's descriptor
+    Receiver->>Phoenix: Adopt FD with gen_tcp.fdopen
+    Receiver-->>Router: ADOPTED
+    Phoenix-->>Browser: TLS handshake on original socket
+    Note over Browser,Phoenix: phx-port is no longer in the data path
 ```
 
 For a handoff-enabled Phoenix application, the sequence is:
@@ -277,16 +294,14 @@ through Bandit's usual machinery.
 The resulting Phoenix application deliberately runs two cooperating
 listeners:
 
-```text
-assigned HTTPS port ----> ordinary Bandit TLS listener
-                          - certificate discovery
-                          - health checks
-                          - direct debugging
-
-private Unix socket ----> handoff-only Bandit listener
-                          - original port-443 sockets
-                          - same TLS configuration
-                          - same Phoenix endpoint
+```mermaid
+flowchart LR
+    Probe["TLS probes and direct debugging"] -->|assigned HTTPS port| Ordinary
+    Router["phx-port :443"] -->|SCM_RIGHTS over private Unix socket| Handoff
+    Ordinary["Ordinary Bandit TLS listener"] --> Endpoint["Phoenix endpoint"]
+    Handoff["Handoff-only Bandit listener"] --> Endpoint
+    TLS["Same application-owned TLS configuration"] --> Ordinary
+    TLS --> Handoff
 ```
 
 At first, keeping an ordinary TCP listener alongside the handoff listener can
