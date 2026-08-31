@@ -1,50 +1,35 @@
 # Proxying Without the Proxy: Handing a Live TLS Socket to Phoenix
 
-I love developing and running multiple web apps on my laptop. 
-Web frameworks like Elixir's Phoenix use some default TCP port (like `4000`) to host their HTTP listener.
-Port collisions are the natural result, so that I have to start configuring (and remembering) which project listens on which TCP port.
-To solve that pain, I developed [`phx-port`](https://github.com/chgeuer/phx-port), a small Rust utility that I can use to change the port by setting a per-project port via environment variable (instead of fiddling in the config files).
-However, I also love turning on security bits like TLS as soon as possible, so I use LetsEncrypt's DNS ACME challenge to give each of my toy projects a production certificate. 
-But - I don't want connect to my 'production-grade' https: endpoint over some funky port number (like `https://www.contoso.com:4017/`), I just want the real `https://www.contoso.com/` in my browser bar. There's a mechanism for exposing multiple domains under the same TCP/TLS port called SNI. But SNI forces the TLS-endpoint to have all the private keys for the different certificates, and I want to keep the certificate key material within my web projects, and I don't want to have to configure some NGINX or other reverse proxy with all the domains. And - I don't want the reverse proxy to 'terminate' the TLS connection, just to establish yet another downstream TLS connection to my actual workload, and then do busywork shoveling bytes forth and back. Then I remembered a Twitter conversation with Chris McCord about [blue/green deployments](https://github.com/chgeuer/blue_green) and (on Linux) handing off existing TCP sockets using Linux SCM_RIGHTS file descriptors, and that led to the most recent version of `phx-port`. 
+I love developing and running several web applications on my laptop. I also
+want those applications to behave like the real thing: real hostnames, real
+production certificates, and real TLS termination inside the application.
+What I do not want is a spreadsheet of port numbers, a second configuration
+database in a reverse proxy, or an extra TCP connection shoveling bytes around
+for no useful reason.
 
-------------
+That combination of preferences took a small port-allocation utility somewhere
+unexpected: all the way from choosing port 4001 instead of 4000 to passing a
+live port-443 socket into the BEAM.
 
-Most local reverse proxies solve one problem by creating another connection.
-They accept traffic on a well-known port, choose a backend, connect to that
-backend, and relay bytes between the two sockets:
+## It started with too many projects and one default port
 
-```text
-browser <-- connection A --> proxy <-- connection B --> application
-```
+Phoenix applications normally start on TCP port 4000. That is convenient until
+the second application starts. Then one project moves to 4001, another to
+4002, and before long I am maintaining arbitrary port choices in project
+configuration and trying to remember which application owns which number.
 
-That is a perfectly good default. It works with almost any server, it keeps
-application changes to a minimum, and TLS passthrough lets the application
-retain its certificate and private key. It does, however, mean that the proxy
-stays in the data path for the entire connection. The application sees the
-proxy as its TCP peer, not the browser, and every byte crosses an additional
-local connection.
-
-While extending `phx-port` into a dynamic TLS router, we built a second path
-for cooperative Phoenix applications. `phx-port` still accepts the connection
-and decides where it belongs, but instead of proxying its bytes, it passes the
-already-connected TCP socket to the selected Bandit server. After that
-handoff, `phx-port` is gone from the connection.
-
-It is a proxy for connection establishment, but not a proxy for the
-established connection.
-
-## From predictable ports to predictable hostnames
-
-`phx-port` originally had a deliberately small job: assign a stable local port
-to each project directory. Two applications that would both normally use port
-4000 instead receive persistent, collision-free ports:
+I wrote [`phx-port`](https://github.com/chgeuer/phx-port) to remove that
+bookkeeping. It is a small Rust utility that assigns a stable port to a
+canonical project directory and persists the mapping. The project does not
+need a hard-coded development port; it just reads an environment variable:
 
 ```bash
 PORT="$(phx-port)" mix phx.server
 ```
 
-Named roles extend the same registry to applications that need more than one
-listener:
+The same project gets the same port next time, while different projects do not
+collide. Named roles extend the registry when an application needs more than
+one listener:
 
 ```bash
 PORT="$(phx-port)" \
@@ -52,10 +37,51 @@ HTTPS_PORT="$(phx-port https)" \
 mix phx.server
 ```
 
-The `main` role can serve clear HTTP while the `https` role runs the
-application's real production-style TLS configuration. Each project owns its
-certificate, private key, SNI callback, ALPN configuration, and renewal
-lifecycle.
+That solved port allocation. It did not solve the URL in my browser.
+
+## I wanted real TLS, not `localhost` with a fancy port
+
+I prefer to enable security features early instead of discovering their
+assumptions during deployment. My development applications use Let's Encrypt
+production certificates obtained through the DNS-01 ACME challenge. Each
+application can request and renew its own certificate without exposing a
+temporary HTTP challenge endpoint.
+
+At that point, opening this felt wrong:
+
+```text
+https://www.contoso.com:4017/
+```
+
+The certificate is real and the hostname is real, but the URL still advertises
+the local port-allocation problem. I wanted the ordinary URL:
+
+```text
+https://www.contoso.com/
+```
+
+Multiple TLS sites can share port 443 because the ClientHello carries the
+requested hostname in its Server Name Indication (SNI) extension. A
+conventional answer would be to configure NGINX, HAProxy, or another reverse
+proxy with every hostname and certificate.
+
+That was precisely the configuration I wanted to avoid. The applications
+already know their hostnames. They already obtain and renew their certificates.
+They already have the correct TLS policy. Copying all of that into a central
+proxy would create a second source of truth and concentrate every private key
+in one process.
+
+So I added a different constraint: `phx-port` may route TLS, but it must not
+terminate it. Certificate and key material stay inside the application that
+owns them.
+
+## Discover the routes from the applications themselves
+
+The `main` role serves ordinary HTTP, while the `https` role runs the
+application's real production-style TLS configuration on its assigned local
+port. Each project remains responsible for its private key, certificate
+renewal, SNI callback, ALPN configuration, cipher policy, and optional client
+authentication.
 
 The `phx-port` daemon binds public TCP port 443. When a new connection arrives,
 it inspects the TLS ClientHello, extracts the requested SNI hostname, and maps
@@ -73,13 +99,16 @@ support eager discovery, while an unknown incoming SNI name can trigger a
 bounded lazy scan. Verified routes are persisted as derived state and removed
 from active service when their workload disappears.
 
-This keeps certificate ownership where it belongs: inside the application
-that requested and renews the certificate.
+In other words, I do not configure `www.contoso.com -> 4008` manually.
+`phx-port` learns that mapping by asking every live TLS workload, "Can you prove
+that this hostname is yours?" The certificate is both the application's
+identity and the source of the routing fact.
 
-## The universal path: opaque TLS relay
+## The first working version still looked like a proxy
 
-Once `phx-port` knows that `www.contoso.com` belongs to port 4008, the portable
-implementation is straightforward:
+Knowing the route is only half the job. The portable way to deliver the
+connection is TLS passthrough. Once `phx-port` knows that `www.contoso.com`
+belongs to port 4008, the implementation is straightforward:
 
 ```text
 browser
@@ -98,8 +127,17 @@ then copies encrypted bytes in both directions. The backend performs the
 handshake and selects its own certificate. This works for Phoenix, another web
 framework, or any TLS-capable process.
 
-The relay is therefore the compatibility path and the safe fallback. Its
-tradeoffs are inherent in the two-connection shape:
+This met the important security goal: the proxy never sees a private key or
+plaintext HTTP. It also works with an unmodified TLS server, so it remains the
+compatibility path and safe fallback.
+
+But it still creates the classic proxy shape:
+
+```text
+browser <-- connection A --> phx-port <-- connection B --> application
+```
+
+Its costs are inherent in those two connections:
 
 - The backend's TCP peer is the local proxy.
 - The daemon remains active for the lifetime of the connection.
@@ -110,14 +148,35 @@ without terminating and understanding the higher-level protocol. PROXY
 protocol could carry peer metadata, but it would require support on both ends
 and would still leave the relay in the data path.
 
-## The cooperative path: transfer the real socket
+This is not an argument that a loopback TCP connection is catastrophically
+slow. It is an argument against paying for work the architecture does not
+need. Every proxied connection adds another socket, another TCP handshake to
+the backend, two copy loops, more scheduling, more buffers, and another
+process that must remain healthy until the client disconnects.
+
+The more I looked at it, the more that second TCP connection bothered me.
+`phx-port` had already accepted exactly the connection the application needed.
+After reading just enough of its ClientHello to choose a destination, why
+should it create another connection and spend the rest of its life copying
+encrypted bytes between the two?
+
+Or, less politely: why do all that unnecessary TCP shit?
+
+## The old idea that unlocked the new path
+
+I remembered a Twitter conversation with Chris McCord about
+[blue/green deployments](https://github.com/chgeuer/blue_green). The key idea
+was that on Linux, one process can hand an existing socket to another process
+using `SCM_RIGHTS`.
 
 Linux can pass an open file descriptor between processes over a Unix-domain
 socket using `sendmsg(2)` and `SCM_RIGHTS`. The descriptor received by the
 application refers to the same kernel TCP socket that `phx-port` accepted on
 port 443.
 
-For a handoff-enabled backend, the topology becomes:
+That turns `phx-port` into a proxy only during connection establishment. It
+accepts the connection, identifies the application, transfers the socket, and
+gets out of the way:
 
 ```text
                             routing only
@@ -129,7 +188,7 @@ browser ---> phx-port :443 -------------+
                          original TCP socket, direct to browser
 ```
 
-The sequence is:
+For a handoff-enabled Phoenix application, the sequence is:
 
 1. `phx-port` accepts a client connection on port 443.
 2. It peeks at the ClientHello and resolves the SNI route.
@@ -146,12 +205,18 @@ No application bytes are relayed after step 7. Phoenix sees the browser's real
 source address through `Plug.Conn.remote_ip`, and the socket still has local
 port 443 because it really is the socket accepted on port 443.
 
+That is the distinction in the title. `phx-port` is a proxy while it makes the
+routing decision, and only a "proxy" afterward: it does not impersonate either
+endpoint or remain between them once the decision is made.
+
 ## Peeking is the crucial trick
 
-Routing requires reading the SNI hostname before deciding where the connection
-goes. TLS also requires the backend to receive the complete, original
-ClientHello. A normal `recv(2)` would consume those bytes, leaving the
-application with a stream that starts in the middle of the TLS handshake.
+The appealing one-line version is "just pass the FD." The catch is that
+`phx-port` must inspect the connection before it knows where to pass it.
+Routing requires the SNI hostname, while the backend's TLS stack requires the
+complete, original ClientHello. A normal `recv(2)` would consume those bytes,
+leaving the application with a stream that starts in the middle of the TLS
+handshake.
 
 `phx-port` instead uses `MSG_PEEK`. Peeking copies bytes out of the kernel
 receive queue without advancing it:
@@ -175,10 +240,11 @@ receive a hostname.
 
 ## Making an imported descriptor look ordinary to Bandit
 
-Passing an FD is only the kernel-level half of the problem. Bandit normally
-expects Thousand Island to accept a socket from a TCP listener, establish
-ownership, gather peer metadata, perform the TLS handshake, and then start the
-HTTP connection lifecycle.
+Preserving the bytes solved the routing half of the problem. Making an
+arbitrary imported file descriptor behave like a connection accepted normally
+by Phoenix was the other half. Bandit expects Thousand Island to accept a
+socket from a listener, establish ownership, gather peer metadata, perform the
+TLS handshake, and then start the HTTP connection lifecycle.
 
 The `PhxPortHandoff` package provides a custom
 `ThousandIsland.Transport`. Its native Rustler receiver:
@@ -198,7 +264,8 @@ After the handshake, there is no special Phoenix request path. HTTP/1.1,
 HTTP/2, LiveView WebSockets, Plug, telemetry, and endpoint routing all proceed
 through Bandit's usual machinery.
 
-The Phoenix application runs two cooperating listeners:
+The resulting Phoenix application deliberately runs two cooperating
+listeners:
 
 ```text
 assigned HTTPS port ----> ordinary Bandit TLS listener
@@ -212,15 +279,18 @@ private Unix socket ----> handoff-only Bandit listener
                           - same Phoenix endpoint
 ```
 
-Keeping the ordinary HTTPS listener matters. It gives the daemon a
-framework-independent way to prove hostname ownership and provides a direct
-diagnostic path even if handoff is unavailable.
+At first, keeping an ordinary TCP listener alongside the handoff listener can
+look redundant. It is actually what keeps discovery independent of Phoenix.
+The daemon can prove hostname ownership using an ordinary TLS handshake,
+perform health checks, and offer a direct diagnostic path even if handoff is
+unavailable. The Unix listener is then an advertised optimization for traffic
+whose route is already trusted.
 
-## Capability detection and safe fallback
+## Cooperation is optional
 
-Socket handoff is an optimization, not a requirement for joining the routing
-system. Each `(project path, role)` pair maps deterministically to a private
-Unix socket:
+I did not want the clever path to become the only path. Socket handoff is an
+optimization, not a requirement for joining the routing system. Each
+`(project path, role)` pair maps deterministically to a private Unix socket:
 
 ```text
 $XDG_RUNTIME_DIR/phx-port/handoff/
@@ -232,7 +302,7 @@ missing, stale, incompatible, or rejects the connection before descriptor
 delivery, the daemon opens the backend's registered HTTPS port and uses the
 ordinary TLS relay.
 
-The ownership boundary is intentionally strict. Before a successful
+This fallback has one non-negotiable ownership boundary. Before a successful
 `sendmsg`, relay fallback is safe because the daemon still owns the only client
 descriptor. After descriptor delivery, fallback is forbidden: the receiver
 may already be using the same kernel socket. A post-delivery failure closes
@@ -258,7 +328,7 @@ The handoff channel is local and deliberately narrow:
 Private keys never cross this channel. They stay in the Phoenix application,
 just as they do on the relay path.
 
-## What this buys us
+## The result
 
 The combined design supports two kinds of workload behind the same dynamic SNI
 router:
@@ -268,16 +338,28 @@ router:
 | Any TLS server | Opaque byte relay | Backend | `phx-port` loopback |
 | Handoff-enabled Phoenix/Bandit | `SCM_RIGHTS` socket transfer | Backend | Original client |
 
-Both paths preserve end-to-end TLS ownership. The cooperative path additionally
-removes the daemon from steady-state traffic and preserves the kernel's real
-connection metadata.
+Both paths preserve end-to-end TLS ownership. The cooperative path also
+removes the daemon from steady-state traffic. There is no downstream TLS
+connection, no relay loop, and no proxy peer address to repair at the HTTP
+layer. The application talks directly to the browser over the socket that
+arrived on port 443.
 
 In end-to-end testing, independently certificated Phoenix applications served
 HTTP/1.1, HTTP/2, and LiveView WebSocket upgrades through the same port-443
 daemon. Concurrent traffic crossed applications without relay fallback, and
 Phoenix observed the original caller address.
 
-## Where the boundary is
+That completes the progression that motivated the work:
+
+1. Multiple local projects get stable ports without per-project bookkeeping.
+2. Each project runs its real TLS configuration and owns its private keys.
+3. Real hostnames use ordinary `https://hostname/` URLs on shared port 443.
+4. Routes appear and disappear with the live applications instead of a
+   separately maintained reverse-proxy configuration.
+5. Cooperative Phoenix applications receive the original socket, eliminating
+   the extra TCP connection and byte-copying path.
+
+## Current boundaries
 
 The current handoff implementation is intentionally Linux- and
 Phoenix-specific:
@@ -292,8 +374,8 @@ Phoenix-specific:
 Other runtimes can implement the PHXP receiver protocol, but they do not need
 to. The generic TLS relay remains the baseline behavior.
 
-That separation is the useful architectural result: dynamic certificate-based
-routing does not depend on application cooperation, while applications that
-do cooperate can receive the real connection rather than a convincing copy of
-it.
-
+For me, that separation is the important architectural result. Dynamic,
+certificate-based routing does not depend on application cooperation. It
+works with any TLS workload through passthrough. But an application that does
+cooperate no longer receives a proxy's reconstruction of the connection. It
+receives the real one.
