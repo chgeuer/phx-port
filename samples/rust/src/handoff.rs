@@ -1,5 +1,5 @@
 use crate::handoff_protocol::{self, MAX_PACKET_LENGTH, Message};
-use crate::{ResponseInfo, serve_tls};
+use crate::{ResponseInfo, report_connection_error, serve_tls};
 use nix::sys::socket::{
     AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, SockaddrStorage,
     UnixAddr, accept4, bind, connect, getpeername, getsockopt, listen, recv, recvmsg, send, socket,
@@ -225,7 +225,7 @@ fn receive_handoff(
         .name("phxp-tls-connection".into())
         .spawn(move || {
             if let Err(error) = serve_tls(stream, tls, info) {
-                eprintln!("handed-off TLS connection failed: {error}");
+                report_connection_error("handed-off TLS", &error);
             }
             if let Ok(mut ids) = ids_for_connection.lock() {
                 ids.remove(&connection_id);

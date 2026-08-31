@@ -68,7 +68,7 @@ fn spawn_plain_connection(stream: TcpStream) {
         if let Err(error) = configure_stream(&stream)
             .and_then(|_| serve_http(stream, ResponseInfo::ordinary("http", peer, local)))
         {
-            eprintln!("HTTP connection failed: {error}");
+            report_connection_error("HTTP", &error);
         }
     });
 }
@@ -87,7 +87,7 @@ fn spawn_https_listener(listener: TcpListener, tls: Arc<ServerConfig>) {
                             if let Err(error) =
                                 serve_tls(stream, tls, ResponseInfo::ordinary("https", peer, local))
                             {
-                                eprintln!("HTTPS connection failed: {error}");
+                                report_connection_error("HTTPS", &error);
                             }
                         });
                     }
@@ -110,8 +110,25 @@ pub(crate) fn serve_tls(
 }
 
 fn configure_stream(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))
+}
+
+pub(crate) fn report_connection_error(label: &str, error: &io::Error) {
+    if !is_expected_disconnect(error) {
+        eprintln!("{label} connection failed: {error}");
+    }
+}
+
+fn is_expected_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+    )
 }
 
 fn serve_http(mut stream: impl Read + Write, info: ResponseInfo) -> io::Result<()> {
@@ -349,9 +366,11 @@ fn io_error(error: io::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResponseInfo, read_request_head};
-    use std::io::Cursor;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use super::{ResponseInfo, configure_stream, is_expected_disconnect, read_request_head};
+    use std::io::{self, Cursor, Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn reads_only_the_http_request_head() {
@@ -360,6 +379,42 @@ mod tests {
             read_request_head(&mut request).unwrap(),
             "GET /hello HTTP/1.1"
         );
+    }
+
+    #[test]
+    fn configures_adopted_nonblocking_stream_for_blocking_io() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            thread::sleep(Duration::from_millis(20));
+            stream.write_all(b"x").unwrap();
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+
+        configure_stream(&stream).unwrap();
+
+        let mut byte = [0];
+        assert_eq!(stream.read(&mut byte).unwrap(), 1);
+        assert_eq!(&byte, b"x");
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn distinguishes_expected_disconnects_from_actionable_io_failures() {
+        assert!(is_expected_disconnect(&io::Error::from(
+            io::ErrorKind::UnexpectedEof
+        )));
+        assert!(is_expected_disconnect(&io::Error::from(
+            io::ErrorKind::ConnectionReset
+        )));
+        assert!(!is_expected_disconnect(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
+        assert!(!is_expected_disconnect(&io::Error::from(
+            io::ErrorKind::InvalidData
+        )));
     }
 
     #[test]
