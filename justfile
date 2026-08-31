@@ -49,15 +49,30 @@ show-rust:
     HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
     PUBLIC_HTTPS_PORT="${PUBLIC_HTTPS_PORT:-443}"
     echo "=== Direct HTTP :$HTTP_PORT ==="
-    curl --fail --silent --show-error "http://127.0.0.1:$HTTP_PORT/"
+    HTTP_RESPONSE="$(curl --fail --silent --show-error "http://127.0.0.1:$HTTP_PORT/")"
+    if [[ "$HTTP_RESPONSE" != *"phxp Rust handoff example"* ]]; then
+      echo "Port $HTTP_PORT is not serving the Rust demo. Stop the Alpha Phoenix fixture and run 'just start-rust'." >&2
+      exit 1
+    fi
+    printf '%s\n' "$HTTP_RESPONSE"
     echo "=== Direct HTTPS :$HTTPS_PORT ==="
-    curl --fail --silent --show-error \
+    HTTPS_RESPONSE="$(curl --fail --silent --show-error \
       --resolve "alpha.phx-port.pollmann.rocks:$HTTPS_PORT:127.0.0.1" \
-      "https://alpha.phx-port.pollmann.rocks:$HTTPS_PORT/"
+      "https://alpha.phx-port.pollmann.rocks:$HTTPS_PORT/")"
+    if [[ "$HTTPS_RESPONSE" != *"listener=https"* ]]; then
+      echo "Port $HTTPS_PORT is not serving the Rust demo's direct HTTPS listener." >&2
+      exit 1
+    fi
+    printf '%s\n' "$HTTPS_RESPONSE"
     echo "=== Public HTTPS handoff :$PUBLIC_HTTPS_PORT ==="
-    curl --fail --silent --show-error \
+    HANDOFF_RESPONSE="$(curl --fail --silent --show-error \
       --resolve "alpha.phx-port.pollmann.rocks:$PUBLIC_HTTPS_PORT:127.0.0.1" \
-      "https://alpha.phx-port.pollmann.rocks:$PUBLIC_HTTPS_PORT/"
+      "https://alpha.phx-port.pollmann.rocks:$PUBLIC_HTTPS_PORT/")"
+    if [[ "$HANDOFF_RESPONSE" != *"listener=phxp-handoff-https"* ]]; then
+      echo "Public TLS is not reaching the Rust PHXP handoff listener." >&2
+      exit 1
+    fi
+    printf '%s\n' "$HANDOFF_RESPONSE"
 
 # Start the .NET 10 HTTP/HTTPS and PHXP handoff server with the Beta certificate
 start-dotnet:
@@ -85,15 +100,30 @@ show-dotnet:
     HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
     PUBLIC_HTTPS_PORT="${PUBLIC_HTTPS_PORT:-443}"
     echo "=== Direct HTTP :$HTTP_PORT ==="
-    curl --fail --silent --show-error "http://127.0.0.1:$HTTP_PORT/"
+    HTTP_RESPONSE="$(curl --fail --silent --show-error "http://127.0.0.1:$HTTP_PORT/")"
+    if [[ "$HTTP_RESPONSE" != *"Hello from ordinary .NET 10 HTTP"* ]]; then
+      echo "Port $HTTP_PORT is not serving the .NET demo. Stop the Beta Phoenix fixture and run 'just start-dotnet'." >&2
+      exit 1
+    fi
+    printf '%s\n' "$HTTP_RESPONSE"
     echo "=== Direct HTTPS :$HTTPS_PORT ==="
-    curl --fail --silent --show-error \
+    HTTPS_RESPONSE="$(curl --fail --silent --show-error \
       --resolve "beta.phx-port.pollmann.rocks:$HTTPS_PORT:127.0.0.1" \
-      "https://beta.phx-port.pollmann.rocks:$HTTPS_PORT/"
+      "https://beta.phx-port.pollmann.rocks:$HTTPS_PORT/")"
+    if [[ "$HTTPS_RESPONSE" != *"Hello from ordinary .NET 10 HTTPS"* ]]; then
+      echo "Port $HTTPS_PORT is not serving the .NET demo's direct HTTPS listener." >&2
+      exit 1
+    fi
+    printf '%s\n' "$HTTPS_RESPONSE"
     echo "=== Public HTTPS handoff :$PUBLIC_HTTPS_PORT ==="
-    curl --fail --silent --show-error \
+    HANDOFF_RESPONSE="$(curl --fail --silent --show-error \
       --resolve "beta.phx-port.pollmann.rocks:$PUBLIC_HTTPS_PORT:127.0.0.1" \
-      "https://beta.phx-port.pollmann.rocks:$PUBLIC_HTTPS_PORT/"
+      "https://beta.phx-port.pollmann.rocks:$PUBLIC_HTTPS_PORT/")"
+    if [[ "$HANDOFF_RESPONSE" != *"Hello from .NET 10 PHXP handoff"* ]]; then
+      echo "Public TLS is not reaching the .NET PHXP handoff listener." >&2
+      exit 1
+    fi
+    printf '%s\n' "$HANDOFF_RESPONSE"
 
 # Show the stable ports assigned to both cross-language examples
 ports-examples:
