@@ -22,32 +22,39 @@ its packet codec stays identical to the daemon implementation.
 From the repository root:
 
 ```bash
-cargo build --manifest-path integrations/rust/phxp_handoff_server/Cargo.toml
-cargo test --manifest-path integrations/rust/phxp_handoff_server/Cargo.toml
+cargo build --manifest-path samples/rust/Cargo.toml
+cargo test --manifest-path samples/rust/Cargo.toml
 ```
 
 ## Run
 
-The default certificate and key are the Alpha files:
+The repository root `justfile` uses the Alpha certificate by default:
 
 ```bash
-/home/chgeuer/src_work/phx_port_alpha/priv/certs/production/alpha.phx-port.pollmann.rocks.crt
-/home/chgeuer/src_work/phx_port_alpha/priv/certs/production/alpha.phx-port.pollmann.rocks.key
+$HOME/.dns/production/alpha.phx-port.pollmann.rocks.crt
+$HOME/.dns/production/alpha.phx-port.pollmann.rocks.key
 ```
 
-Use the same project path and role registered with `phx-port`. To run this
-example as the Alpha workload:
+From the repository root:
 
 ```bash
-cd /home/chgeuer/src_work/phx_port_alpha
+just start-rust
+# In another terminal:
+just show-rust
+```
 
-cargo run \
-  --manifest-path /home/chgeuer/github/chgeuer/phx-port/integrations/rust/phxp_handoff_server/Cargo.toml \
-  -- \
-  --http "127.0.0.1:$(phx-port)" \
-  --https "127.0.0.1:$(phx-port https)" \
-  --cert /home/chgeuer/src_work/phx_port_alpha/priv/certs/production/alpha.phx-port.pollmann.rocks.crt \
-  --key /home/chgeuer/src_work/phx_port_alpha/priv/certs/production/alpha.phx-port.pollmann.rocks.key \
+For a manual invocation:
+
+```bash
+cd samples/rust
+export PHXP_TLS_CERT="${PHXP_TLS_CERT:-$HOME/.dns/production/alpha.phx-port.pollmann.rocks.crt}"
+export PHXP_TLS_KEY="${PHXP_TLS_KEY:-$HOME/.dns/production/alpha.phx-port.pollmann.rocks.key}"
+export HTTP_PORT="${HTTP_PORT:-$(phx-port)}"
+export HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
+
+cargo run -- \
+  --http "127.0.0.1:$HTTP_PORT" \
+  --https "127.0.0.1:$HTTPS_PORT" \
   --role https
 ```
 
@@ -94,5 +101,5 @@ All settings have CLI and environment forms:
   handed-off TLS. There is no multi-certificate SNI resolver or client auth.
 - It uses a thread per TCP connection and is intended as a protocol example,
   not a benchmark or production server.
-- The Alpha certificate paths in the test command are machine-specific. Supply
-  another certificate and key when running elsewhere.
+- The sample hostname and certificate directory are configurable through the
+  root `justfile`.

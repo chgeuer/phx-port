@@ -3,7 +3,7 @@ compile_error!("the PHXP socket-handoff example requires Linux");
 
 mod handoff;
 
-#[path = "../../../../src/handoff_protocol.rs"]
+#[path = "../../../src/handoff_protocol.rs"]
 mod handoff_protocol;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};

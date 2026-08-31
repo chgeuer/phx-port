@@ -66,6 +66,7 @@ with context.wrap_socket(client, server_hostname=args.sni) as tls:
 
 http_response = b"".join(chunks)
 assert http_response.startswith(b"HTTP/1.1 200 OK\r\n"), http_response
-assert b"Hello from .NET 10 PHXP handoff" in http_response, http_response
+assert b"phxp .NET 10 handoff example" in http_response, http_response
+assert b"listener=phxp-handoff-https" in http_response, http_response
 assert f"peer={expected_peer[0]}:{expected_peer[1]}".encode() in http_response, http_response
 print(http_response.decode())

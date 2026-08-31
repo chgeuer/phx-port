@@ -22,120 +22,101 @@ fmt:
 fmt-check:
     cargo fmt -- --check
 
-# PHXP socket-handoff examples
+# PHXP socket-handoff samples
 
-# Start the Rust HTTP/HTTPS and PHXP handoff server with the Alpha certificate
+# Start the Rust sample with the Alpha certificate
 start-rust:
     #!/usr/bin/env bash
     set -euo pipefail
-    MANIFEST="$PWD/integrations/rust/phxp_handoff_server/Cargo.toml"
-    cd /home/chgeuer/src_work/phx_port_alpha
+    cd samples/rust
+    CERT_DIR="${PHXP_CERT_DIR:-$HOME/.dns/production}"
+    HOST="${PHXP_HOST:-alpha.phx-port.pollmann.rocks}"
+    export PHXP_TLS_CERT="${PHXP_TLS_CERT:-$CERT_DIR/$HOST.crt}"
+    export PHXP_TLS_KEY="${PHXP_TLS_KEY:-$CERT_DIR/$HOST.key}"
     HTTP_PORT="${HTTP_PORT:-$(phx-port)}"
     HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
-    echo "Rust: http://localhost:$HTTP_PORT, https://alpha.phx-port.pollmann.rocks:$HTTPS_PORT/"
-    exec cargo run --manifest-path "$MANIFEST" -- \
+    echo "Rust: http://localhost:$HTTP_PORT, https://$HOST:$HTTPS_PORT/"
+    exec cargo run -- \
       --http "127.0.0.1:$HTTP_PORT" \
       --https "127.0.0.1:$HTTPS_PORT" \
-      --cert /home/chgeuer/src_work/phx_port_alpha/priv/certs/production/alpha.phx-port.pollmann.rocks.crt \
-      --key /home/chgeuer/src_work/phx_port_alpha/priv/certs/production/alpha.phx-port.pollmann.rocks.key \
       --role https
 
-# Show direct HTTP, direct HTTPS, and public handoff responses from the Rust server
+# Show all Rust sample ingress paths
 show-rust:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd /home/chgeuer/src_work/phx_port_alpha
-    HTTP_PORT="${HTTP_PORT:-$(phx-port)}"
-    HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
-    PUBLIC_HTTPS_PORT="${PUBLIC_HTTPS_PORT:-443}"
-    echo "=== Direct HTTP :$HTTP_PORT ==="
-    HTTP_RESPONSE="$(curl --fail --silent --show-error "http://127.0.0.1:$HTTP_PORT/")"
-    if [[ "$HTTP_RESPONSE" != *"phxp Rust handoff example"* ]]; then
-      echo "Port $HTTP_PORT is not serving the Rust demo. Stop the Alpha Phoenix fixture and run 'just start-rust'." >&2
-      exit 1
-    fi
-    printf '%s\n' "$HTTP_RESPONSE"
-    echo "=== Direct HTTPS :$HTTPS_PORT ==="
-    HTTPS_RESPONSE="$(curl --fail --silent --show-error \
-      --resolve "alpha.phx-port.pollmann.rocks:$HTTPS_PORT:127.0.0.1" \
-      "https://alpha.phx-port.pollmann.rocks:$HTTPS_PORT/")"
-    if [[ "$HTTPS_RESPONSE" != *"listener=https"* ]]; then
-      echo "Port $HTTPS_PORT is not serving the Rust demo's direct HTTPS listener." >&2
-      exit 1
-    fi
-    printf '%s\n' "$HTTPS_RESPONSE"
-    echo "=== Public HTTPS handoff :$PUBLIC_HTTPS_PORT ==="
-    HANDOFF_RESPONSE="$(curl --fail --silent --show-error \
-      --resolve "alpha.phx-port.pollmann.rocks:$PUBLIC_HTTPS_PORT:127.0.0.1" \
-      "https://alpha.phx-port.pollmann.rocks:$PUBLIC_HTTPS_PORT/")"
-    if [[ "$HANDOFF_RESPONSE" != *"listener=phxp-handoff-https"* ]]; then
-      echo "Public TLS is not reaching the Rust PHXP handoff listener." >&2
-      exit 1
-    fi
-    printf '%s\n' "$HANDOFF_RESPONSE"
+    @samples/show.sh rust Rust "${PHXP_HOST:-alpha.phx-port.pollmann.rocks}"
 
-# Start the .NET 10 HTTP/HTTPS and PHXP handoff server with the Beta certificate
+# Report whether the Rust sample is running
+status-rust:
+    @samples/manage.sh status rust Rust
+
+# Stop the Rust sample
+stop-rust:
+    @samples/manage.sh stop rust Rust
+
+# Start the .NET 10 sample with the Beta certificate
 start-dotnet:
     #!/usr/bin/env bash
     set -euo pipefail
-    PROJECT="$PWD/integrations/dotnet/phxp-handoff-server/PhxpHandoffServer.csproj"
-    cd /home/chgeuer/src_work/phx_port_beta
+    cd samples/dotnet
+    CERT_DIR="${PHXP_CERT_DIR:-$HOME/.dns/production}"
+    HOST="${PHXP_HOST:-beta.phx-port.pollmann.rocks}"
+    export PHXP_CERT_PATH="${PHXP_CERT_PATH:-$CERT_DIR/$HOST.crt}"
+    export PHXP_KEY_PATH="${PHXP_KEY_PATH:-$CERT_DIR/$HOST.key}"
     HTTP_PORT="${HTTP_PORT:-$(phx-port)}"
     HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
-    echo ".NET: http://localhost:$HTTP_PORT, https://beta.phx-port.pollmann.rocks:$HTTPS_PORT/"
-    exec dotnet run --project "$PROJECT" -- \
+    echo ".NET: http://localhost:$HTTP_PORT, https://$HOST:$HTTPS_PORT/"
+    exec dotnet run -- \
       --project "$PWD" \
       --role https \
       --http-port "$HTTP_PORT" \
-      --https-port "$HTTPS_PORT" \
-      --cert /home/chgeuer/src_work/phx_port_beta/priv/certs/production/beta.phx-port.pollmann.rocks.crt \
-      --key /home/chgeuer/src_work/phx_port_beta/priv/certs/production/beta.phx-port.pollmann.rocks.key
+      --https-port "$HTTPS_PORT"
 
-# Show direct HTTP, direct HTTPS, and public handoff responses from the .NET server
+# Show all .NET sample ingress paths
 show-dotnet:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd /home/chgeuer/src_work/phx_port_beta
-    HTTP_PORT="${HTTP_PORT:-$(phx-port)}"
-    HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
-    PUBLIC_HTTPS_PORT="${PUBLIC_HTTPS_PORT:-443}"
-    echo "=== Direct HTTP :$HTTP_PORT ==="
-    HTTP_RESPONSE="$(curl --fail --silent --show-error "http://127.0.0.1:$HTTP_PORT/")"
-    if [[ "$HTTP_RESPONSE" != *"Hello from ordinary .NET 10 HTTP"* ]]; then
-      echo "Port $HTTP_PORT is not serving the .NET demo. Stop the Beta Phoenix fixture and run 'just start-dotnet'." >&2
-      exit 1
-    fi
-    printf '%s\n' "$HTTP_RESPONSE"
-    echo "=== Direct HTTPS :$HTTPS_PORT ==="
-    HTTPS_RESPONSE="$(curl --fail --silent --show-error \
-      --resolve "beta.phx-port.pollmann.rocks:$HTTPS_PORT:127.0.0.1" \
-      "https://beta.phx-port.pollmann.rocks:$HTTPS_PORT/")"
-    if [[ "$HTTPS_RESPONSE" != *"Hello from ordinary .NET 10 HTTPS"* ]]; then
-      echo "Port $HTTPS_PORT is not serving the .NET demo's direct HTTPS listener." >&2
-      exit 1
-    fi
-    printf '%s\n' "$HTTPS_RESPONSE"
-    echo "=== Public HTTPS handoff :$PUBLIC_HTTPS_PORT ==="
-    HANDOFF_RESPONSE="$(curl --fail --silent --show-error \
-      --resolve "beta.phx-port.pollmann.rocks:$PUBLIC_HTTPS_PORT:127.0.0.1" \
-      "https://beta.phx-port.pollmann.rocks:$PUBLIC_HTTPS_PORT/")"
-    if [[ "$HANDOFF_RESPONSE" != *"Hello from .NET 10 PHXP handoff"* ]]; then
-      echo "Public TLS is not reaching the .NET PHXP handoff listener." >&2
-      exit 1
-    fi
-    printf '%s\n' "$HANDOFF_RESPONSE"
+    @samples/show.sh dotnet ".NET 10" "${PHXP_HOST:-beta.phx-port.pollmann.rocks}"
 
-# Show the stable ports assigned to both cross-language examples
-ports-examples:
+# Report whether the .NET sample is running
+status-dotnet:
+    @samples/manage.sh status dotnet ".NET 10"
+
+# Stop the .NET sample
+stop-dotnet:
+    @samples/manage.sh stop dotnet ".NET 10"
+
+# Start the minimal Elixir/Bandit sample with the Alias Alpha certificate
+start-elixir:
     #!/usr/bin/env bash
     set -euo pipefail
-    for example in \
-      /home/chgeuer/src_work/phx_port_alpha \
-      /home/chgeuer/src_work/phx_port_beta
-    do
+    cd samples/elixir
+    CERT_DIR="${PHXP_CERT_DIR:-$HOME/.dns/production}"
+    HOST="${PHXP_HOST:-alias-alpha.phx-port.pollmann.rocks}"
+    export PHXP_TLS_CERT="${PHXP_TLS_CERT:-$CERT_DIR/$HOST.crt}"
+    export PHXP_TLS_KEY="${PHXP_TLS_KEY:-$CERT_DIR/$HOST.key}"
+    export PORT="${PORT:-$(phx-port)}"
+    export HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
+    echo "Elixir: http://localhost:$PORT, https://$HOST:$HTTPS_PORT/"
+    exec mix run --no-halt
+
+# Show all Elixir sample ingress paths
+show-elixir:
+    @samples/show.sh elixir Elixir "${PHXP_HOST:-alias-alpha.phx-port.pollmann.rocks}"
+
+# Report whether the Elixir sample is running
+status-elixir:
+    @samples/manage.sh status elixir Elixir
+
+# Stop the Elixir sample
+stop-elixir:
+    @samples/manage.sh stop elixir Elixir
+
+# Show the stable ports assigned to every language sample
+ports-samples:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for sample in samples/rust samples/dotnet samples/elixir; do
       (
-        cd "$example"
-        printf '%-50s http=%s https=%s\n' "$example" "$(phx-port)" "$(phx-port https)"
+        cd "$sample"
+        printf '%-20s http=%s https=%s\n' "$sample" "$(phx-port)" "$(phx-port https)"
       )
     done
 

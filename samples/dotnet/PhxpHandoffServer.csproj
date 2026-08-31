@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="PhxpHandoffServer.ProtocolTests" />
+    <Compile Remove="tests/**/*.cs" />
   </ItemGroup>
 
 </Project>

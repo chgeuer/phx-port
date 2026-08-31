@@ -8,7 +8,7 @@ returns one HTTP/1.1 response. The response and log include the original peer
 and local addresses.
 
 The PHXP implementation follows
-[`docs/socket-forwarding-design.md`](../../../docs/socket-forwarding-design.md):
+[`docs/socket-forwarding-design.md`](../../docs/socket-forwarding-design.md):
 `HELLO`/`READY`, one bounded `HANDOFF` packet plus exactly one descriptor, then
 `ADOPTED` or `REJECTED`. It also verifies the sender UID with `SO_PEERCRED`,
 uses a `0700` handoff directory and `0600` socket, validates the connected
@@ -17,7 +17,7 @@ stream descriptor, and rejects duplicate active connection IDs.
 ## Build
 
 ```bash
-dotnet build integrations/dotnet/phxp-handoff-server/PhxpHandoffServer.csproj
+dotnet build samples/dotnet/PhxpHandoffServer.csproj
 ```
 
 The project targets `net10.0` and has no NuGet package dependencies.
@@ -25,42 +25,33 @@ The project targets `net10.0` and has no NuGet package dependencies.
 Run the focused, dependency-free protocol tests with:
 
 ```bash
-dotnet run --project integrations/dotnet/phxp-handoff-server-tests/PhxpHandoffServer.ProtocolTests.csproj
+dotnet run --project samples/dotnet/tests/PhxpHandoffServer.ProtocolTests.csproj
 ```
 
 ## Run with phx-port
 
-Run these commands from the project directory that should own the phx-port
-registration. `--project` must exactly match the canonical path shown by
-`phx-port list`; the role normally must be `https`.
+From the repository root:
 
 ```bash
-export HTTP_PORT="$(phx-port)"
-export HTTPS_PORT="$(phx-port https)"
-export PHXP_CERT_PATH=/home/chgeuer/src_work/phx_port_beta/priv/certs/production/beta.phx-port.pollmann.rocks.crt
-export PHXP_KEY_PATH=/home/chgeuer/src_work/phx_port_beta/priv/certs/production/beta.phx-port.pollmann.rocks.key
-
-dotnet run \
-  --project /home/chgeuer/github/chgeuer/phx-port/integrations/dotnet/phxp-handoff-server/PhxpHandoffServer.csproj \
-  -- \
-  --project "$PWD" \
-  --role https \
-  --http-port "$HTTP_PORT" \
-  --https-port "$HTTPS_PORT"
+just start-dotnet
+# In another terminal:
+just show-dotnet
 ```
 
 The certificate and private key are required through `--cert`/`--key` or
-`PHXP_CERT_PATH`/`PHXP_KEY_PATH`. For an explicit CLI-only Beta invocation:
+`PHXP_CERT_PATH`/`PHXP_KEY_PATH`. For a manual invocation:
 
 ```bash
-dotnet run \
-  --project /home/chgeuer/github/chgeuer/phx-port/integrations/dotnet/phxp-handoff-server/PhxpHandoffServer.csproj \
-  -- \
+cd samples/dotnet
+export PHXP_CERT_PATH="${PHXP_CERT_PATH:-$HOME/.dns/production/beta.phx-port.pollmann.rocks.crt}"
+export PHXP_KEY_PATH="${PHXP_KEY_PATH:-$HOME/.dns/production/beta.phx-port.pollmann.rocks.key}"
+export HTTP_PORT="${HTTP_PORT:-$(phx-port)}"
+export HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
+
+dotnet run -- \
   --project "$PWD" \
   --http-port "$HTTP_PORT" \
-  --https-port "$HTTPS_PORT" \
-  --cert /home/chgeuer/src_work/phx_port_beta/priv/certs/production/beta.phx-port.pollmann.rocks.crt \
-  --key /home/chgeuer/src_work/phx_port_beta/priv/certs/production/beta.phx-port.pollmann.rocks.key
+  --https-port "$HTTPS_PORT"
 ```
 
 Other equivalent environment variables are `PHXP_CERT_PASSWORD`, `PHXP_PROJECT`,
@@ -86,7 +77,7 @@ server prints the derived Unix socket path at startup.
 While the server is running, copy its logged socket path and run:
 
 ```bash
-python integrations/dotnet/phxp-handoff-server/test_handoff.py \
+python samples/dotnet/test_handoff.py \
   "$XDG_RUNTIME_DIR/phx-port/handoff/<hash>.sock" \
   --sni beta.phx-port.pollmann.rocks
 ```

@@ -8,8 +8,9 @@ the original connection.
 | Integration | Purpose | Handed-off protocol surface |
 |---|---|---|
 | [`elixir/phx_port_handoff`](elixir/phx_port_handoff) | Reusable Phoenix/Bandit integration | HTTP/1.1, HTTP/2, WebSocket, and the normal Plug pipeline |
-| [`rust/phxp_handoff_server`](rust/phxp_handoff_server) | Standalone Rust interoperability example | Minimal HTTP/1.1 over rustls |
-| [`dotnet/phxp-handoff-server`](dotnet/phxp-handoff-server) | Standalone .NET 10 interoperability example | Minimal HTTP/1.1 over `SslStream`; ordinary listeners use Kestrel |
+| [`../samples/elixir`](../samples/elixir) | Minimal Elixir/Bandit example | Plug over ordinary and handed-off Bandit listeners |
+| [`../samples/rust`](../samples/rust) | Standalone Rust interoperability example | Minimal HTTP/1.1 over rustls |
+| [`../samples/dotnet`](../samples/dotnet) | Standalone .NET 10 interoperability example | Minimal HTTP/1.1 over `SslStream`; ordinary listeners use Kestrel |
 
 All receivers:
 
@@ -25,19 +26,5 @@ All receivers:
 See [`../docs/socket-forwarding-design.md`](../docs/socket-forwarding-design.md)
 for the protocol, ownership boundary, security model, and fallback behavior.
 
-On the development machine, the root `justfile` runs the reference servers as
-drop-in replacements for the Alpha and Beta Phoenix fixtures:
-
-```bash
-# Stop the corresponding Phoenix fixture first, then use two terminals.
-just start-rust
-just show-rust
-
-just start-dotnet
-just show-dotnet
-
-just ports-examples
-```
-
-The `show-*` recipes request the direct HTTP listener, direct certificate-backed
-HTTPS listener, and public port-443 handoff path in sequence.
+The root [`../samples`](../samples) directory and `justfile` provide runnable
+cross-language examples.

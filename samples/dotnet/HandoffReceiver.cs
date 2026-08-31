@@ -190,7 +190,8 @@ internal sealed class HandoffReceiver(
 
             var requestBytes = await ReadHttpHeadersAsync(tls, stoppingToken);
             var body = Encoding.UTF8.GetBytes(
-                $"Hello from .NET 10 PHXP handoff\n"
+                $"phxp .NET 10 handoff example\n"
+                + "listener=phxp-handoff-https\n"
                 + $"peer={Format(peer)}\n"
                 + $"local={Format(local)}\n"
                 + $"sni={request.RequestedSni}\n"

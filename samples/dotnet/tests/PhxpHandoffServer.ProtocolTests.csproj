@@ -8,7 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../phxp-handoff-server/PhxpHandoffServer.csproj" />
+    <ProjectReference Include="../PhxpHandoffServer.csproj" />
   </ItemGroup>
 
 </Project>

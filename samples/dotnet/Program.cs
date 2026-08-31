@@ -80,8 +80,12 @@ app.Run(async context =>
     var peer = new IPEndPoint(
         context.Connection.RemoteIpAddress ?? IPAddress.None,
         context.Connection.RemotePort);
-    var scheme = context.Request.IsHttps ? "HTTPS" : "HTTP";
-    var body = $"Hello from ordinary .NET 10 {scheme}\npeer={peer}\n";
+    var local = new IPEndPoint(
+        context.Connection.LocalIpAddress ?? IPAddress.None,
+        context.Connection.LocalPort);
+    var listener = context.Request.IsHttps ? "https" : "http";
+    var body =
+        $"phxp .NET 10 handoff example\nlistener={listener}\npeer={peer}\nlocal={local}\n";
     context.Response.ContentType = "text/plain; charset=utf-8";
     await context.Response.WriteAsync(body);
 });

@@ -803,9 +803,9 @@ remain outstanding.
   if shared limits or measured performance justify the additional complexity.
 - Keep the Elixir adapter as an independently versioned Mix package under
   `integrations/elixir/phx_port_handoff` in this repository.
-- Keep the Rust and .NET implementations as minimal interoperability examples
-  under `integrations/rust` and `integrations/dotnet`; they do not replace
-  framework-native production adapters.
+- Keep the Elixir, Rust, and .NET implementations as minimal interoperability
+  examples under `samples`; they do not replace framework-native production
+  adapters.
 
 The remaining questions are empirical rather than architectural: scheduler
 impact, socket option compatibility, comparative performance, sustained
