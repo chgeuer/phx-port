@@ -27,16 +27,16 @@ cd samples/elixir
 PORT=4100 HTTPS_PORT=4101 mix run --no-halt
 ```
 
-TLS defaults to:
+The root `justfile` passes these certificate paths explicitly:
 
 ```text
 ~/.dns/production/alias-alpha.phx-port.pollmann.rocks.crt
 ~/.dns/production/alias-alpha.phx-port.pollmann.rocks.key
 ```
 
-The paths are built from `System.user_home!()`. Override them with
-`PHXP_TLS_CERT` and `PHXP_TLS_KEY`, with application config keys `:tls_cert`
-and `:tls_key`, or on the command line:
+The Elixir source contains no certificate location or hostname. Direct
+invocations must provide `--cert` and `--key`, `PHXP_TLS_CERT` and
+`PHXP_TLS_KEY`, or application config keys `:tls_cert` and `:tls_key`:
 
 ```bash
 PORT=4100 HTTPS_PORT=4101 mix run --no-halt -- \

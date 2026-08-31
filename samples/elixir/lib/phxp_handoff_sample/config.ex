@@ -6,29 +6,23 @@ defmodule PhxpHandoffSample.Config do
     argv = Keyword.get(options, :argv, System.argv())
     env = Keyword.get(options, :env, &System.get_env/1)
     app_config = Keyword.get(options, :app_config, Application.get_all_env(:phxp_handoff_sample))
-    home = Keyword.get(options, :home, System.user_home!())
     cwd = Keyword.get(options, :cwd, File.cwd!())
-    {default_cert, default_key} = default_tls_paths(home)
 
     %__MODULE__{
       port: port!(env.("PORT") || app_config[:port], "PORT"),
       https_port: port!(env.("HTTPS_PORT") || app_config[:https_port], "HTTPS_PORT"),
       tls_cert:
         cli_value(argv, "--cert") || env.("PHXP_TLS_CERT") || app_config[:tls_cert] ||
-          default_cert,
+          raise("TLS certificate must be set with --cert, PHXP_TLS_CERT, or application config"),
       tls_key:
-        cli_value(argv, "--key") || env.("PHXP_TLS_KEY") || app_config[:tls_key] || default_key,
+        cli_value(argv, "--key") || env.("PHXP_TLS_KEY") || app_config[:tls_key] ||
+          raise("TLS private key must be set with --key, PHXP_TLS_KEY, or application config"),
       project:
         Path.expand(
           cli_value(argv, "--project") || env.("PHXP_PROJECT") || app_config[:project] || cwd
         ),
       role: cli_value(argv, "--role") || env.("PHXP_ROLE") || app_config[:role] || "https"
     }
-  end
-
-  def default_tls_paths(home \\ System.user_home!()) do
-    base = Path.join([home, ".dns", "production", "alias-alpha.phx-port.pollmann.rocks"])
-    {base <> ".crt", base <> ".key"}
   end
 
   defp port!(nil, name), do: raise("#{name} must be set")

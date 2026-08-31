@@ -31,14 +31,14 @@ start-rust:
     cd samples/rust
     CERT_DIR="${PHXP_CERT_DIR:-$HOME/.dns/production}"
     HOST="${PHXP_HOST:-alpha.phx-port.pollmann.rocks}"
-    export PHXP_TLS_CERT="${PHXP_TLS_CERT:-$CERT_DIR/$HOST.crt}"
-    export PHXP_TLS_KEY="${PHXP_TLS_KEY:-$CERT_DIR/$HOST.key}"
     HTTP_PORT="${HTTP_PORT:-$(phx-port)}"
     HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
     echo "Rust: http://localhost:$HTTP_PORT, https://$HOST:$HTTPS_PORT/"
     exec cargo run -- \
       --http "127.0.0.1:$HTTP_PORT" \
       --https "127.0.0.1:$HTTPS_PORT" \
+      --cert "$CERT_DIR/$HOST.crt" \
+      --key "$CERT_DIR/$HOST.key" \
       --role https
 
 # Show all Rust sample ingress paths
@@ -60,8 +60,6 @@ start-dotnet:
     cd samples/dotnet
     CERT_DIR="${PHXP_CERT_DIR:-$HOME/.dns/production}"
     HOST="${PHXP_HOST:-beta.phx-port.pollmann.rocks}"
-    export PHXP_CERT_PATH="${PHXP_CERT_PATH:-$CERT_DIR/$HOST.crt}"
-    export PHXP_KEY_PATH="${PHXP_KEY_PATH:-$CERT_DIR/$HOST.key}"
     HTTP_PORT="${HTTP_PORT:-$(phx-port)}"
     HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
     echo ".NET: http://localhost:$HTTP_PORT, https://$HOST:$HTTPS_PORT/"
@@ -69,7 +67,9 @@ start-dotnet:
       --project "$PWD" \
       --role https \
       --http-port "$HTTP_PORT" \
-      --https-port "$HTTPS_PORT"
+      --https-port "$HTTPS_PORT" \
+      --cert "$CERT_DIR/$HOST.crt" \
+      --key "$CERT_DIR/$HOST.key"
 
 # Show all .NET sample ingress paths
 show-dotnet:
@@ -90,12 +90,12 @@ start-elixir:
     cd samples/elixir
     CERT_DIR="${PHXP_CERT_DIR:-$HOME/.dns/production}"
     HOST="${PHXP_HOST:-alias-alpha.phx-port.pollmann.rocks}"
-    export PHXP_TLS_CERT="${PHXP_TLS_CERT:-$CERT_DIR/$HOST.crt}"
-    export PHXP_TLS_KEY="${PHXP_TLS_KEY:-$CERT_DIR/$HOST.key}"
     export PORT="${PORT:-$(phx-port)}"
     export HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
     echo "Elixir: http://localhost:$PORT, https://$HOST:$HTTPS_PORT/"
-    exec mix run --no-halt
+    exec mix run --no-halt -- \
+      --cert "$CERT_DIR/$HOST.crt" \
+      --key "$CERT_DIR/$HOST.key"
 
 # Show all Elixir sample ingress paths
 show-elixir:

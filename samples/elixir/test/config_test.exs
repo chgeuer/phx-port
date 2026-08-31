@@ -3,29 +3,38 @@ defmodule PhxpHandoffSample.ConfigTest do
 
   alias PhxpHandoffSample.Config
 
-  test "uses stable listener ports and portable TLS defaults" do
-    env = %{"PORT" => "4101", "HTTPS_PORT" => "4102"}
+  test "uses stable listener ports and explicit TLS configuration" do
+    env = %{
+      "PORT" => "4101",
+      "HTTPS_PORT" => "4102",
+      "PHXP_TLS_CERT" => "/certs/server.crt",
+      "PHXP_TLS_KEY" => "/certs/server.key"
+    }
 
     config =
       Config.load(
         argv: [],
         env: &env[&1],
         app_config: [],
-        home: "/users/alice",
         cwd: "/work/phx-port/samples/elixir"
       )
 
     assert config.port == 4101
     assert config.https_port == 4102
 
-    assert config.tls_cert ==
-             "/users/alice/.dns/production/alias-alpha.phx-port.pollmann.rocks.crt"
-
-    assert config.tls_key ==
-             "/users/alice/.dns/production/alias-alpha.phx-port.pollmann.rocks.key"
+    assert config.tls_cert == "/certs/server.crt"
+    assert config.tls_key == "/certs/server.key"
 
     assert config.project == "/work/phx-port/samples/elixir"
     assert config.role == "https"
+  end
+
+  test "requires a certificate and private key" do
+    env = %{"PORT" => "4101", "HTTPS_PORT" => "4102"}
+
+    assert_raise RuntimeError, ~r/TLS certificate must be set/, fn ->
+      Config.load(argv: [], env: &env[&1], app_config: [], cwd: ".")
+    end
   end
 
   test "CLI certificate options override environment and application config" do
