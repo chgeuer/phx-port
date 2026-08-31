@@ -1,3 +1,7 @@
+rust_hostname := "alpha.phx-port.pollmann.rocks"
+dotnet_hostname := "beta.phx-port.pollmann.rocks"
+elixir_hostname := "alias-alpha.phx-port.pollmann.rocks"
+
 default:
     @just --list
 
@@ -30,7 +34,7 @@ start-rust:
     set -euo pipefail
     cd samples/rust
     CERT_DIR="${PHXP_CERT_DIR:-$HOME/.dns/production}"
-    HOST="${PHXP_HOST:-alpha.phx-port.pollmann.rocks}"
+    HOST="${PHXP_HOST:-{{ rust_hostname }}}"
     HTTP_PORT="${HTTP_PORT:-$(phx-port)}"
     HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
     echo "Rust: http://localhost:$HTTP_PORT, https://$HOST:$HTTPS_PORT/"
@@ -43,7 +47,7 @@ start-rust:
 
 # Show all Rust sample ingress paths
 show-rust:
-    @samples/show.sh rust Rust "${PHXP_HOST:-alpha.phx-port.pollmann.rocks}"
+    @samples/show.sh rust Rust "${PHXP_HOST:-{{ rust_hostname }}}"
 
 # Report whether the Rust sample is running
 status-rust:
@@ -59,7 +63,7 @@ start-dotnet:
     set -euo pipefail
     cd samples/dotnet
     CERT_DIR="${PHXP_CERT_DIR:-$HOME/.dns/production}"
-    HOST="${PHXP_HOST:-beta.phx-port.pollmann.rocks}"
+    HOST="${PHXP_HOST:-{{ dotnet_hostname }}}"
     HTTP_PORT="${HTTP_PORT:-$(phx-port)}"
     HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
     echo ".NET: http://localhost:$HTTP_PORT, https://$HOST:$HTTPS_PORT/"
@@ -73,7 +77,7 @@ start-dotnet:
 
 # Show all .NET sample ingress paths
 show-dotnet:
-    @samples/show.sh dotnet ".NET 10" "${PHXP_HOST:-beta.phx-port.pollmann.rocks}"
+    @samples/show.sh dotnet ".NET 10" "${PHXP_HOST:-{{ dotnet_hostname }}}"
 
 # Report whether the .NET sample is running
 status-dotnet:
@@ -89,7 +93,7 @@ start-elixir:
     set -euo pipefail
     cd samples/elixir
     CERT_DIR="${PHXP_CERT_DIR:-$HOME/.dns/production}"
-    HOST="${PHXP_HOST:-alias-alpha.phx-port.pollmann.rocks}"
+    HOST="${PHXP_HOST:-{{ elixir_hostname }}}"
     export PORT="${PORT:-$(phx-port)}"
     export HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
     echo "Elixir: http://localhost:$PORT, https://$HOST:$HTTPS_PORT/"
@@ -99,7 +103,7 @@ start-elixir:
 
 # Show all Elixir sample ingress paths
 show-elixir:
-    @samples/show.sh elixir Elixir "${PHXP_HOST:-alias-alpha.phx-port.pollmann.rocks}"
+    @samples/show.sh elixir Elixir "${PHXP_HOST:-{{ elixir_hostname }}}"
 
 # Report whether the Elixir sample is running
 status-elixir:
