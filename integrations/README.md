@@ -24,3 +24,20 @@ All receivers:
 
 See [`../docs/socket-forwarding-design.md`](../docs/socket-forwarding-design.md)
 for the protocol, ownership boundary, security model, and fallback behavior.
+
+On the development machine, the root `justfile` runs the reference servers as
+drop-in replacements for the Alpha and Beta Phoenix fixtures:
+
+```bash
+# Stop the corresponding Phoenix fixture first, then use two terminals.
+just start-rust
+just show-rust
+
+just start-dotnet
+just show-dotnet
+
+just ports-examples
+```
+
+The `show-*` recipes request the direct HTTP listener, direct certificate-backed
+HTTPS listener, and public port-443 handoff path in sequence.

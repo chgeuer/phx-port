@@ -44,7 +44,7 @@ cd /home/chgeuer/src_work/phx_port_alpha
 cargo run \
   --manifest-path /home/chgeuer/github/chgeuer/phx-port/integrations/rust/phxp_handoff_server/Cargo.toml \
   -- \
-  --http "127.0.0.1:$(phx-port http)" \
+  --http "127.0.0.1:$(phx-port)" \
   --https "127.0.0.1:$(phx-port https)" \
   --cert /home/chgeuer/src_work/phx_port_alpha/priv/certs/production/alpha.phx-port.pollmann.rocks.crt \
   --key /home/chgeuer/src_work/phx_port_alpha/priv/certs/production/alpha.phx-port.pollmann.rocks.key \
