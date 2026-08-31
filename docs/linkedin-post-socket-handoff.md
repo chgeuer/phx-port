@@ -37,8 +37,10 @@ This relies heavily on the extensibility of Matt Trudel's Thousand Island and
 Bandit projects. A custom transport can introduce an externally accepted
 socket without forking Bandit or implementing another HTTP stack.
 
-The relay remains the compatibility fallback. Descriptor handoff is currently
-limited to Linux, OTP 29+, and the end-to-end verified Rustler 0.36.2 line.
+The relay remains the compatibility fallback. Descriptor handoff currently
+targets Linux. The Phoenix adapter requires OTP 29+ and the end-to-end verified
+Rustler 0.36.2 line; standalone Rust and .NET 10 receivers now exercise the
+same protocol without the BEAM.
 
 Implementation and diagrams:
 https://github.com/chgeuer/phx-port/blob/master/docs/proxying-without-the-proxy.md

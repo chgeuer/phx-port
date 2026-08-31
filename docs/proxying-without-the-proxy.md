@@ -386,15 +386,17 @@ That completes the progression that motivated the work:
 
 ## Current boundaries
 
-The current handoff implementation is intentionally Linux- and
-Phoenix-specific:
+The handoff transport is intentionally Linux-specific. The production-shaped
+integration remains Phoenix-specific, while minimal Rust and .NET 10 servers
+now demonstrate PHXP interoperability outside the BEAM:
 
 - Descriptor passing uses Linux/Unix socket facilities.
-- The receiver requires Erlang/OTP 29 or later.
-- The tested integration pins Rustler 0.36.2.
+- The Phoenix receiver requires Erlang/OTP 29 or later and pins Rustler 0.36.2.
 - A second, handoff-only Bandit supervisor is used beside the ordinary
   endpoint.
 - The native receive path currently uses one serialized acceptor.
+- The Rust and .NET examples implement only a small HTTP/1.1 surface and are
+  reference servers, not production framework integrations.
 
 Other runtimes can implement the PHXP receiver protocol, but they do not need
 to. The generic TLS relay remains the baseline behavior.

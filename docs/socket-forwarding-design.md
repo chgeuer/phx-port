@@ -7,13 +7,17 @@ handoff-only second-server architecture described below.
 
 The version 1 wire codec, endpoint derivation, same-UID capability handshake,
 Rust `SCM_RIGHTS` sender, Rustler receiver, and Thousand Island TLS transport
-are implemented. Two independently certificated Phoenix endpoints have
-completed HTTP/1.1, HTTP/2, and LiveView WebSocket upgrades through dynamic SNI
-routing over original port-443 sockets. Concurrent cross-site requests and an
-in-VM handoff listener restart also complete without relay traffic. The daemon
-peeks without consuming the ClientHello, automatically attempts handoff at a
-derived `SOCK_SEQPACKET` endpoint, and falls back to its ordinary TLS relay only
-before a descriptor is delivered.
+are implemented. Minimal native Rust and .NET 10 receivers independently
+implement the same PHXP protocol and demonstrate that handoff is not tied to
+the BEAM. Two independently certificated Phoenix endpoints have completed
+HTTP/1.1, HTTP/2, and LiveView WebSocket upgrades through dynamic SNI routing
+over original port-443 sockets. Concurrent cross-site requests and an in-VM
+handoff listener restart also complete without relay traffic. The Rust and
+.NET examples have each completed direct HTTP, direct trusted HTTPS, and
+daemon-driven TLS handoff with the original peer and local socket addresses.
+The daemon peeks without consuming the ClientHello, automatically attempts
+handoff at a derived `SOCK_SEQPACKET` endpoint, and falls back to its ordinary
+TLS relay only before a descriptor is delivered.
 
 Combining ordinary TCP and handed-off connections within one native accept
 broker remains future work. The current package runs an additional
@@ -56,7 +60,9 @@ original kernel TCP connection.
 
 The earlier socket-handoff proof of concept demonstrated descriptor transfer
 between BEAM processes. The implemented package now carries that mechanism
-through a production Bandit and Thousand Island connection lifecycle.
+through a production Bandit and Thousand Island connection lifecycle. The
+minimal Rust and .NET servers exercise the protocol directly without Bandit,
+showing the boundary a different runtime must implement.
 
 ## Requirements
 
@@ -504,6 +510,14 @@ field after the message type to be zero. `ADOPTED` and `REJECTED` echo the
 request's connection identifier. `REJECTED` requires a nonzero reason code.
 All numeric fields use network byte order.
 
+Version 1 rejection reason codes are:
+
+| Code | Meaning |
+|---:|---|
+| 1 | The delivered descriptor is absent, malformed, or not a connected stream |
+| 2 | The connection identifier is already active |
+| 3 | The receiver could not adopt or schedule the delivered connection |
+
 The header does not contain TLS payload. The TLS bytes remain in the passed
 socket's kernel receive queue.
 
@@ -659,6 +673,16 @@ The capability must be detected at build time and runtime:
 The public TLS routing behavior must not depend on socket handoff being
 available.
 
+The repository currently contains three Linux receiver implementations:
+
+- Phoenix/Bandit through Rustler and a custom Thousand Island transport.
+- A standalone Rust HTTP/1.1 reference server using rustls.
+- A standalone .NET 10 HTTP/1.1 reference receiver using `Socket`,
+  `SafeSocketHandle`, and `SslStream`, alongside ordinary Kestrel listeners.
+
+The Rust and .NET servers are deliberately small protocol examples rather than
+production application-server integrations.
+
 ## Performance expectations
 
 Compared with generic relay:
@@ -735,8 +759,11 @@ The original remote address remains the standard connection peer metadata.
 
 The HTTP/1.1, HTTP/2, LiveView WebSocket, original peer-address, concurrent
 cross-site, and in-VM listener restart scenarios have been exercised end to
-end. Certificate rotation under load, sustained descriptor-leak testing, and
-comparative performance benchmarks remain outstanding.
+end in Phoenix. The standalone Rust and .NET 10 receivers have also been built
+and exercised through certificate discovery and real daemon handoff using the
+Alpha and Beta fixture certificates. Certificate rotation under load,
+sustained descriptor-leak testing, and comparative performance benchmarks
+remain outstanding.
 
 ## Delivery status
 
@@ -747,11 +774,12 @@ comparative performance benchmarks remain outstanding.
 5. [x] Add automatic handoff selection and safe pre-delivery relay fallback.
 6. [x] Prove LiveView WebSocket upgrade, concurrent cross-site traffic, and
    in-VM listener restart.
-7. [ ] Replace serialized blocking accepts with a supervised native worker and
+7. [x] Prove PHXP interoperability with standalone Rust and .NET 10 receivers.
+8. [ ] Replace serialized blocking accepts with a supervised native worker and
    queue if benchmarks show it is needed.
-8. [ ] Evaluate combining ordinary TCP and handoff acceptance in one hybrid
+9. [ ] Evaluate combining ordinary TCP and handoff acceptance in one hybrid
    transport.
-9. [ ] Benchmark and harden before presenting handoff as a general production
+10. [ ] Benchmark and harden before presenting handoff as a general production
    default.
 
 ## Resolved implementation choices
@@ -775,6 +803,9 @@ comparative performance benchmarks remain outstanding.
   if shared limits or measured performance justify the additional complexity.
 - Keep the Elixir adapter as an independently versioned Mix package under
   `integrations/elixir/phx_port_handoff` in this repository.
+- Keep the Rust and .NET implementations as minimal interoperability examples
+  under `integrations/rust` and `integrations/dotnet`; they do not replace
+  framework-native production adapters.
 
 The remaining questions are empirical rather than architectural: scheduler
 impact, socket option compatibility, comparative performance, sustained
@@ -794,8 +825,10 @@ For Phoenix applications, a custom `ThousandIsland.Transport` accepts handed
 off descriptors, performs the server-side TLS handshake, and feeds them into
 the normal Bandit connection pipeline. The ordinary Phoenix endpoint continues
 to accept direct TLS traffic separately. Both paths use the same Phoenix Plug
-and TLS configuration. This preserves the client's real peer address and
-removes phx-port from the established connection's data path.
+and TLS configuration. Standalone Rust and .NET 10 examples validate the same
+wire protocol and descriptor lifecycle outside the BEAM. All three preserve
+the client's real peer address and remove phx-port from the established
+connection's data path.
 
 Because this requires a backend adapter and Unix descriptor passing, it is an
 optional optimization. The framework-independent TCP relay defined in the TLS

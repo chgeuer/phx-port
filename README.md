@@ -163,7 +163,13 @@ to ordinary clear-HTTP `main` listeners.
 On Linux, the daemon also checks the route's derived `SOCK_SEQPACKET` endpoint
 for a version-compatible, same-user socket-handoff receiver. When present, it
 passes the untouched client descriptor with `SCM_RIGHTS`; otherwise it uses
-the ordinary relay. The receiving integration is still under development.
+the ordinary relay. The repository includes a Phoenix/Bandit integration and
+minimal Rust and .NET 10 reference servers:
+
+- [`integrations/elixir/phx_port_handoff`](integrations/elixir/phx_port_handoff)
+- [`integrations/rust/phxp_handoff_server`](integrations/rust/phxp_handoff_server)
+- [`integrations/dotnet/phxp-handoff-server`](integrations/dotnet/phxp-handoff-server)
+
 The handoff design and protocol are described in
 [`docs/tls-proxy-design.md`](docs/tls-proxy-design.md) and
 [`docs/socket-forwarding-design.md`](docs/socket-forwarding-design.md).
