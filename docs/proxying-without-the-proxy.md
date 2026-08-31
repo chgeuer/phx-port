@@ -246,6 +246,16 @@ by Phoenix was the other half. Bandit expects Thousand Island to accept a
 socket from a listener, establish ownership, gather peer metadata, perform the
 TLS handshake, and then start the HTTP connection lifecycle.
 
+This is where
+[Matt Trudel's](https://github.com/mtrudel)
+[Thousand Island](https://github.com/mtrudel/thousand_island) and
+[Bandit](https://github.com/mtrudel/bandit) deserve special praise. Their
+extensibility is what makes this stunt possible without forking the web server
+or building a parallel HTTP stack. Thousand Island exposes transport behavior
+as a real abstraction, and Bandit cleanly builds its HTTP lifecycle on top of
+it. That lets a handed-off descriptor enter through a custom transport and,
+after TLS setup, become an otherwise ordinary Bandit connection.
+
 The `PhxPortHandoff` package provides a custom
 `ThousandIsland.Transport`. Its native Rustler receiver:
 
