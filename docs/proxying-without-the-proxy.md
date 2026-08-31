@@ -1,5 +1,14 @@
 # Proxying Without the Proxy: Handing a Live TLS Socket to Phoenix
 
+I love developing and running multiple web apps on my laptop. 
+Web frameworks like Elixir's Phoenix use some default TCP port (like `4000`) to host their HTTP listener.
+Port collisions are the natural result, so that I have to start configuring (and remembering) which project listens on which TCP port.
+To solve that pain, I developed [`phx-port`](https://github.com/chgeuer/phx-port), a small Rust utility that I can use to change the port by setting a per-project port via environment variable (instead of fiddling in the config files).
+However, I also love turning on security bits like TLS as soon as possible, so I use LetsEncrypt's DNS ACME challenge to give each of my toy projects a production certificate. 
+But - I don't want connect to my 'production-grade' https: endpoint over some funky port number (like `https://www.contoso.com:4017/`), I just want the real `https://www.contoso.com/` in my browser bar. There's a mechanism for exposing multiple domains under the same TCP/TLS port called SNI. But SNI forces the TLS-endpoint to have all the private keys for the different certificates, and I want to keep the certificate key material within my web projects, and I don't want to have to configure some NGINX or other reverse proxy with all the domains. And - I don't want the reverse proxy to 'terminate' the TLS connection, just to establish yet another downstream TLS connection to my actual workload, and then do busywork shoveling bytes forth and back. Then I remembered a Twitter conversation with Chris McCord about [blue/green deployments](https://github.com/chgeuer/blue_green) and (on Linux) handing off existing TCP sockets using Linux SCM_RIGHTS file descriptors, and that led to the most recent version of `phx-port`. 
+
+------------
+
 Most local reverse proxies solve one problem by creating another connection.
 They accept traffic on a well-known port, choose a backend, connect to that
 backend, and relay bytes between the two sockets:
