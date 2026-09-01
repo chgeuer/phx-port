@@ -2,16 +2,20 @@
 
 ## Status
 
-Implemented for the daemon sender, Phoenix/Bandit integration, and Rust sample.
-The Darwin descriptor path has been manually exercised on macOS arm64 with
-real Unix and TCP sockets plus trusted end-to-end TLS requests over HTTP/1.1,
-HTTP/2, and Phoenix Channel WebSockets. The .NET receiver and `launchd`
-service installation remain follow-up work.
+The daemon sender, Phoenix/Bandit integration, and Rust sample implementations
+are available. Darwin end-to-end validation remains manual rather than
+automation-complete.
 
-### Manual validation evidence
+The repository's `macos-latest` CI builds and runs the Rust unit tests for the
+daemon, Rust sample, and native Rustler broker. It does not start the real
+daemon and framework backends or run the trusted TLS handoff scenarios below.
+The .NET receiver and `launchd` service installation also remain follow-up
+work.
 
-The completed path was exercised with Rust 1.97.1, OTP 29.0.3, Elixir 1.20.2,
-and Rustler 0.36.2 on macOS arm64:
+### Manual validation evidence, not committed regression coverage
+
+The implementation was manually exercised with Rust 1.97.1, OTP 29.0.3,
+Elixir 1.20.2, and Rustler 0.36.2 on macOS arm64:
 
 | Area | Evidence |
 |---|---|
@@ -27,6 +31,25 @@ A receiver-side different-UID connection was not exercised because this host
 could not launch a test process under a second effective UID. The receiver's
 negative `getpeereid` branch remains enforced in code; successful peer-ID
 checks were exercised on every handoff.
+
+### Automated validation still required
+
+A committed Darwin end-to-end harness or equivalent macOS CI coverage is still
+required for:
+
+- real post-delivery `REJECTED`, acknowledgement-timeout, and malformed-response
+  behavior with proof that relay is never attempted;
+- a real positive partial descriptor-bearing `sendmsg` followed by failure
+  while writing the remainder, beyond the committed ownership-state unit test;
+- Phoenix HTTP/2 and WebSocket or LiveView traffic through the daemon and
+  Rustler receiver;
+- receiver-side rejection of a daemon running under a different effective UID;
+  and
+- repeatable descriptor-leak, endpoint-disappearance, restart, and concurrency
+  assertions.
+
+Until that harness is committed, the results above describe one-machine manual
+validation and must not be interpreted as reproducible CI acceptance evidence.
 
 This document specifies the macOS port of the optional PHXP connected-socket
 handoff path. It is intended to be implementation-ready on a macOS development
@@ -906,9 +929,11 @@ Implement in tracer-bullet order so each step leaves Linux usable:
 Do not start by changing documentation claims or widening all `cfg` gates.
 First establish a real Darwin descriptor-transfer test.
 
-## Acceptance criteria
+## Acceptance criteria for automation-complete validation
 
-The initial macOS port is complete when all of the following are true:
+The implementation targets all of the following criteria. Criteria currently
+covered only by the manual evidence above remain incomplete as automated
+regression coverage:
 
 1. The root crate builds and its existing tests pass on Linux and macOS.
 2. Linux continues to use its existing `SOCK_SEQPACKET` PHXP transport.

@@ -2,21 +2,29 @@
 
 ## Status
 
-The optional, cooperative Linux and macOS fast path is implemented through the
-handoff-only second-server architecture described below.
+The optional, cooperative Linux and macOS fast-path implementation is available
+through the handoff-only second-server architecture described below. Darwin
+application-level end-to-end validation is manual, not automation-complete.
 
 The version 1 wire codec, endpoint derivation, same-UID capability handshake,
 Rust `SCM_RIGHTS` sender, and three framework transport adapters are
 implemented: Thousand Island/Bandit and Tokio/Axum on Linux and macOS, plus
 Kestrel/ASP.NET Core on Linux. The latter two independently implement the same
-PHXP protocol and demonstrate that handoff is not tied to the BEAM. Two
-independently certificated Phoenix
-endpoints have completed
-HTTP/1.1, HTTP/2, and LiveView WebSocket upgrades through dynamic SNI routing
-over original port-443 sockets. Concurrent cross-site requests and an in-VM
-handoff listener restart also complete without relay traffic. The Rust and
-.NET examples have each completed direct HTTP, direct trusted HTTPS, and
+PHXP protocol and demonstrate that handoff is not tied to the BEAM. Existing
+automated tests and manual integration runs have exercised independently
+certificated Phoenix endpoints over HTTP/1.1, HTTP/2, and WebSockets through
+dynamic SNI routing on original port-443 sockets, plus concurrent cross-site
+requests and an in-VM handoff listener restart. The Rust and .NET examples have
+also been exercised through direct HTTP, direct trusted HTTPS, and
 daemon-driven TLS handoff with the original peer and local socket addresses.
+These statements are implementation evidence, not a claim that every scenario
+is covered by macOS CI.
+
+Current `macos-latest` CI builds and runs the Rust unit tests for the daemon,
+Rust sample, and native Rustler broker. It does not run the real daemon,
+Phoenix HTTP/2/WebSockets, post-delivery fault injection, or cross-UID receiver
+tests.
+
 The daemon peeks without consuming the ClientHello, automatically attempts
 handoff at a derived Unix-domain endpoint, and falls back to its ordinary TLS
 relay only before a descriptor is delivered. Linux retains `SOCK_SEQPACKET`;
@@ -804,6 +812,12 @@ Channel, and concurrent Phoenix/Rust handoffs also completed with preserved
 IPv6 addresses. Endpoint disappearance and a wrong-UID daemon peer both fell
 back to relay before delivery, and receiver restart restored handoff.
 
+The Darwin application results in this section are manual runs. They are not
+currently reproduced by the committed macOS workflow. In particular,
+post-delivery rejection and timeout, a real partial-positive-`sendmsg`
+remainder failure, Phoenix HTTP/2/WebSockets, and receiver-side wrong-UID
+rejection remain automation gaps.
+
 ## Delivery status
 
 1. [x] Build a handoff-only Thousand Island transport.
@@ -815,11 +829,14 @@ back to relay before delivery, and receiver restart restored handoff.
    in-VM listener restart.
 7. [x] Prove PHXP interoperability with standalone Rust and .NET 10 receivers.
 8. [x] Port the daemon, Phoenix/Bandit receiver, and Rust sample to macOS.
-9. [ ] Replace serialized blocking accepts with a supervised native worker and
+9. [ ] Commit reproducible Darwin end-to-end coverage for post-delivery
+   failures, Phoenix HTTP/2/WebSockets, cross-UID rejection, concurrency,
+   restart, and descriptor lifecycle.
+10. [ ] Replace serialized blocking accepts with a supervised native worker and
    queue if benchmarks show it is needed.
-10. [ ] Evaluate combining ordinary TCP and handoff acceptance in one hybrid
+11. [ ] Evaluate combining ordinary TCP and handoff acceptance in one hybrid
    transport.
-11. [ ] Benchmark and harden before presenting handoff as a general production
+12. [ ] Benchmark and harden before presenting handoff as a general production
    default.
 
 ## Resolved implementation choices
