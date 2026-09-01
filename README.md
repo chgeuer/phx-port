@@ -186,6 +186,67 @@ The handoff design and protocol are described in
 the Darwin transport profile in
 [`docs/macos-socket-handoff-design.md`](docs/macos-socket-handoff-design.md).
 
+### macOS handoff playground
+
+The repository includes a local playground for the Darwin handoff path. It
+uses these trusted certificates directly, without copying them into the
+repository:
+
+```text
+~/.dns/production/a.pollmann.rocks.{crt,key}
+~/.dns/production/b.pollmann.rocks.{crt,key}
+~/.dns/production/c.pollmann.rocks.{crt,key}
+```
+
+Start the Phoenix/Bandit handoff sample, the Rust/Axum handoff sample, a
+relay-only OpenSSL backend, and the proxy:
+
+```bash
+just play-up
+just play-status
+just play-try
+just play-logs daemon
+just play-down
+```
+
+The proxy listens on `0.0.0.0:443` and `[::]:443`; all backend listeners stay
+on loopback. `a.pollmann.rocks` uses Phoenix/Bandit handoff,
+`b.pollmann.rocks` uses Rust/Axum handoff, and `c.pollmann.rocks` deliberately
+has no handoff receiver so it exercises TLS relay fallback. `just play`
+combines startup and the request suite.
+
+The targets invoke the locally built `phx-port` CLI to register stable
+`main`/`https` roles for `samples/elixir` and `samples/rust`, and an `https`
+role for `samples/relay`. These are normal project registrations, visible in
+`phx-port list`, and use `~/.config/phx-ports.toml` unless
+`PHX_PORT_CONFIG` overrides it. `just play-down` stops the processes but keeps
+the stable registrations.
+
+External clients must resolve each hostname to this Mac's reachable address,
+not `127.0.0.1`, and the macOS firewall and any intervening router must allow
+TCP port 443. For a one-off client-side test without changing DNS:
+
+```bash
+curl --resolve a.pollmann.rocks:443:192.0.2.10 \
+  https://a.pollmann.rocks/
+```
+
+Replace `192.0.2.10` with this Mac's LAN or public address. Playground logs and
+PID files stay below `/tmp/phx-port-play-<uid>`; private keys remain in
+`~/.dns/production`.
+
+If those DNS names resolve to `127.0.0.1` on another machine, forward that
+machine's loopback port to the Mac instead:
+
+```bash
+sudo ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:443:127.0.0.1:443 chgeuer@mini.geuer-pollmann.de
+```
+
+With that tunnel running, `curl https://a.pollmann.rocks`,
+`curl https://b.pollmann.rocks`, and `curl https://c.pollmann.rocks` use the
+standard HTTPS port and retain normal hostname and certificate verification.
+
 ### Managing registrations
 
 ```bash

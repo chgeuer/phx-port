@@ -124,6 +124,34 @@ ports-samples:
       )
     done
 
+# Build the daemon plus the Rust and Elixir handoff samples
+play-build:
+    @bash samples/playground.sh build
+
+# Start the trusted playground on 0.0.0.0/[::]:443
+play-up: play-build
+    @bash samples/playground.sh up
+
+# Start the playground and exercise its direct, handoff, and relay paths
+play: play-up
+    @bash samples/playground.sh try
+
+# Show playground processes, listeners, routes, and daemon counters
+play-status:
+    @bash samples/playground.sh status
+
+# Exercise HTTP/1.1, HTTP/2, IPv6, handoff, and relay paths
+play-try:
+    @bash samples/playground.sh try
+
+# Show recent playground logs: all, daemon, elixir, rust, or relay
+play-logs service="all":
+    @bash samples/playground.sh logs "{{service}}"
+
+# Stop only the processes managed by the playground
+play-down:
+    @bash samples/playground.sh down
+
 # VS Code extension tasks
 
 vscode-compile:
