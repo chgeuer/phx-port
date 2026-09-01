@@ -9,8 +9,8 @@ the original connection.
 |---|---|---|
 | [`elixir/phx_port_handoff`](elixir/phx_port_handoff) | Reusable Phoenix/Bandit integration | HTTP/1.1, HTTP/2, WebSocket, and the normal Plug pipeline |
 | [`../samples/elixir`](../samples/elixir) | Minimal Elixir/Bandit example | Plug over ordinary and handed-off Bandit listeners |
-| [`../samples/rust`](../samples/rust) | Standalone Rust interoperability example | Minimal HTTP/1.1 over rustls |
-| [`../samples/dotnet`](../samples/dotnet) | Standalone .NET 10 interoperability example | Minimal HTTP/1.1 over `SslStream`; ordinary listeners use Kestrel |
+| [`../samples/rust`](../samples/rust) | Rust interoperability example | Tokio/tokio-rustls transport feeding one Axum router through Hyper |
+| [`../samples/dotnet`](../samples/dotnet) | .NET 10 interoperability example | Custom connection listener feeding direct and handed-off sockets through Kestrel |
 
 All receivers:
 
