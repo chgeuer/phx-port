@@ -305,7 +305,8 @@ async fn run() -> Result<(), String> {
     let https_listener = TcpListener::bind(config.https)
         .await
         .map_err(|e| format!("cannot bind HTTPS {}: {e}", config.https))?;
-    let handoff = handoff::HandoffListener::bind(&config.handoff_socket)?;
+    let handoff =
+        handoff::HandoffListener::bind(&config.handoff_socket, config.handoff_socket_is_derived)?;
 
     println!(
         "HTTP:  http://{}",
@@ -347,6 +348,7 @@ struct Config {
     project: String,
     role: String,
     handoff_socket: PathBuf,
+    handoff_socket_is_derived: bool,
 }
 
 impl Config {
@@ -394,8 +396,10 @@ impl Config {
             .to_str()
             .ok_or_else(|| "project path is not valid UTF-8".to_string())?
             .to_string();
-        let handoff_socket =
-            handoff_socket.map_or_else(|| handoff::endpoint_path(&project, &role), Ok)?;
+        let (handoff_socket, handoff_socket_is_derived) = match handoff_socket {
+            Some(path) => (path, false),
+            None => (handoff::endpoint_path(&project, &role)?, true),
+        };
 
         Ok(Self {
             http: http
@@ -409,6 +413,7 @@ impl Config {
             project,
             role,
             handoff_socket,
+            handoff_socket_is_derived,
         })
     }
 }

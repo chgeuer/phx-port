@@ -85,11 +85,8 @@ struct EndpointIdentity {
 }
 
 impl HandoffListener {
-    pub(crate) fn bind(path: &Path) -> Result<Self, String> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| "handoff socket has no parent directory".to_string())?;
-        ensure_private_directory(parent)?;
+    pub(crate) fn bind(path: &Path, validate_runtime_root: bool) -> Result<Self, String> {
+        ensure_endpoint_directory(path, validate_runtime_root)?;
         remove_stale_endpoint(path)?;
 
         let listener = create_control_socket()?;
@@ -217,14 +214,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder.create(path).map_err(|create_error| {
-                format!(
-                    "cannot create handoff directory {}: {create_error}",
-                    path.display()
-                )
-            })?;
+            create_private_directory(path)?;
         }
         Err(error) => {
             return Err(format!(
@@ -259,6 +249,32 @@ fn ensure_private_directory(path: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn create_private_directory(path: &Path) -> Result<(), String> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(format!(
+            "cannot create handoff directory {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn ensure_endpoint_directory(path: &Path, validate_runtime_root: bool) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "handoff socket has no parent directory".to_string())?;
+    if validate_runtime_root {
+        let runtime_root = parent
+            .parent()
+            .ok_or_else(|| "handoff directory has no runtime root".to_string())?;
+        ensure_private_directory(runtime_root)?;
+    }
+    ensure_private_directory(parent)
 }
 
 fn remove_stale_endpoint(path: &Path) -> Result<(), String> {
@@ -648,11 +664,11 @@ fn hex_id(id: &[u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        HandoffListener, endpoint_hash, endpoint_path_in, ensure_private_directory,
-        remove_stale_endpoint,
+        HandoffListener, create_private_directory, endpoint_hash, endpoint_path_in,
+        ensure_endpoint_directory, ensure_private_directory, remove_stale_endpoint,
     };
     use std::fs;
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -676,9 +692,10 @@ mod tests {
     #[test]
     fn listener_creates_private_socket_and_removes_its_endpoint() {
         let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let endpoint_directory = directory.path().join("handoff");
         let endpoint = endpoint_directory.join("receiver.sock");
-        let listener = HandoffListener::bind(&endpoint).unwrap();
+        let listener = HandoffListener::bind(&endpoint, true).unwrap();
 
         assert!(
             fs::symlink_metadata(&endpoint)
@@ -706,6 +723,43 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(ensure_private_directory(&path).is_err());
+    }
+
+    #[test]
+    fn private_directory_creation_tolerates_a_concurrent_creator() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("handoff");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        create_private_directory(&path).unwrap();
+        ensure_private_directory(&path).unwrap();
+    }
+
+    #[test]
+    fn endpoint_directory_rejects_symlinked_runtime_root() {
+        let directory = tempdir().unwrap();
+        let actual = directory.path().join("actual");
+        fs::create_dir(&actual).unwrap();
+        fs::set_permissions(&actual, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = directory.path().join("runtime");
+        symlink(&actual, &runtime).unwrap();
+        let endpoint = runtime.join("handoff").join("receiver.sock");
+
+        assert!(ensure_endpoint_directory(&endpoint, true).is_err());
+        assert!(!actual.join("handoff").exists());
+    }
+
+    #[test]
+    fn explicit_endpoint_validates_only_its_private_parent() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let handoff = directory.path().join("handoff");
+        fs::create_dir(&handoff).unwrap();
+        fs::set_permissions(&handoff, fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = handoff.join("receiver.sock");
+
+        ensure_endpoint_directory(&endpoint, false).unwrap();
     }
 
     #[test]

@@ -425,7 +425,6 @@ mod platform {
             Err(_) => return Outcome::Unavailable(client),
         };
 
-        drop(client);
         if sent < packet.len()
             && let Err(error) = control.write_all(&packet[sent..])
         {
@@ -442,6 +441,7 @@ mod platform {
                 ));
             }
         };
+        drop(client);
         validate_response(&response, connection_id)
     }
 
@@ -557,7 +557,9 @@ mod platform {
         use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::net::UnixStream;
         use std::path::Path;
+        use std::sync::mpsc;
         use std::thread;
+        use std::time::Duration;
         use tempfile::tempdir_in;
 
         #[test]
@@ -688,6 +690,116 @@ mod platform {
             let mut response = [0_u8; 12];
             client.read_exact(&mut response).unwrap();
             assert_eq!(&response, b"server reply");
+            backend.join().unwrap();
+        }
+
+        #[test]
+        fn retains_inert_sender_descriptor_until_response() {
+            let directory = tempdir_in("/tmp").unwrap();
+            let endpoint = directory.path().join("handoff.sock");
+            let listener = socket(
+                AddressFamily::Unix,
+                SockType::Stream,
+                SockFlag::empty(),
+                None,
+            )
+            .unwrap();
+            set_cloexec(&listener).unwrap();
+            set_no_sigpipe(&listener).unwrap();
+            bind(
+                listener.as_raw_fd(),
+                &UnixAddr::new(endpoint.as_path()).unwrap(),
+            )
+            .unwrap();
+            listen(&listener, Backlog::new(1).unwrap()).unwrap();
+
+            let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(tcp_listener.local_addr().unwrap()).unwrap();
+            let (accepted, _) = tcp_listener.accept().unwrap();
+            let connection_id = [0x6B; 16];
+            let (dropped_tx, dropped_rx) = mpsc::channel();
+            let (respond_tx, respond_rx) = mpsc::channel();
+
+            let backend = thread::spawn(move || {
+                let control = accept(listener.as_raw_fd()).unwrap();
+                let control = unsafe { OwnedFd::from_raw_fd(control) };
+                let mut control = UnixStream::from(control);
+
+                assert_eq!(
+                    decode(&read_frame(&mut control).unwrap()).unwrap(),
+                    Message::Hello
+                );
+                control
+                    .write_all(&encode(&Message::Ready).unwrap())
+                    .unwrap();
+
+                let mut packet = [0_u8; MAX_PACKET_LENGTH + 1];
+                let (packet_length, descriptors) = {
+                    let mut ancillary = nix::cmsg_space!([i32; 2]);
+                    let mut iov = [IoSliceMut::new(&mut packet)];
+                    let message = recvmsg::<UnixAddr>(
+                        control.as_raw_fd(),
+                        &mut iov,
+                        Some(&mut ancillary),
+                        MsgFlags::empty(),
+                    )
+                    .unwrap();
+                    let descriptors = message
+                        .cmsgs()
+                        .unwrap()
+                        .flat_map(|control| match control {
+                            ControlMessageOwned::ScmRights(descriptors) => descriptors,
+                            _ => Vec::new(),
+                        })
+                        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+                        .collect::<Vec<_>>();
+                    (message.bytes, descriptors)
+                };
+                assert_eq!(descriptors.len(), 1);
+                let request =
+                    complete_frame(&mut control, packet[..packet_length].to_vec()).unwrap();
+                assert!(matches!(
+                    decode(&request).unwrap(),
+                    Message::Handoff(ref handoff) if handoff.connection_id == connection_id
+                ));
+
+                drop(descriptors);
+                dropped_tx.send(()).unwrap();
+                respond_rx.recv().unwrap();
+                control
+                    .write_all(&encode(&Message::Adopted { connection_id }).unwrap())
+                    .unwrap();
+            });
+
+            let endpoint_for_sender = endpoint.clone();
+            let sender = thread::spawn(move || {
+                try_transfer_to_endpoint(
+                    accepted,
+                    &endpoint_for_sender,
+                    "www.contoso.com",
+                    0,
+                    connection_id,
+                    42,
+                )
+            });
+
+            dropped_rx.recv().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            let error = client.read(&mut byte).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ));
+
+            respond_tx.send(()).unwrap();
+            assert!(matches!(sender.join().unwrap(), Outcome::Transferred));
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            assert_eq!(client.read(&mut byte).unwrap(), 0);
             backend.join().unwrap();
         }
 

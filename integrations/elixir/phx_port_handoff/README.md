@@ -81,6 +81,17 @@ reads the original bytes and performs authoritative SNI certificate selection.
 After successful descriptor delivery, failures close the client connection
 rather than falling back to relay.
 
+OTP's legacy `inet` driver treats an FD imported with `:gen_tcp.fdopen/2` as
+externally owned. A dedicated Elixir process therefore retains the native
+receipt and monitors the imported Erlang port. The transport closes the raw
+port after TLS closes, and only then does the monitor release the native
+descriptor. This ordering prevents descriptor reuse while the driver still has
+the old FD registered. The import forces `{:inet_backend, :inet}` even when the
+VM-wide default is OTP's newer `socket` backend, and selects `:inet` or
+`:inet6` from the received descriptor's address family. Active receipts retain
+only the duplicate-ID registry, so they do not pin retired listener
+descriptors across restarts.
+
 ## Current limitations
 
 - Linux or macOS and OTP 29 are required.

@@ -93,7 +93,11 @@ The derived endpoint is
 `$XDG_RUNTIME_DIR/phx-port/handoff/<hash>.sock` on Linux and
 `/tmp/phx-port-<euid>/handoff/<hash>.sock` on macOS. Set
 `PHX_PORT_RUNTIME_DIR` to use `<runtime>/handoff/<hash>.sock`, or use
-`--handoff-socket` for a complete path override.
+`--handoff-socket` for a complete path override. Derived endpoints validate
+both the runtime root and its `handoff` child as private directories. A
+complete path override validates only its immediate parent, so it may live
+beneath a normally accessible project directory as long as the socket
+directory itself is owned by the current user with mode `0700`.
 
 ## Scope and limitations
 

@@ -7,6 +7,7 @@ defmodule PhxPortHandoff do
 
   @type broker :: reference()
   @type receipt :: reference()
+  @type address_family :: :inet | :inet6
 
   @spec endpoint_path(Path.t(), String.t()) :: Path.t()
   def endpoint_path(project, role) do
@@ -18,7 +19,7 @@ defmodule PhxPortHandoff do
 
   @spec listen(Path.t(), String.t()) :: {:ok, broker()} | {:error, term()}
   def listen(project, role) do
-    Native.listen(endpoint_path(project, role))
+    Native.listen_derived(endpoint_path(project, role))
   end
 
   @spec bandit_child_spec(module(), Path.t(), String.t(), keyword()) :: Supervisor.child_spec()
@@ -30,7 +31,10 @@ defmodule PhxPortHandoff do
     thousand_island_options =
       thousand_island_options
       |> Keyword.put(:transport_module, PhxPortHandoff.Transport)
-      |> Keyword.put(:transport_options, [handoff_path: handoff_path] ++ transport_options)
+      |> Keyword.put(
+        :transport_options,
+        [handoff_path: handoff_path, derived_handoff_path: true] ++ transport_options
+      )
       |> Keyword.put(:num_acceptors, 1)
 
     options =
@@ -57,10 +61,10 @@ defmodule PhxPortHandoff do
   def accept(broker) do
     lock = {{__MODULE__, broker}, self()}
 
-    with {:ok, receipt, fd, sni, peeked_length} <-
+    with {:ok, receipt, fd, address_family, sni, peeked_length} <-
            :global.trans(lock, fn -> Native.accept(broker) end),
-         {:ok, ^fd} <- Native.take_fd(receipt),
-         {:ok, socket} <- fdopen(receipt, fd) do
+         {:ok, socket} <- fdopen(receipt, fd, address_family) do
+      retain_client_until_socket_closes(socket, receipt)
       {:ok, socket, receipt, %{sni: sni, peeked_length: peeked_length}}
     end
   end
@@ -92,15 +96,35 @@ defmodule PhxPortHandoff do
     end
   end
 
-  defp fdopen(receipt, fd) do
-    case :gen_tcp.fdopen(fd, [:binary, active: false, packet: :raw, nodelay: true]) do
+  defp fdopen(receipt, fd, address_family) when address_family in [:inet, :inet6] do
+    options = [
+      {:inet_backend, :inet},
+      address_family,
+      :binary,
+      active: false,
+      packet: :raw,
+      nodelay: true
+    ]
+
+    case :gen_tcp.fdopen(fd, options) do
       {:ok, socket} ->
         {:ok, socket}
 
       {:error, reason} ->
-        _ = Native.close_fd(fd)
         _ = Native.rejected(receipt, 1)
+        _ = Native.close_client(receipt)
         {:error, {:fdopen, reason}}
     end
+  end
+
+  defp retain_client_until_socket_closes(socket, receipt) do
+    spawn(fn ->
+      monitor = :erlang.monitor(:port, socket)
+
+      receive do
+        {:DOWN, ^monitor, :port, ^socket, _reason} ->
+          :ok = Native.close_client(receipt)
+      end
+    end)
   end
 end

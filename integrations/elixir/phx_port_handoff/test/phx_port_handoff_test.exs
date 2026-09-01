@@ -46,6 +46,18 @@ defmodule PhxPortHandoffTest do
     assert :ok = Native.close_listener(broker)
   end
 
+  test "explicit endpoint validates only its private parent directory" do
+    root = Path.join("/tmp", "phxp-explicit-#{:os.getpid()}-#{System.unique_integer()}")
+    path = Path.join([root, "handoff", "receiver.sock"])
+    File.mkdir_p!(Path.dirname(path))
+    File.chmod!(root, 0o755)
+    File.chmod!(Path.dirname(path), 0o700)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    assert {:ok, broker} = Native.listen(path)
+    assert :ok = Native.close_listener(broker)
+  end
+
   test "native broker refuses to replace a live endpoint" do
     path = endpoint_path()
 
@@ -90,16 +102,34 @@ defmodule PhxPortHandoffTest do
         Process.sleep(:infinity)
       end)
 
-    assert_receive {:broker, broker}
+    assert_receive {:broker, broker}, 1_000
     accept = Task.async(fn -> Native.accept(broker) end)
     Process.exit(owner, :kill)
     assert {:error, :closed} = Task.await(accept)
-    refute File.exists?(path)
+    assert wait_until_removed(path)
   end
 
   defp endpoint_path do
-    directory = Path.join("/tmp", "phxp-#{System.unique_integer([:positive])}")
+    directory =
+      Path.join(
+        "/tmp",
+        "phxp-#{:os.getpid()}-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
     on_exit(fn -> File.rm_rf!(directory) end)
     Path.join(directory, "handoff.sock")
+  end
+
+  defp wait_until_removed(path, attempts \\ 100)
+
+  defp wait_until_removed(_path, 0), do: false
+
+  defp wait_until_removed(path, attempts) do
+    if File.exists?(path) do
+      Process.sleep(10)
+      wait_until_removed(path, attempts - 1)
+    else
+      true
+    end
   end
 end

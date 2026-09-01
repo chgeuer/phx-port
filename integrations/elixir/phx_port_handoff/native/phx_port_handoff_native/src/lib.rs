@@ -25,8 +25,8 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt}
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -56,6 +56,8 @@ mod atoms {
         closed,
         error,
         econnaborted,
+        inet,
+        inet6,
     }
 }
 
@@ -65,12 +67,18 @@ struct EndpointIdentity {
     inode: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TcpAddressFamily {
+    Inet,
+    Inet6,
+}
+
 struct Broker {
     listener: OwnedFd,
     path: PathBuf,
     endpoint_identity: EndpointIdentity,
     closed: AtomicBool,
-    connection_ids: Mutex<HashSet<[u8; 16]>>,
+    connection_ids: Arc<Mutex<HashSet<[u8; 16]>>>,
 }
 
 #[rustler::resource_impl]
@@ -100,7 +108,7 @@ struct Receipt {
     client: Mutex<Option<OwnedFd>>,
     control: Mutex<Option<Control>>,
     connection_id: [u8; 16],
-    broker: ResourceArc<Broker>,
+    connection_ids: Arc<Mutex<HashSet<[u8; 16]>>>,
 }
 
 #[rustler::resource_impl]
@@ -108,7 +116,7 @@ impl rustler::Resource for Receipt {}
 
 impl Drop for Receipt {
     fn drop(&mut self) {
-        if let Ok(mut ids) = self.broker.connection_ids.lock() {
+        if let Ok(mut ids) = self.connection_ids.lock() {
             ids.remove(&self.connection_id);
         }
     }
@@ -121,11 +129,21 @@ fn effective_uid() -> u32 {
 
 #[rustler::nif]
 fn listen(env: Env<'_>, path: String) -> NifResult<(Atom, ResourceArc<Broker>)> {
+    listen_with_policy(env, path, false)
+}
+
+#[rustler::nif]
+fn listen_derived(env: Env<'_>, path: String) -> NifResult<(Atom, ResourceArc<Broker>)> {
+    listen_with_policy(env, path, true)
+}
+
+fn listen_with_policy(
+    env: Env<'_>,
+    path: String,
+    validate_runtime_root: bool,
+) -> NifResult<(Atom, ResourceArc<Broker>)> {
     let path = PathBuf::from(path);
-    let parent = path
-        .parent()
-        .ok_or_else(|| failure("handoff path has no parent directory"))?;
-    ensure_private_directory(parent).map_err(failure)?;
+    ensure_endpoint_directory(&path, validate_runtime_root).map_err(failure)?;
     remove_stale_endpoint(&path).map_err(failure)?;
 
     let listener = create_listener_socket().map_err(failure)?;
@@ -152,7 +170,7 @@ fn listen(env: Env<'_>, path: String) -> NifResult<(Atom, ResourceArc<Broker>)> 
         path,
         endpoint_identity,
         closed: AtomicBool::new(false),
-        connection_ids: Mutex::new(HashSet::new()),
+        connection_ids: Arc::new(Mutex::new(HashSet::new())),
     });
     env.monitor(&broker, &env.pid())
         .ok_or_else(|| failure("cannot monitor handoff listener owner"))?;
@@ -168,7 +186,7 @@ fn close_listener(broker: ResourceArc<Broker>) -> NifResult<Atom> {
 #[rustler::nif(schedule = "DirtyIo")]
 fn accept(
     broker: ResourceArc<Broker>,
-) -> NifResult<(Atom, ResourceArc<Receipt>, i32, String, u32)> {
+) -> NifResult<(Atom, ResourceArc<Receipt>, i32, Atom, String, u32)> {
     let mut control = loop {
         if broker.closed.load(Ordering::Acquire) {
             return Err(Error::Term(Box::new(atoms::closed())));
@@ -231,16 +249,8 @@ fn accept(
         .into_iter()
         .next()
         .expect("descriptor count checked above");
-    let peer_address = getpeername::<SockaddrStorage>(client.as_raw_fd());
-    let is_connected_ip_stream = getsockopt(&client, sockopt::SockType)
-        .is_ok_and(|socket_type| socket_type == SockType::Stream)
-        && peer_address.is_ok_and(|address| {
-            matches!(
-                address.family(),
-                Some(AddressFamily::Inet | AddressFamily::Inet6)
-            )
-        });
-    if !is_connected_ip_stream {
+    let address_family = connected_tcp_address_family(&client);
+    if address_family.is_none() {
         send_response(
             &mut control,
             connection_id,
@@ -276,9 +286,28 @@ fn accept(
         client: Mutex::new(Some(client)),
         control: Mutex::new(Some(control)),
         connection_id,
-        broker,
+        connection_ids: Arc::clone(&broker.connection_ids),
     });
-    Ok((atoms::ok(), receipt, fd, sni, peeked_length))
+    let address_family = match address_family.expect("address family checked above") {
+        TcpAddressFamily::Inet => atoms::inet(),
+        TcpAddressFamily::Inet6 => atoms::inet6(),
+    };
+    Ok((atoms::ok(), receipt, fd, address_family, sni, peeked_length))
+}
+
+fn connected_tcp_address_family(client: &OwnedFd) -> Option<TcpAddressFamily> {
+    if !getsockopt(client, sockopt::SockType)
+        .is_ok_and(|socket_type| socket_type == SockType::Stream)
+    {
+        return None;
+    }
+    getpeername::<SockaddrStorage>(client.as_raw_fd())
+        .ok()
+        .and_then(|address| match address.family() {
+            Some(AddressFamily::Inet) => Some(TcpAddressFamily::Inet),
+            Some(AddressFamily::Inet6) => Some(TcpAddressFamily::Inet6),
+            _ => None,
+        })
 }
 
 #[rustler::nif]
@@ -292,6 +321,16 @@ fn take_fd(receipt: ResourceArc<Receipt>) -> NifResult<(Atom, i32)> {
         .ok_or_else(|| failure("handoff descriptor was already taken"))?
         .into_raw_fd();
     Ok((atoms::ok(), fd))
+}
+
+#[rustler::nif]
+fn close_client(receipt: ResourceArc<Receipt>) -> NifResult<Atom> {
+    let mut client = receipt
+        .client
+        .lock()
+        .map_err(|_| failure("handoff client lock poisoned"))?;
+    client.take();
+    Ok(atoms::ok())
 }
 
 #[rustler::nif]
@@ -333,7 +372,7 @@ fn respond(receipt: &Receipt, message_type: u8, reason_code: u16) -> NifResult<(
         reason_code,
     )
     .map_err(failure)?;
-    if let Ok(mut ids) = receipt.broker.connection_ids.lock() {
+    if let Ok(mut ids) = receipt.connection_ids.lock() {
         ids.remove(&receipt.connection_id);
     }
     Ok(())
@@ -343,14 +382,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder.create(path).map_err(|create_error| {
-                format!(
-                    "cannot create handoff directory {}: {create_error}",
-                    path.display()
-                )
-            })?;
+            create_private_directory(path)?;
         }
         Err(error) => {
             return Err(format!(
@@ -385,6 +417,32 @@ fn ensure_private_directory(path: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn create_private_directory(path: &Path) -> Result<(), String> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(format!(
+            "cannot create handoff directory {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn ensure_endpoint_directory(path: &Path, validate_runtime_root: bool) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "handoff socket has no parent directory".to_string())?;
+    if validate_runtime_root {
+        let runtime_root = parent
+            .parent()
+            .ok_or_else(|| "handoff directory has no runtime root".to_string())?;
+        ensure_private_directory(runtime_root)?;
+    }
+    ensure_private_directory(parent)
 }
 
 fn remove_stale_endpoint(path: &Path) -> Result<(), String> {
@@ -847,13 +905,19 @@ rustler::init!("Elixir.PhxPortHandoff.Native");
 #[cfg(test)]
 mod tests {
     use super::{
-        HEADER_LENGTH, MAX_PACKET_LENGTH, TYPE_HELLO, create_listener_socket, empty_message,
+        Broker, EndpointIdentity, HEADER_LENGTH, MAX_PACKET_LENGTH, Receipt, TYPE_HELLO,
+        TcpAddressFamily, connected_tcp_address_family, create_listener_socket,
+        create_private_directory, empty_message, ensure_endpoint_directory,
         ensure_private_directory, frame_length_from_header, remove_stale_endpoint,
     };
     use nix::sys::socket::{UnixAddr, bind};
+    use std::collections::HashSet;
     use std::fs;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::PermissionsExt;
+    use std::net::{TcpListener, TcpStream};
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     #[test]
@@ -874,6 +938,106 @@ mod tests {
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(ensure_private_directory(&path).is_err());
+    }
+
+    #[test]
+    fn private_directory_creation_tolerates_a_concurrent_creator() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("handoff");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        create_private_directory(&path).unwrap();
+        ensure_private_directory(&path).unwrap();
+    }
+
+    #[test]
+    fn endpoint_directory_rejects_symlinked_runtime_root() {
+        let directory = tempdir().unwrap();
+        let actual = directory.path().join("actual");
+        fs::create_dir(&actual).unwrap();
+        fs::set_permissions(&actual, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = directory.path().join("runtime");
+        symlink(&actual, &runtime).unwrap();
+        let endpoint = runtime.join("handoff").join("receiver.sock");
+
+        assert!(ensure_endpoint_directory(&endpoint, true).is_err());
+        assert!(!actual.join("handoff").exists());
+    }
+
+    #[test]
+    fn explicit_endpoint_validates_only_its_private_parent() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let handoff = directory.path().join("handoff");
+        fs::create_dir(&handoff).unwrap();
+        fs::set_permissions(&handoff, fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = handoff.join("receiver.sock");
+
+        ensure_endpoint_directory(&endpoint, false).unwrap();
+    }
+
+    #[test]
+    fn active_receipt_does_not_retain_retired_listener() {
+        let directory = tempdir().unwrap();
+        let endpoint = directory.path().join("handoff.sock");
+        let listener = create_listener_socket().unwrap();
+        bind(listener.as_raw_fd(), &UnixAddr::new(&endpoint).unwrap()).unwrap();
+        let metadata = fs::symlink_metadata(&endpoint).unwrap();
+        let endpoint_after_drop = endpoint.clone();
+        let connection_ids = Arc::new(Mutex::new(HashSet::from([[0x5A; 16]])));
+        let broker = Broker {
+            listener,
+            path: endpoint,
+            endpoint_identity: EndpointIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+            closed: AtomicBool::new(false),
+            connection_ids: Arc::clone(&connection_ids),
+        };
+        let receipt = Receipt {
+            client: Mutex::new(None),
+            control: Mutex::new(None),
+            connection_id: [0x5A; 16],
+            connection_ids,
+        };
+
+        drop(broker);
+
+        assert!(!endpoint_after_drop.exists());
+        assert_eq!(Arc::strong_count(&receipt.connection_ids), 1);
+        drop(receipt);
+    }
+
+    #[test]
+    fn classifies_connected_ipv4_descriptor() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let accepted = OwnedFd::from(accepted);
+
+        assert_eq!(
+            connected_tcp_address_family(&accepted),
+            Some(TcpAddressFamily::Inet)
+        );
+        drop(peer);
+    }
+
+    #[test]
+    fn classifies_connected_ipv6_descriptor_when_available() {
+        let Ok(listener) = TcpListener::bind("[::1]:0") else {
+            return;
+        };
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let accepted = OwnedFd::from(accepted);
+
+        assert_eq!(
+            connected_tcp_address_family(&accepted),
+            Some(TcpAddressFamily::Inet6)
+        );
+        drop(peer);
     }
 
     #[test]

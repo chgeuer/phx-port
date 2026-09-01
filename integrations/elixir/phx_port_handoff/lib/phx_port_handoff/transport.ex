@@ -15,8 +15,16 @@ defmodule PhxPortHandoff.Transport do
   @impl true
   def listen(port, options) do
     {path, tls_options} = Keyword.pop!(options, :handoff_path)
+    {derived_path?, tls_options} = Keyword.pop(tls_options, :derived_handoff_path, false)
 
-    case Native.listen(path) do
+    result =
+      if derived_path? do
+        Native.listen_derived(path)
+      else
+        Native.listen(path)
+      end
+
+    case result do
       {:ok, broker} -> {:ok, {broker, tls_options, {{0, 0, 0, 0}, port}}}
       other -> other
     end
@@ -50,14 +58,15 @@ defmodule PhxPortHandoff.Transport do
   def handshake(%__MODULE__{socket: socket, tls_options: options}) do
     peername = :inet.peername(socket)
     sockname = :inet.sockname(socket)
+    options = [:binary | options]
 
     case :ssl.handshake(socket, options) do
       {:ok, tls_socket, _extensions} ->
-        remember_addresses(tls_socket, peername, sockname)
+        remember_connection(tls_socket, socket, peername, sockname)
         {:ok, tls_socket}
 
       {:ok, tls_socket} ->
-        remember_addresses(tls_socket, peername, sockname)
+        remember_connection(tls_socket, socket, peername, sockname)
         {:ok, tls_socket}
 
       other ->
@@ -97,7 +106,14 @@ defmodule PhxPortHandoff.Transport do
   end
 
   def close({broker, _tls_options, _public_address}), do: Native.close_listener(broker)
-  def close(socket), do: :ssl.close(socket)
+
+  def close(socket) do
+    try do
+      :ssl.close(socket)
+    after
+      release_connection(socket)
+    end
+  end
 
   @impl true
   def sockname(%__MODULE__{socket: socket}), do: :inet.sockname(socket)
@@ -143,8 +159,18 @@ defmodule PhxPortHandoff.Transport do
     end
   end
 
-  defp remember_addresses(socket, peername, sockname) do
+  defp remember_connection(socket, tcp_socket, peername, sockname) do
+    Process.put({__MODULE__, :tcp_socket, socket}, tcp_socket)
     Process.put({__MODULE__, :peername, socket}, peername)
     Process.put({__MODULE__, :sockname, socket}, sockname)
+  end
+
+  defp release_connection(socket) do
+    Process.delete({__MODULE__, :peername, socket})
+    Process.delete({__MODULE__, :sockname, socket})
+
+    if tcp_socket = Process.delete({__MODULE__, :tcp_socket, socket}) do
+      :gen_tcp.close(tcp_socket)
+    end
   end
 end

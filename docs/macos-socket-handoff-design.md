@@ -3,9 +3,30 @@
 ## Status
 
 Implemented for the daemon sender, Phoenix/Bandit integration, and Rust sample.
-The Darwin descriptor path has been exercised on macOS arm64 with real Unix
-and TCP sockets plus end-to-end TLS requests over HTTP/1.1 and HTTP/2. The
-.NET receiver and `launchd` service installation remain follow-up work.
+The Darwin descriptor path has been manually exercised on macOS arm64 with
+real Unix and TCP sockets plus trusted end-to-end TLS requests over HTTP/1.1,
+HTTP/2, and Phoenix Channel WebSockets. The .NET receiver and `launchd`
+service installation remain follow-up work.
+
+### Manual validation evidence
+
+The completed path was exercised with Rust 1.97.1, OTP 29.0.3, Elixir 1.20.2,
+and Rustler 0.36.2 on macOS arm64:
+
+| Area | Evidence |
+|---|---|
+| Trusted routing and ALPN | CA-trusted certificates for three loopback hostnames covered Phoenix handoff, Rust handoff, and relay-only routing over HTTP/1.1 and HTTP/2 on IPv4; Phoenix and Rust handoff also passed over IPv6. |
+| Phoenix/Bandit | Original IPv4 and IPv6 peer and public local addresses were preserved; 160/160 concurrent TLS requests and 32/32 concurrent Phoenix Channel WebSockets completed. Channel join, push/reply, sustained traffic, ping/pong, and close all passed. |
+| Phoenix descriptor lifecycle | Total and TCP descriptor counts returned exactly to their pre-test baselines after both request and WebSocket stress. |
+| OTP backend selection | Handoff remained functional when the VM-wide default was `inet_backend=socket`; imported descriptors were forced onto the compatible legacy `inet` backend and returned to the FD baseline. |
+| Rust/Axum | Direct TLS passed 16/16 concurrent requests and handoff passed 80/80, including HTTP/1.1, HTTP/2, keep-alive, and address preservation. |
+| Fallback and recovery | Relay-only routing passed, removal of a live handoff endpoint fell back to TLS relay, and receiver restart restored handoff. |
+| Peer authentication | Same-UID peers passed mutual `getpeereid`; the daemon rejected a connected root-owned Unix-socket peer before PHXP exchange and safely fell back to relay. |
+
+A receiver-side different-UID connection was not exercised because this host
+could not launch a test process under a second effective UID. The receiver's
+negative `getpeereid` branch remains enforced in code; successful peer-ID
+checks were exercised on every handoff.
 
 This document specifies the macOS port of the optional PHXP connected-socket
 handoff path. It is intended to be implementation-ready on a macOS development
@@ -210,7 +231,8 @@ send_handoff(control, client_fd, frame):
         return PRE_DELIVERY_FAILURE
 
     descriptor may now exist in the receiver
-    close daemon's client descriptor without shutdown
+    enter irreversible post-delivery state
+    defer close of daemon's inert client descriptor without shutdown
 
     if sent < frame.length:
         write all remaining frame bytes without another SCM_RIGHTS message
@@ -218,14 +240,18 @@ send_handoff(control, client_fd, frame):
             return POST_DELIVERY_FAILURE
 
     read one complete response frame
+    close daemon's inert client descriptor
     validate its type and connection ID
 ```
 
 A positive result from the initial `sendmsg` is the irreversible ownership
 boundary even when it is smaller than the frame length. The descriptor is
-associated with the first successfully transferred data byte. Failure while
-sending the remainder must therefore produce `Outcome::Delivered`, never
-`Outcome::Unavailable`.
+associated with the first successfully transferred data byte. The sender must
+not use or relay the socket after that point, but on Darwin it retains its
+inert descriptor until the receiver response and closes it before returning.
+This acknowledgment barrier avoids a close-before-receive race observed under
+concurrent handoff. Failure while sending the remainder must therefore produce
+`Outcome::Delivered`, never `Outcome::Unavailable`.
 
 The implementation must not resend `SCM_RIGHTS` while completing a partial
 frame; doing so would duplicate the client descriptor a second time.
@@ -307,9 +333,9 @@ explicitly.
 |---|---:|---:|---:|
 | Before HANDOFF `sendmsg` | yes | no | yes |
 | `sendmsg` returned error or zero | yes | no | yes |
-| `sendmsg` returned a positive byte count | no, close immediately | yes | no |
-| Sending remaining frame bytes | no | yes | no |
-| Waiting for response | no | yes | no |
+| `sendmsg` returned a positive byte count | logically no; retain inert descriptor until response | yes | no |
+| Sending remaining frame bytes | logically no; retain inert descriptor until response | yes | no |
+| Waiting for response | logically no; retain inert descriptor until response | yes | no |
 | `ADOPTED` | no | yes | no |
 | `REJECTED`, EOF, timeout, malformed response | no | receiver closes if needed | no |
 
@@ -480,6 +506,11 @@ once. Keep the existing Linux path stable by treating its XDG root as before:
 `$XDG_RUNTIME_DIR/phx-port/handoff/<sha256>.sock`. Shared endpoint helpers must
 make this platform-specific prefix explicit and test it.
 
+Complete socket-path overrides are a separate policy from derived endpoints.
+Derived endpoints validate both the runtime root and its `handoff` child.
+Explicit paths validate their immediate socket directory without inferring a
+runtime root from a directory merely named `handoff`.
+
 The short `/tmp` location is intentional. Typical macOS `$TMPDIR` paths under
 `/var/folders` can be long enough that adding a 64-character digest exceeds
 Darwin's Unix socket path limit.
@@ -526,7 +557,8 @@ The macOS sender must:
 - authenticate the receiver with `getpeereid`;
 - frame `HELLO` and `READY`;
 - send HANDOFF and one TCP FD using the partial-write algorithm above;
-- close its client FD immediately after a positive `sendmsg`;
+- stop using its client FD after a positive `sendmsg`, retain it only as an
+  inert lifetime guard until the receiver response, then close it;
 - read one framed response; and
 - map failures to `Unavailable` or `Delivered` according to the ownership
   boundary.
@@ -600,13 +632,36 @@ identical.
 Keep `:gen_tcp.fdopen/2` as the first implementation:
 
 ```elixir
-:gen_tcp.fdopen(fd, [:binary, active: false, packet: :raw, nodelay: true])
+:gen_tcp.fdopen(fd, [
+  {:inet_backend, :inet},
+  address_family,
+  :binary,
+  active: false,
+  packet: :raw,
+  nodelay: true
+])
 ```
 
-The native owner releases the descriptor only once. On `fdopen` failure:
+OTP's legacy `inet` driver treats a descriptor passed to `fdopen` as externally
+owned and unregisters it without calling `close(2)`. The native receipt
+therefore remains the descriptor owner. After a successful import, a dedicated
+Elixir process holds the receipt and monitors the imported Erlang port. The
+transport explicitly closes that raw port after `:ssl.close/1`; only after the
+port monitor reports `DOWN` does the native helper close the descriptor. This
+prevents descriptor-number reuse while the `tcp_inet` driver still has the old
+FD registered. The per-call `inet_backend` option is mandatory even when the
+VM-wide default selects OTP's newer `socket` backend, whose socket value cannot
+be monitored as an Erlang port. The NIF derives `address_family` from the
+connected descriptor and returns `:inet` for IPv4 or `:inet6` for IPv6.
 
-- close the raw descriptor through the native helper;
+Receipts retain only the shared duplicate-ID registry, not the broker resource
+that owns the listening descriptor. Long-lived connections therefore cannot
+pin retired listener FDs across supervised listener restarts.
+
+On `fdopen` failure:
+
 - send `REJECTED`;
+- close the receipt-owned descriptor through the native helper;
 - return an error to Thousand Island; and
 - never acknowledge adoption.
 
@@ -617,7 +672,9 @@ After `fdopen`, preserve the existing sequence:
 3. send `ADOPTED`;
 4. cache peer and local addresses;
 5. perform `:ssl.handshake`;
-6. enter the normal Bandit connection lifecycle.
+6. enter the normal Bandit connection lifecycle;
+7. close the raw `:gen_tcp` port after the SSL socket closes; and
+8. close the native descriptor only after the port monitor reports `DOWN`.
 
 OTP 29 and Rustler 0.36.2 remain the supported baseline until macOS tests prove
 otherwise. Do not upgrade Rustler as part of this port.
@@ -750,9 +807,9 @@ Using real Unix and TCP sockets:
 6. Verify `FD_CLOEXEC` on the accepted control FD and received TCP FD.
 7. Verify `peername` and `sockname` match the original connection.
 8. Read the complete previously peeked payload through the received FD.
-9. Close the sender copy without `shutdown`.
-10. Continue bidirectional I/O through the receiver copy.
-11. Send and validate `ADOPTED`.
+9. Send and validate `ADOPTED`.
+10. Close the sender copy without `shutdown`.
+11. Continue bidirectional I/O through the receiver copy.
 
 Add negative tests for:
 
@@ -805,8 +862,10 @@ On macOS with OTP 29:
 - HTTP/2 reaches the ordinary Phoenix endpoint;
 - LiveView WebSocket upgrade remains connected;
 - `Plug.Conn.remote_ip` is the original client;
-- local socket port is the daemon's public listener port; and
-- concurrent handoffs to separate applications do not cross routes.
+- local socket port is the daemon's public listener port;
+- concurrent handoffs to separate applications do not cross routes;
+- concurrent handoffs do not hang or steal a reused descriptor number; and
+- connection churn does not leak or double-close descriptors.
 
 Repeat request tests through the ordinary assigned HTTPS port to prove the
 application configuration is shared rather than forked.
@@ -922,12 +981,13 @@ and authenticate both connected peers.
 
 ### Runtime descriptor ownership mismatch
 
-Risk: `:gen_tcp.fdopen/2`, Rustler resource cleanup, and Darwin's socket backend
-interact differently than on tested Linux/OTP builds.
+Risk: `:gen_tcp.fdopen/2`, Rustler resource cleanup, and Darwin descriptor
+reuse interact differently than on tested Linux/OTP builds.
 
-Mitigation: retain OTP 29 and Rustler 0.36.2, test closure and supervisor
-restart on a real Mac, and do not advertise support based on compilation
-alone.
+Mitigation: retain OTP 29 and Rustler 0.36.2, monitor the imported Erlang port
+before releasing the receipt-owned FD, test closure, concurrency, descriptor
+counts, and supervisor restart on a real Mac, and do not advertise support
+based on compilation alone.
 
 ## References
 

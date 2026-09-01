@@ -553,6 +553,9 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
 }
 
 fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<(), String> {
+    client
+        .set_nonblocking(false)
+        .map_err(|error| format!("cannot configure accepted client socket: {error}"))?;
     let accepted_at_ns = PROCESS_START
         .get_or_init(Instant::now)
         .elapsed()

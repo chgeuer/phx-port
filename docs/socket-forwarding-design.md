@@ -186,8 +186,9 @@ For an active route whose backend advertises socket-handoff capability:
 5. Connect to the backend's Unix-domain control socket.
 6. Send a small versioned handoff header and the connected client FD using
    `SCM_RIGHTS`.
-7. Treat successful `sendmsg` as the ownership boundary and immediately close
-   phx-port's descriptor without calling `shutdown(2)`.
+7. Treat successful `sendmsg` as the ownership boundary. Linux closes
+   phx-port's descriptor immediately; Darwin retains it as an inert lifetime
+   guard until the receiver response, then closes it without `shutdown(2)`.
 8. Wait for a bounded acknowledgement that reports whether the backend adopted
    the already-delivered socket.
 9. Close the Unix-domain control connection after the response or timeout.
@@ -217,10 +218,10 @@ sequenceDiagram
     NIF-->>Daemon: READY
     Daemon->>NIF: HANDOFF metadata + FD via SCM_RIGHTS
     Note over Daemon,NIF: Successful sendmsg is the ownership boundary
-    Daemon->>Daemon: close(FD), never shutdown(FD)
     NIF->>TI: gen_tcp.fdopen(FD)
     TI->>TI: Transfer controlling process
     NIF-->>Daemon: ADOPTED
+    Daemon->>Daemon: close(FD), never shutdown(FD)
     TI->>Bandit: Server-side TLS, then normal connection pipeline
     Bandit-->>Client: HTTP over the original port-443 socket
 ```
@@ -361,6 +362,18 @@ end
 
 OTP 29 accepts a `:gen_tcp` socket in the server-side handshake, making an FD
 wrapped with `:gen_tcp.fdopen/2` suitable for this upgrade path.
+
+The `inet` driver treats an FD passed to `:gen_tcp.fdopen/2` as externally
+owned and does not close it with the Erlang socket. A dedicated Elixir process
+therefore holds the native receipt and monitors the imported Erlang port for
+its full lifetime. The transport closes the raw `:gen_tcp` port after
+`:ssl.close/1`; the monitor then observes `DOWN` and closes the native
+descriptor. This ordering prevents the OS from reusing an FD number while the
+old `tcp_inet` driver still has it registered. Descriptor import explicitly
+selects `{:inet_backend, :inet}` so this lifecycle remains valid when the
+VM-wide default is the newer `socket` backend, and selects `:inet` or `:inet6`
+from the descriptor family returned by the NIF. Receipts retain the shared
+duplicate-ID registry but not the broker's listening descriptor.
 
 The implemented transport records `:inet.peername/1` and `:inet.sockname/1`
 before TLS upgrade. On imported descriptors, OTP 29 may return `:ebadf` from
@@ -610,8 +623,9 @@ The implementation handles the ambiguous case where the descriptor was
 delivered but the acknowledgement was lost as follows:
 
 - The backend treats descriptor receipt as ownership transfer.
-- phx-port closes its descriptor when `sendmsg` succeeds, regardless of a lost
-  acknowledgement.
+- phx-port permanently stops using the descriptor when `sendmsg` succeeds.
+- Linux closes its copy immediately. Darwin keeps an inert copy until a
+  response, EOF, or timeout, then closes it regardless of the outcome.
 - The acknowledgement is used for telemetry and failure reporting, not as a
   transactional rollback boundary.
 
@@ -778,12 +792,17 @@ The HTTP/1.1, HTTP/2, LiveView WebSocket, original peer-address, concurrent
 cross-site, and in-VM listener restart scenarios have been exercised end to
 end in Phoenix. The standalone Rust and .NET 10 receivers have also been built
 and exercised through certificate discovery and real daemon handoff using the
-Alpha and Beta fixture certificates. Certificate rotation under load,
-sustained descriptor-leak testing, and comparative performance benchmarks
-remain outstanding. On macOS arm64, the daemon transport has transferred an
-untouched TCP descriptor with explicit close-on-exec checks, while the Bandit
-and Axum receivers have each completed handed-off TLS requests over HTTP/1.1
-and HTTP/2 with original peer and local addresses.
+Alpha and Beta fixture certificates. Certificate rotation under load and
+comparative performance benchmarks remain outstanding. Manual validation on
+macOS arm64 transferred an untouched TCP descriptor with explicit
+close-on-exec checks. Bandit and Axum completed trusted handed-off TLS over
+HTTP/1.1 and HTTP/2 with original peer and local addresses; Phoenix Channel
+WebSockets completed join and sustained bidirectional traffic. Stress runs
+completed 160 Phoenix requests, 32 concurrent Phoenix Channel WebSockets, and
+80 Rust requests without descriptor growth. IPv6 HTTP/1.1, HTTP/2, Phoenix
+Channel, and concurrent Phoenix/Rust handoffs also completed with preserved
+IPv6 addresses. Endpoint disappearance and a wrong-UID daemon peer both fell
+back to relay before delivery, and receiver restart restored handoff.
 
 ## Delivery status
 
