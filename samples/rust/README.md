@@ -8,8 +8,8 @@ This Linux-only standalone example runs three listeners:
 
 The PHXP listener performs the `HELLO`/`READY` handshake, receives exactly one
 connected TCP descriptor with `SCM_RIGHTS`, acknowledges adoption, performs
-server-side TLS on the untouched socket, and returns the same small HTTP/1.1
-response as the ordinary listeners. The response includes `peer` and `local`;
+server-side TLS on the untouched socket, and feeds it into the same Axum router
+as the ordinary listeners. The response includes `peer` and `local`;
 on a handed-off socket these are the original client and daemon listener
 addresses. The handoff SNI is printed only as diagnostic metadata; rustls
 processes the original ClientHello and does not trust that field for TLS.
@@ -95,11 +95,11 @@ All settings have CLI and environment forms:
 
 - Linux only; the handoff transport depends on `SCM_RIGHTS` and
   `SO_PEERCRED`.
-- HTTP/1.1 only. Each connection serves one request and closes; there is no
-  HTTP/2, keep-alive, WebSocket, graceful shutdown, or production hardening.
+- Axum and Hyper handle HTTP/1.1, HTTP/2, keep-alive, upgrades, request bodies,
+  and response framing on all three ingress paths.
 - One configured certificate chain/private key is used for both ordinary and
   handed-off TLS. There is no multi-certificate SNI resolver or client auth.
-- It uses a thread per TCP connection and is intended as a protocol example,
-  not a benchmark or production server.
+- The PHXP `SOCK_SEQPACKET` control protocol uses blocking worker threads;
+  adopted TCP connections run as Tokio tasks.
 - The sample hostname and certificate directory are configurable through the
   root `justfile`.

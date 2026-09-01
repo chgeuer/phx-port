@@ -1,26 +1,54 @@
 use crate::handoff_protocol::{self, MAX_PACKET_LENGTH, Message};
-use crate::{ResponseInfo, report_connection_error, serve_tls};
 use nix::sys::socket::{
-    AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, SockaddrStorage,
-    UnixAddr, accept4, bind, connect, getpeername, getsockopt, listen, recv, recvmsg, send, socket,
-    sockopt,
+    AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, SockaddrLike,
+    SockaddrStorage, UnixAddr, accept4, bind, connect, getpeername, getsockopt, listen, recv,
+    recvmsg, send, socket, sockopt,
 };
-use rustls::ServerConfig;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::IoSliceMut;
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use tokio::sync::mpsc::{Sender, error::TrySendError};
 
 const REJECT_INVALID_DESCRIPTOR: u16 = 1;
 const REJECT_DUPLICATE_ID: u16 = 2;
 const REJECT_ADOPTION_FAILED: u16 = 3;
+
+pub(crate) struct AdoptedConn {
+    pub(crate) stream: TcpStream,
+    pub(crate) peer: Option<SocketAddr>,
+    pub(crate) local: Option<SocketAddr>,
+    pub(crate) sni: String,
+    pub(crate) peeked: u32,
+    pub(crate) connection_id: [u8; 16],
+    pub(crate) active_ids: Arc<Mutex<HashSet<[u8; 16]>>>,
+}
+
+pub(crate) struct ActiveIdGuard {
+    id: [u8; 16],
+    active_ids: Arc<Mutex<HashSet<[u8; 16]>>>,
+}
+
+impl ActiveIdGuard {
+    pub(crate) fn new(id: [u8; 16], active_ids: Arc<Mutex<HashSet<[u8; 16]>>>) -> Self {
+        Self { id, active_ids }
+    }
+}
+
+impl Drop for ActiveIdGuard {
+    fn drop(&mut self) {
+        if let Ok(mut ids) = self.active_ids.lock() {
+            ids.remove(&self.id);
+        }
+    }
+}
 
 pub(crate) struct HandoffListener {
     listener: OwnedFd,
@@ -54,6 +82,7 @@ impl HandoffListener {
             None,
         )
         .map_err(|error| format!("cannot create handoff socket: {error}"))?;
+
         let address = UnixAddr::new(path)
             .map_err(|error| format!("invalid handoff path {}: {error}", path.display()))?;
         bind(listener.as_raw_fd(), &address)
@@ -73,19 +102,26 @@ impl HandoffListener {
         })
     }
 
-    pub(crate) fn run(self, tls: Arc<ServerConfig>) -> Result<(), String> {
+    pub(crate) fn spawn(self, adopted_tx: Sender<AdoptedConn>) {
+        thread::Builder::new()
+            .name("phxp-listener".into())
+            .spawn(move || self.run_loop(adopted_tx))
+            .expect("failed to start PHXP listener thread");
+    }
+
+    fn run_loop(self, adopted_tx: Sender<AdoptedConn>) {
         loop {
             let control = match accept4(self.listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC) {
-                Ok(descriptor) => unsafe { OwnedFd::from_raw_fd(descriptor) },
+                Ok(fd) => unsafe { OwnedFd::from_raw_fd(fd) },
                 Err(error) => {
                     eprintln!("PHXP accept failed: {error}");
                     continue;
                 }
             };
-            let tls = Arc::clone(&tls);
+            let tx = adopted_tx.clone();
             let active_ids = Arc::clone(&self.active_ids);
             thread::spawn(move || {
-                if let Err(error) = receive_handoff(control, tls, active_ids) {
+                if let Err(error) = receive_handoff(control, tx, active_ids) {
                     eprintln!("PHXP handoff failed: {error}");
                 }
             });
@@ -157,7 +193,7 @@ fn endpoint_is_live(path: &Path) -> bool {
 
 fn receive_handoff(
     control: OwnedFd,
-    tls: Arc<ServerConfig>,
+    adopted_tx: Sender<AdoptedConn>,
     active_ids: Arc<Mutex<HashSet<[u8; 16]>>>,
 ) -> Result<(), String> {
     let credentials = getsockopt(&control, sockopt::PeerCredentials)
@@ -165,9 +201,12 @@ fn receive_handoff(
     if credentials.uid() != nix::unistd::getuid().as_raw() {
         return Err("PHXP peer belongs to a different user".into());
     }
+
     let timeout = nix::sys::time::TimeVal::new(2, 0);
     nix::sys::socket::setsockopt(&control, sockopt::ReceiveTimeout, &timeout)
         .map_err(|error| format!("cannot configure PHXP receive timeout: {error}"))?;
+    nix::sys::socket::setsockopt(&control, sockopt::SendTimeout, &timeout)
+        .map_err(|error| format!("cannot configure PHXP send timeout: {error}"))?;
 
     let mut packet = [0_u8; MAX_PACKET_LENGTH + 1];
     let length = recv(control.as_raw_fd(), &mut packet, MsgFlags::empty())
@@ -191,14 +230,32 @@ fn receive_handoff(
             descriptors.len()
         ));
     }
-    let client = descriptors.into_iter().next().expect("length checked");
+    let client = descriptors
+        .into_iter()
+        .next()
+        .expect("length checked above");
+    let peer_address = getpeername::<SockaddrStorage>(client.as_raw_fd());
     let is_connected_stream = getsockopt(&client, sockopt::SockType)
         .is_ok_and(|socket_type| socket_type == SockType::Stream)
-        && getpeername::<SockaddrStorage>(client.as_raw_fd()).is_ok();
+        && peer_address.is_ok_and(|address| {
+            matches!(
+                address.family(),
+                Some(AddressFamily::Inet | AddressFamily::Inet6)
+            )
+        });
     if !is_connected_stream {
         send_rejected(&control, handoff.connection_id, REJECT_INVALID_DESCRIPTOR)?;
-        return Err("handed-off descriptor is not a connected stream socket".into());
+        return Err("handed-off descriptor is not a connected TCP stream socket".into());
     }
+
+    let stream = TcpStream::from(client);
+    let peer = stream.peer_addr().ok();
+    let local = stream.local_addr().ok();
+
+    stream.set_nonblocking(true).map_err(|error| {
+        let _ = send_rejected(&control, handoff.connection_id, REJECT_ADOPTION_FAILED);
+        format!("cannot set adopted fd to nonblocking mode: {error}")
+    })?;
 
     {
         let mut ids = active_ids
@@ -210,54 +267,49 @@ fn receive_handoff(
         }
     }
 
-    let stream = TcpStream::from(client);
-    let peer = stream.peer_addr().ok();
-    let local = stream.local_addr().ok();
-    let connection_id = handoff.connection_id;
-    let info = ResponseInfo::handed_off(
+    let conn = AdoptedConn {
+        stream,
         peer,
         local,
-        handoff.requested_sni.clone(),
-        handoff.peeked_length,
-    );
-    let ids_for_connection = Arc::clone(&active_ids);
-    let worker = thread::Builder::new()
-        .name("phxp-tls-connection".into())
-        .spawn(move || {
-            if let Err(error) = serve_tls(stream, tls, info) {
-                report_connection_error("handed-off TLS", &error);
-            }
-            if let Ok(mut ids) = ids_for_connection.lock() {
-                ids.remove(&connection_id);
-            }
-        });
+        sni: handoff.requested_sni.clone(),
+        peeked: handoff.peeked_length,
+        connection_id: handoff.connection_id,
+        active_ids: Arc::clone(&active_ids),
+    };
 
-    match worker {
-        Ok(_) => {
-            send_packet(
-                &control,
-                &Message::Adopted {
-                    connection_id: handoff.connection_id,
-                },
-            )?;
-            println!(
-                "adopted PHXP connection for {} from {} (peeked {} bytes, accepted_at_ns={})",
-                handoff.requested_sni,
-                peer.map(|address| address.to_string())
-                    .unwrap_or_else(|| "unknown peer".into()),
-                handoff.peeked_length,
-                handoff.accepted_at_ns
-            );
-            Ok(())
+    if let Err(error) = adopted_tx.try_send(conn) {
+        let (conn, reason) = match error {
+            TrySendError::Full(conn) => (conn, "handoff queue is full"),
+            TrySendError::Closed(conn) => (conn, "async runtime shut down"),
+        };
+        drop(conn);
+        if let Ok(mut ids) = active_ids.lock() {
+            ids.remove(&handoff.connection_id);
         }
-        Err(error) => {
-            if let Ok(mut ids) = active_ids.lock() {
-                ids.remove(&handoff.connection_id);
-            }
-            send_rejected(&control, handoff.connection_id, REJECT_ADOPTION_FAILED)?;
-            Err(format!("cannot start handed-off connection: {error}"))
-        }
+        send_rejected(&control, handoff.connection_id, REJECT_ADOPTION_FAILED)?;
+        return Err(format!("{reason}; rejected adoption"));
     }
+
+    if let Err(error) = send_packet(
+        &control,
+        &Message::Adopted {
+            connection_id: handoff.connection_id,
+        },
+    ) {
+        eprintln!(
+            "PHXP connection {} was adopted, but its acknowledgement was lost: {error}",
+            hex_id(&handoff.connection_id)
+        );
+    }
+    println!(
+        "adopted PHXP connection for {} from {} (peeked {} bytes, accepted_at_ns={})",
+        handoff.requested_sni,
+        peer.map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown peer".into()),
+        handoff.peeked_length,
+        handoff.accepted_at_ns,
+    );
+    Ok(())
 }
 
 fn receive_descriptor(
@@ -273,17 +325,19 @@ fn receive_descriptor(
         MsgFlags::MSG_CMSG_CLOEXEC,
     )
     .map_err(|error| format!("cannot receive PHXP descriptor: {error}"))?;
+
     let packet_length = message.bytes;
     let flags = message.flags;
     let descriptors = message
         .cmsgs()
         .map_err(|error| format!("invalid PHXP ancillary message: {error}"))?
-        .flat_map(|control| match control {
-            ControlMessageOwned::ScmRights(descriptors) => descriptors,
+        .flat_map(|cmsg| match cmsg {
+            ControlMessageOwned::ScmRights(fds) => fds,
             _ => Vec::new(),
         })
-        .map(|descriptor| unsafe { OwnedFd::from_raw_fd(descriptor) })
+        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
         .collect::<Vec<_>>();
+
     if flags.intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC) {
         return Err("truncated PHXP packet or ancillary data".into());
     }
@@ -309,6 +363,10 @@ fn send_packet(control: &OwnedFd, message: &Message) -> Result<(), String> {
     send(control.as_raw_fd(), &packet, MsgFlags::empty())
         .map_err(|error| format!("cannot send PHXP response: {error}"))?;
     Ok(())
+}
+
+fn hex_id(id: &[u8; 16]) -> String {
+    id.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 #[cfg(test)]

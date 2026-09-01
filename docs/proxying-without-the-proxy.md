@@ -386,17 +386,21 @@ That completes the progression that motivated the work:
 
 ## Current boundaries
 
-The handoff transport is intentionally Linux-specific. The production-shaped
-integration remains Phoenix-specific, while minimal Rust and .NET 10 servers
-now demonstrate PHXP interoperability outside the BEAM:
+The handoff transport is intentionally Linux-specific. Rust and .NET 10
+samples now demonstrate the same production-shaped boundary outside the BEAM:
 
 - Descriptor passing uses Linux/Unix socket facilities.
 - The Phoenix receiver requires Erlang/OTP 29 or later and pins Rustler 0.36.2.
 - A second, handoff-only Bandit supervisor is used beside the ordinary
   endpoint.
 - The native receive path currently uses one serialized acceptor.
-- The Rust and .NET examples implement only a small HTTP/1.1 surface and are
-  reference servers, not production framework integrations.
+- The Rust sample adapts the descriptor to Tokio, then uses tokio-rustls,
+  Hyper, and one Axum router for direct and handed-off requests.
+- The .NET sample exposes the descriptor through a custom public Kestrel
+  `IConnectionListener`; Kestrel performs TLS and HTTP before dispatching to
+  the same ASP.NET Core middleware as its ordinary listeners.
+- Both framework paths negotiate HTTP/1.1 and HTTP/2. Their custom code stops
+  at the accepted-socket transport boundary rather than implementing HTTP.
 
 Other runtimes can implement the PHXP receiver protocol, but they do not need
 to. The generic TLS relay remains the baseline behavior.

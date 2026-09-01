@@ -3,9 +3,11 @@
 This standalone Linux example exposes ordinary ASP.NET Core HTTP and HTTPS
 listeners and a PHXP v1 `AF_UNIX` `SOCK_SEQPACKET` receiver. The receiver gets
 the original TCP descriptor through `SCM_RIGHTS`, adopts it with
-`SafeSocketHandle`/`Socket`, performs server-side TLS with `SslStream`, and
-returns one HTTP/1.1 response. The response and log include the original peer
-and local addresses.
+`SafeSocketHandle`/`Socket`, and adapts it to a public Kestrel
+`IConnectionListener`. Kestrel then performs TLS,
+HTTP/1.1 or HTTP/2, and dispatches through the same ASP.NET Core middleware as
+the ordinary listeners. The response includes the original peer and local
+addresses.
 
 The PHXP implementation follows
 [`docs/socket-forwarding-design.md`](../../docs/socket-forwarding-design.md):
@@ -90,10 +92,8 @@ acknowledgement, response, and preserved peer address.
 
 - Linux x64/arm64 only; the small P/Invoke layer assumes the Linux `recvmsg`,
   `cmsghdr`, `SO_PEERCRED`, and descriptor ABI.
-- The handed-off path is a compact HTTP/1.1 example, not a Kestrel transport:
-  one request is read, request bodies/upgrades are not supported, and the
-  connection is closed after one response. Ordinary listeners are Kestrel.
+- The handed-off path uses a small custom Kestrel transport because Kestrel's
+  built-in socket transport cannot accept an already-connected descriptor.
 - One configured PEM certificate/key pair is used. The informational PHXP SNI
-  is logged, but `SslStream` independently parses the original ClientHello.
-- Accepted handoffs run as independent tasks and do not share Kestrel limits,
-  middleware, routing, HTTP/2, or graceful-drain accounting.
+  is diagnostic metadata; Kestrel independently parses the original
+  ClientHello.

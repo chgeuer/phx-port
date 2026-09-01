@@ -9,8 +9,13 @@ These intentionally small servers expose three ingress paths:
 | Sample | TLS implementation | HTTP implementation |
 |---|---|---|
 | [`elixir`](elixir) | Erlang/OTP SSL through `PhxPortHandoff` | Bandit and a minimal Plug |
-| [`rust`](rust) | rustls | Minimal HTTP/1.1 |
-| [`dotnet`](dotnet) | `SslStream` for handoff; Kestrel for direct HTTPS | Minimal HTTP/1.1 for handoff; Kestrel for direct HTTP/HTTPS |
+| [`rust`](rust) | tokio-rustls | Axum through Hyper, with HTTP/1.1 and HTTP/2 |
+| [`dotnet`](dotnet) | Kestrel | ASP.NET Core middleware through Kestrel, with HTTP/1.1 and HTTP/2 |
+
+Each sample confines PHXP-specific code to authenticating the local control
+connection, receiving and validating the descriptor, and adapting that
+connected socket to its web server's transport abstraction. Direct and
+handed-off requests then use the same application pipeline.
 
 The examples load certificates from `${PHXP_CERT_DIR:-$HOME/.dns/production}`.
 Certificates and private keys stay outside the repository. Override

@@ -1,5 +1,7 @@
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
+using Microsoft.AspNetCore.Connections;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
 using PhxpHandoffServer;
 
 const string usage = """
@@ -66,11 +68,22 @@ builder.WebHost.ConfigureKestrel(kestrel =>
 {
     kestrel.ListenAnyIP(options.HttpPort);
     kestrel.ListenAnyIP(options.HttpsPort, listen => listen.UseHttps(certificate));
+    if (options.HandoffEnabled)
+    {
+        kestrel.Listen(new HandoffEndPoint(options.HandoffPath), listen =>
+        {
+            listen.Protocols = HttpProtocols.Http1AndHttp2;
+            listen.UseHttps(certificate);
+        });
+    }
 });
 builder.Services.AddSingleton(options);
 builder.Services.AddSingleton(certificate);
 if (options.HandoffEnabled)
 {
+    builder.Services.AddSingleton<HandoffTransportFactory>();
+    builder.Services.AddSingleton<IConnectionListenerFactory>(
+        services => services.GetRequiredService<HandoffTransportFactory>());
     builder.Services.AddHostedService<HandoffReceiver>();
 }
 
@@ -83,9 +96,19 @@ app.Run(async context =>
     var local = new IPEndPoint(
         context.Connection.LocalIpAddress ?? IPAddress.None,
         context.Connection.LocalPort);
-    var listener = context.Request.IsHttps ? "https" : "http";
+    var handoff = context.Features.Get<HandoffConnectionFeature>();
+    var listener = handoff is null
+        ? context.Request.IsHttps ? "https" : "http"
+        : "phxp-handoff-https";
     var body =
-        $"phxp .NET 10 handoff example\nlistener={listener}\npeer={peer}\nlocal={local}\n";
+        $"phxp .NET 10 handoff example\nlistener={listener}\npeer={peer}\nlocal={local}\n"
+        + $"request={context.Request.Method} {context.Request.PathBase}{context.Request.Path} {context.Request.Protocol}\n";
+    if (handoff is not null)
+    {
+        body +=
+            $"handoff_sni={handoff.RequestedSni}\n"
+            + $"peeked_length={handoff.PeekedLength}\n";
+    }
     context.Response.ContentType = "text/plain; charset=utf-8";
     await context.Response.WriteAsync(body);
 });

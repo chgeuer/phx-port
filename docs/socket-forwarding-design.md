@@ -6,10 +6,11 @@ The optional, cooperative Linux fast path is implemented through the
 handoff-only second-server architecture described below.
 
 The version 1 wire codec, endpoint derivation, same-UID capability handshake,
-Rust `SCM_RIGHTS` sender, Rustler receiver, and Thousand Island TLS transport
-are implemented. Minimal native Rust and .NET 10 receivers independently
-implement the same PHXP protocol and demonstrate that handoff is not tied to
-the BEAM. Two independently certificated Phoenix endpoints have completed
+Rust `SCM_RIGHTS` sender, and three framework transport adapters are
+implemented: Thousand Island/Bandit, Tokio/Axum, and Kestrel/ASP.NET Core.
+The latter two independently implement the same PHXP protocol and demonstrate
+that handoff is not tied to the BEAM. Two independently certificated Phoenix
+endpoints have completed
 HTTP/1.1, HTTP/2, and LiveView WebSocket upgrades through dynamic SNI routing
 over original port-443 sockets. Concurrent cross-site requests and an in-VM
 handoff listener restart also complete without relay traffic. The Rust and
@@ -60,9 +61,10 @@ original kernel TCP connection.
 
 The earlier socket-handoff proof of concept demonstrated descriptor transfer
 between BEAM processes. The implemented package now carries that mechanism
-through a production Bandit and Thousand Island connection lifecycle. The
-minimal Rust and .NET servers exercise the protocol directly without Bandit,
-showing the boundary a different runtime must implement.
+through a production Bandit and Thousand Island connection lifecycle. The Rust
+and .NET samples feed adopted sockets into Axum and Kestrel, respectively,
+showing that another runtime only needs a narrow accepted-socket transport
+adapter rather than a parallel HTTP implementation.
 
 ## Requirements
 
@@ -74,8 +76,8 @@ showing the boundary a different runtime must implement.
 3. A cooperating backend can both:
    - Accept ordinary TCP/TLS connections on its assigned phx-port HTTPS port.
    - Accept already-connected client sockets handed over by phx-port.
-4. Both ingress paths enter the ordinary Thousand Island connection lifecycle
-   and Bandit request pipeline.
+4. Both ingress paths enter the workload's ordinary web-server connection
+   lifecycle and application pipeline.
 5. The backend performs the TLS handshake and retains ownership of certificates
    and private keys.
 6. The backend sees the original client address through the socket's
@@ -106,8 +108,8 @@ showing the boundary a different runtime must implement.
 - Preserve the client's real TCP source address without terminating TLS in
   phx-port.
 - Remove phx-port from the connection data path after SNI routing.
-- Reuse Thousand Island's normal connection supervision, telemetry, TLS
-  handshake, and Bandit handler lifecycle.
+- Reuse each web server's normal connection supervision, TLS handshake, HTTP
+  implementation, and application lifecycle.
 - Keep the backend independently reachable through its assigned HTTPS port.
 - Confine BEAM-specific integration to a reusable Thousand Island transport.
 - Keep socket handoff optional so non-cooperating backends continue to work.
@@ -676,12 +678,13 @@ available.
 The repository currently contains three Linux receiver implementations:
 
 - Phoenix/Bandit through Rustler and a custom Thousand Island transport.
-- A standalone Rust HTTP/1.1 reference server using rustls.
-- A standalone .NET 10 HTTP/1.1 reference receiver using `Socket`,
-  `SafeSocketHandle`, and `SslStream`, alongside ordinary Kestrel listeners.
+- Rust through Tokio, tokio-rustls, Hyper, and a shared Axum router.
+- .NET 10 through a custom public Kestrel `IConnectionListenerFactory` and the
+  same ASP.NET Core middleware used by its ordinary listeners.
 
-The Rust and .NET servers are deliberately small protocol examples rather than
-production application-server integrations.
+All three keep certificate handling, ALPN, HTTP/1.1, HTTP/2, and request
+dispatch in the standard server stack. PHXP-specific code ends after
+descriptor validation and adaptation to the framework's connection transport.
 
 ## Performance expectations
 

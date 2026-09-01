@@ -14,10 +14,30 @@ internal static unsafe class LinuxNative
     private const int MsgTrunc = 0x20;
     private const int MsgCmsgCloexec = 0x40000000;
     private const int Eintr = 4;
+    private const int AtFileDescriptorCwd = -100;
+    private const int AtSymlinkNoFollow = 0x100;
+    private const uint StatxType = 0x0001;
+    private const ushort FileTypeMask = 0xF000;
+    private const ushort SocketFileType = 0xC000;
     private const int ControlBufferLength = 64;
     private static readonly nuint ControlHeaderLength = Align((nuint)sizeof(ControlMessageHeader));
 
     public static uint EffectiveUserId => geteuid();
+
+    public static bool IsSocket(string path)
+    {
+        if (statx(
+                AtFileDescriptorCwd,
+                path,
+                AtSymlinkNoFollow,
+                StatxType,
+                out var status) != 0)
+        {
+            throw Error("statx");
+        }
+
+        return (status.Mode & FileTypeMask) == SocketFileType;
+    }
 
     public static PeerCredentials GetPeerCredentials(int socket)
     {
@@ -214,6 +234,18 @@ internal static unsafe class LinuxNative
         public readonly uint GroupId;
     }
 
+    [StructLayout(LayoutKind.Sequential, Size = 256)]
+    private struct Statx
+    {
+        public uint Mask;
+        public uint BlockSize;
+        public ulong Attributes;
+        public uint HardLinks;
+        public uint UserId;
+        public uint GroupId;
+        public ushort Mode;
+    }
+
     [DllImport("libc", SetLastError = true)]
     private static extern nint recvmsg(int socket, MessageHeader* message, int flags);
 
@@ -235,6 +267,14 @@ internal static unsafe class LinuxNative
 
     [DllImport("libc")]
     private static extern uint geteuid();
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int statx(
+        int directory,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        int flags,
+        uint mask,
+        out Statx status);
 
     [DllImport("libc")]
     private static extern int close(int descriptor);

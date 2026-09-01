@@ -5,9 +5,14 @@ edition = "2024"
 publish = false
 
 [dependencies]
-nix = { version = "0.30", features = ["fs", "socket", "uio", "user"] }
-rustls = "0.23"
+axum           = { version = "0.8", features = ["http1", "http2", "tokio"] }
+hyper          = { version = "1" }
+hyper-util     = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
+nix            = { version = "0.30", features = ["fs", "socket", "uio", "user"] }
 rustls-pemfile = "2"
-sha2 = "0.10"
+sha2           = "0.10"
+tokio          = { version = "1", features = ["net", "rt-multi-thread", "sync", "macros", "time"] }
+tokio-rustls   = "0.26"
+tower          = { version = "0.5" }
 
 [workspace]
