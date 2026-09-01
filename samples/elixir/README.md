@@ -45,7 +45,10 @@ PORT=4100 HTTPS_PORT=4101 mix run --no-halt -- \
 
 `PHXP_PROJECT` and `PHXP_ROLE` (or `--project` and `--role`) override the
 handoff endpoint identity. The project defaults to the current directory and
-the role defaults to `https`.
+the role defaults to `https`. Linux derives the endpoint below
+`$XDG_RUNTIME_DIR/phx-port/handoff`; macOS uses
+`/tmp/phx-port-<euid>/handoff`. `PHX_PORT_RUNTIME_DIR` overrides the runtime
+root on either platform.
 
 Every response is `text/plain` and has this shape:
 

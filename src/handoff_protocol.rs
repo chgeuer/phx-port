@@ -80,23 +80,9 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, String> {
 }
 
 pub fn decode(packet: &[u8]) -> Result<Message, String> {
-    if packet.len() < HEADER_LENGTH {
-        return Err("handoff packet is shorter than its fixed header".to_string());
-    }
-    if packet.len() > MAX_PACKET_LENGTH {
-        return Err("handoff packet exceeds protocol limit".to_string());
-    }
-    if &packet[0..4] != MAGIC {
-        return Err("handoff packet has invalid magic".to_string());
-    }
-    if packet[4] != VERSION {
-        return Err(format!(
-            "unsupported handoff protocol version {}",
-            packet[4]
-        ));
-    }
-    if packet[6..8] != [0, 0] {
-        return Err("handoff packet uses unsupported flags".to_string());
+    let frame_length = frame_length_from_header(packet)?;
+    if packet.len() != frame_length {
+        return Err("handoff payload length does not match packet".to_string());
     }
 
     let connection_id = packet[8..24]
@@ -122,9 +108,6 @@ pub fn decode(packet: &[u8]) -> Result<Message, String> {
             .try_into()
             .map_err(|_| "handoff reason code is malformed".to_string())?,
     );
-    if packet.len() != HEADER_LENGTH + payload_length {
-        return Err("handoff payload length does not match packet".to_string());
-    }
 
     match packet[5] {
         TYPE_HELLO => {
@@ -179,6 +162,39 @@ pub fn decode(packet: &[u8]) -> Result<Message, String> {
     }
 }
 
+pub fn frame_length_from_header(header: &[u8]) -> Result<usize, String> {
+    if header.len() < HEADER_LENGTH {
+        return Err("handoff packet is shorter than its fixed header".to_string());
+    }
+    if &header[0..4] != MAGIC {
+        return Err("handoff packet has invalid magic".to_string());
+    }
+    if header[4] != VERSION {
+        return Err(format!(
+            "unsupported handoff protocol version {}",
+            header[4]
+        ));
+    }
+    if !matches!(
+        header[5],
+        TYPE_HELLO | TYPE_READY | TYPE_HANDOFF | TYPE_ADOPTED | TYPE_REJECTED
+    ) {
+        return Err(format!("unknown handoff message type {}", header[5]));
+    }
+    if header[6..8] != [0, 0] {
+        return Err("handoff packet uses unsupported flags".to_string());
+    }
+
+    let payload_length = usize::from(u16::from_be_bytes([header[36], header[37]]));
+    let frame_length = HEADER_LENGTH
+        .checked_add(payload_length)
+        .ok_or_else(|| "handoff payload length overflows frame size".to_string())?;
+    if frame_length > MAX_PACKET_LENGTH {
+        return Err("handoff packet exceeds protocol limit".to_string());
+    }
+    Ok(frame_length)
+}
+
 fn require_empty_envelope(
     payload_length: usize,
     connection_id: [u8; 16],
@@ -211,7 +227,10 @@ fn require_response_envelope(
 
 #[cfg(test)]
 mod tests {
-    use super::{Handoff, Message, decode, encode};
+    use super::{
+        HEADER_LENGTH, Handoff, MAX_PACKET_LENGTH, Message, decode, encode,
+        frame_length_from_header,
+    };
 
     #[test]
     fn messages_round_trip_through_fixed_envelope() {
@@ -265,5 +284,17 @@ mod tests {
         packet[5] = 5;
 
         assert!(decode(&packet).is_err());
+    }
+
+    #[test]
+    fn frame_length_is_checked_before_payload_allocation() {
+        let mut header = encode(&Message::Hello).unwrap();
+        header[36..38].copy_from_slice(
+            &u16::try_from(MAX_PACKET_LENGTH - HEADER_LENGTH + 1)
+                .unwrap()
+                .to_be_bytes(),
+        );
+
+        assert!(frame_length_from_header(&header).is_err());
     }
 }

@@ -15,4 +15,7 @@ tokio          = { version = "1", features = ["net", "rt-multi-thread", "sync", 
 tokio-rustls   = "0.26"
 tower          = { version = "0.5" }
 
+[dev-dependencies]
+tempfile = "3"
+
 [workspace]

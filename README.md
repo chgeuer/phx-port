@@ -160,11 +160,20 @@ SNI-only workloads and HTTPS servers using the compatibility `main` role
 continue to use lazy discovery. This avoids sending speculative TLS handshakes
 to ordinary clear-HTTP `main` listeners.
 
-On Linux, the daemon also checks the route's derived `SOCK_SEQPACKET` endpoint
+On Linux and macOS, the daemon also checks the route's derived PHXP endpoint
 for a version-compatible, same-user socket-handoff receiver. When present, it
 passes the untouched client descriptor with `SCM_RIGHTS`; otherwise it uses
-the ordinary relay. The repository includes a reusable Phoenix/Bandit
-integration and minimal Elixir, Rust, and .NET 10 reference servers:
+the ordinary relay:
+
+| Platform | Control transport | Peer authentication | Default endpoint root |
+|---|---|---|---|
+| Linux | `AF_UNIX/SOCK_SEQPACKET` | `SO_PEERCRED` | `$XDG_RUNTIME_DIR/phx-port/handoff` |
+| macOS | `AF_UNIX/SOCK_STREAM` with PHXP length framing | `getpeereid` | `/tmp/phx-port-<euid>/handoff` |
+
+Set `PHX_PORT_RUNTIME_DIR` to use an explicit runtime root on either platform;
+the endpoint is then `<runtime>/handoff/<hash>.sock`. The repository includes
+a reusable Phoenix/Bandit integration and minimal Elixir and Rust reference
+servers for Linux and macOS. The .NET 10 receiver remains Linux-only:
 
 - [`integrations/elixir/phx_port_handoff`](integrations/elixir/phx_port_handoff)
 - [`samples/elixir`](samples/elixir)
@@ -173,7 +182,9 @@ integration and minimal Elixir, Rust, and .NET 10 reference servers:
 
 The handoff design and protocol are described in
 [`docs/tls-proxy-design.md`](docs/tls-proxy-design.md) and
-[`docs/socket-forwarding-design.md`](docs/socket-forwarding-design.md).
+[`docs/socket-forwarding-design.md`](docs/socket-forwarding-design.md), with
+the Darwin transport profile in
+[`docs/macos-socket-handoff-design.md`](docs/macos-socket-handoff-design.md).
 
 ### Managing registrations
 

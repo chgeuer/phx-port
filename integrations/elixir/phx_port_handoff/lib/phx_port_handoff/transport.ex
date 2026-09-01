@@ -2,8 +2,8 @@ defmodule PhxPortHandoff.Transport do
   @moduledoc """
   Handoff-only TLS transport for Thousand Island.
 
-  `:handoff_path` identifies the `SOCK_SEQPACKET` endpoint. All remaining
-  transport options are passed to the server-side TLS handshake.
+  `:handoff_path` identifies the local PHXP endpoint. All remaining transport
+  options are passed to the server-side TLS handshake.
   """
 
   @behaviour ThousandIsland.Transport

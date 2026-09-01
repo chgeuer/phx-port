@@ -2,14 +2,15 @@
 
 ## Status
 
-The optional, cooperative Linux fast path is implemented through the
+The optional, cooperative Linux and macOS fast path is implemented through the
 handoff-only second-server architecture described below.
 
 The version 1 wire codec, endpoint derivation, same-UID capability handshake,
 Rust `SCM_RIGHTS` sender, and three framework transport adapters are
-implemented: Thousand Island/Bandit, Tokio/Axum, and Kestrel/ASP.NET Core.
-The latter two independently implement the same PHXP protocol and demonstrate
-that handoff is not tied to the BEAM. Two independently certificated Phoenix
+implemented: Thousand Island/Bandit and Tokio/Axum on Linux and macOS, plus
+Kestrel/ASP.NET Core on Linux. The latter two independently implement the same
+PHXP protocol and demonstrate that handoff is not tied to the BEAM. Two
+independently certificated Phoenix
 endpoints have completed
 HTTP/1.1, HTTP/2, and LiveView WebSocket upgrades through dynamic SNI routing
 over original port-443 sockets. Concurrent cross-site requests and an in-VM
@@ -17,8 +18,9 @@ handoff listener restart also complete without relay traffic. The Rust and
 .NET examples have each completed direct HTTP, direct trusted HTTPS, and
 daemon-driven TLS handoff with the original peer and local socket addresses.
 The daemon peeks without consuming the ClientHello, automatically attempts
-handoff at a derived `SOCK_SEQPACKET` endpoint, and falls back to its ordinary
-TLS relay only before a descriptor is delivered.
+handoff at a derived Unix-domain endpoint, and falls back to its ordinary TLS
+relay only before a descriptor is delivered. Linux retains `SOCK_SEQPACKET`;
+macOS uses `SOCK_STREAM` with bounded PHXP framing.
 
 Combining ordinary TCP and handed-off connections within one native accept
 broker remains future work. The current package runs an additional
@@ -322,9 +324,9 @@ listener.
 - A connected descriptor received from phx-port over the handoff listener.
 
 The future implementation would use a Rustler resource-backed native accept
-broker. A dedicated native worker would use Linux `epoll` to multiplex both
-listener sources without blocking normal BEAM schedulers and deliver accepted
-sockets to waiting Thousand Island acceptors. Elixir supervision would own the
+broker. A dedicated native worker would use Linux `epoll` or Darwin `kqueue`
+to multiplex both listener sources without blocking normal BEAM schedulers and
+deliver accepted sockets to waiting Thousand Island acceptors. Elixir supervision would own the
 broker lifecycle.
 
 Multiple Thousand Island acceptors may invoke `accept/1` concurrently. The
@@ -460,11 +462,17 @@ transport if sharing one connection limit and accept queue proves worthwhile.
 
 ## Handoff protocol
 
-The control protocol uses an `AF_UNIX` `SOCK_SEQPACKET` socket and is versioned
-from the first implementation. One bounded packet carries the fixed binary
-header and exactly one FD in `SCM_RIGHTS` ancillary data. Message boundaries
-therefore preserve the association between metadata and descriptor without
-stream framing.
+The PHXP v1 envelope is shared across two local transport profiles:
+
+| Platform | Control transport | Framing |
+|---|---|---|
+| Linux | `AF_UNIX/SOCK_SEQPACKET` | One kernel-preserved packet per PHXP message |
+| macOS | `AF_UNIX/SOCK_STREAM` | Fixed header plus checked payload length |
+
+The descriptor-bearing `HANDOFF` frame begins in one `sendmsg` call with
+exactly one FD in `SCM_RIGHTS`. On macOS, a positive partial `sendmsg` crosses
+the ownership boundary; remaining bytes are written without resending the
+ancillary data.
 
 The Rust daemon and Rustler NIF implement the protocol independently against
 the same written specification. The encoding uses network byte order, a
@@ -492,7 +500,7 @@ REJECTED(connection_id, reason_code)
 ```
 
 Version 1 uses a 40-byte fixed header followed by at most 253 bytes of UTF-8
-SNI. The complete `SOCK_SEQPACKET` packet is capped at 512 bytes:
+SNI. The complete PHXP frame is capped at 512 bytes:
 
 | Offset | Width | Field |
 |---:|---:|---|
@@ -537,22 +545,26 @@ The daemon derives the handoff socket path from a hash of the canonical project
 path and port role:
 
 ```text
-$XDG_RUNTIME_DIR/phx-port/handoff/<sha256(project-path NUL role)>.sock
+Linux: $XDG_RUNTIME_DIR/phx-port/handoff/<sha256(project-path NUL role)>.sock
+macOS: /tmp/phx-port-<euid>/handoff/<sha256(project-path NUL role)>.sock
 ```
+
+`PHX_PORT_RUNTIME_DIR` overrides the runtime root on both platforms, producing
+`<runtime>/handoff/<hash>.sock`.
 
 The fixed-length hash prevents collisions between repositories with the same
 basename, avoids exposing project names, and remains within Unix socket path
 limits. Before removing an existing path, the backend attempts to connect: a
 live receiver makes startup fail, while an unreachable entry is treated as
 stale and replaced. The broker monitors the BEAM listener process that created
-it; listener exit shuts down the Unix listener, wakes a blocked native accept,
-and removes the endpoint before a supervisor restart can bind its replacement.
+it; listener exit stops the nonblocking accept loop and removes the endpoint
+before a supervisor restart can bind its replacement.
 
 When a `main` or `https` TLS workload becomes active, the daemon attempts a
 version handshake at the derived path. Connection refusal or a missing path
 means that handoff is unavailable and relay remains the compatibility path.
-The daemon verifies the endpoint's `SO_PEERCRED` UID before sending a client
-descriptor.
+The daemon verifies the endpoint's effective UID with `SO_PEERCRED` on Linux
+or `getpeereid` on macOS before sending a client descriptor.
 
 Ordinary TLS probing on the assigned backend port remains authoritative for
 route and certificate discovery. The handoff socket advertises only an
@@ -645,10 +657,10 @@ connections. It therefore requires stronger protection than an ordinary local
 health endpoint.
 
 - Place Unix sockets in a user-owned runtime directory such as
-  `$XDG_RUNTIME_DIR/phx-port/`.
+  `$XDG_RUNTIME_DIR/phx-port/` on Linux or `/tmp/phx-port-<euid>/` on macOS.
 - Use restrictive directory and socket permissions.
 - Verify peer credentials with `SO_PEERCRED` or the platform equivalent.
-- Require the daemon and backend to have the same UID.
+- Require the daemon and backend to have the same effective UID.
 - Use unpredictable or project-bound socket names.
 - Treat a missing or unreachable receiver endpoint as unavailable capability.
 - Permit only one descriptor per handoff request.
@@ -663,23 +675,25 @@ outside the initial threat model.
 
 ## Portability
 
-`SCM_RIGHTS` is Unix-specific. The implementation targets Linux,
-matching the existing socket-handoff proof of concept.
+`SCM_RIGHTS` is Unix-specific. The implementation explicitly targets Linux and
+macOS rather than enabling every Unix target without platform tests.
 
 The capability must be detected at build time and runtime:
 
-- Linux with a compatible backend adapter: socket handoff.
+- Linux or macOS with a compatible backend adapter: socket handoff.
 - Other Unix platforms: future support after explicit testing.
 - Windows or unsupported runtimes: generic TCP relay.
 
 The public TLS routing behavior must not depend on socket handoff being
 available.
 
-The repository currently contains three Linux receiver implementations:
+The repository currently contains two Linux/macOS receiver implementations and
+one Linux-only receiver:
 
 - Phoenix/Bandit through Rustler and a custom Thousand Island transport.
 - Rust through Tokio, tokio-rustls, Hyper, and a shared Axum router.
-- .NET 10 through a custom public Kestrel `IConnectionListenerFactory` and the
+- Linux-only .NET 10 through a custom public Kestrel
+  `IConnectionListenerFactory` and the
   same ASP.NET Core middleware used by its ordinary listeners.
 
 All three keep certificate handling, ALPN, HTTP/1.1, HTTP/2, and request
@@ -766,7 +780,10 @@ end in Phoenix. The standalone Rust and .NET 10 receivers have also been built
 and exercised through certificate discovery and real daemon handoff using the
 Alpha and Beta fixture certificates. Certificate rotation under load,
 sustained descriptor-leak testing, and comparative performance benchmarks
-remain outstanding.
+remain outstanding. On macOS arm64, the daemon transport has transferred an
+untouched TCP descriptor with explicit close-on-exec checks, while the Bandit
+and Axum receivers have each completed handed-off TLS requests over HTTP/1.1
+and HTTP/2 with original peer and local addresses.
 
 ## Delivery status
 
@@ -778,17 +795,20 @@ remain outstanding.
 6. [x] Prove LiveView WebSocket upgrade, concurrent cross-site traffic, and
    in-VM listener restart.
 7. [x] Prove PHXP interoperability with standalone Rust and .NET 10 receivers.
-8. [ ] Replace serialized blocking accepts with a supervised native worker and
+8. [x] Port the daemon, Phoenix/Bandit receiver, and Rust sample to macOS.
+9. [ ] Replace serialized blocking accepts with a supervised native worker and
    queue if benchmarks show it is needed.
-9. [ ] Evaluate combining ordinary TCP and handoff acceptance in one hybrid
+10. [ ] Evaluate combining ordinary TCP and handoff acceptance in one hybrid
    transport.
-10. [ ] Benchmark and harden before presenting handoff as a general production
+11. [ ] Benchmark and harden before presenting handoff as a general production
    default.
 
 ## Resolved implementation choices
 
-- Use `SOCK_SEQPACKET`.
-- Carry the fixed binary header and one FD in a single packet.
+- Use `SOCK_SEQPACKET` on Linux and framed `SOCK_STREAM` on macOS.
+- Begin the fixed binary frame and one FD in a single descriptor-bearing
+  `sendmsg`; never resend ancillary data when completing a partial stream
+  write.
 - Implement the wire encoding independently in the daemon and NIF against one
   written specification.
 - Use a Rustler resource-backed native accept broker supervised from Elixir.
@@ -819,7 +839,8 @@ handling, so the verified integration remains pinned to Rustler 0.36.2.
 
 ## Decision summary
 
-Connected-socket forwarding is feasible for cooperating Linux backends.
+Connected-socket forwarding is feasible for cooperating Linux and macOS
+backends.
 phx-port can inspect SNI with `MSG_PEEK`, transfer the untouched client socket
 through `SCM_RIGHTS`, and leave the backend talking directly to the original
 client connection.

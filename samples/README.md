@@ -6,11 +6,11 @@ These intentionally small servers expose three ingress paths:
 2. Ordinary HTTPS on its stable `https` port.
 3. Original port-443 sockets received from `phx-port` over PHXP.
 
-| Sample | TLS implementation | HTTP implementation |
-|---|---|---|
-| [`elixir`](elixir) | Erlang/OTP SSL through `PhxPortHandoff` | Bandit and a minimal Plug |
-| [`rust`](rust) | tokio-rustls | Axum through Hyper, with HTTP/1.1 and HTTP/2 |
-| [`dotnet`](dotnet) | Kestrel | ASP.NET Core middleware through Kestrel, with HTTP/1.1 and HTTP/2 |
+| Sample | Platforms | TLS implementation | HTTP implementation |
+|---|---|---|---|
+| [`elixir`](elixir) | Linux, macOS | Erlang/OTP SSL through `PhxPortHandoff` | Bandit and a minimal Plug |
+| [`rust`](rust) | Linux, macOS | tokio-rustls | Axum through Hyper, with HTTP/1.1 and HTTP/2 |
+| [`dotnet`](dotnet) | Linux | Kestrel | ASP.NET Core middleware through Kestrel, with HTTP/1.1 and HTTP/2 |
 
 Each sample confines PHXP-specific code to authenticating the local control
 connection, receiving and validating the descriptor, and adapting that

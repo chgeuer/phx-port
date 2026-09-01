@@ -1,6 +1,6 @@
 defmodule PhxPortHandoff do
   @moduledoc """
-  Linux connected-socket handoff support for phx-port.
+  Linux and macOS connected-socket handoff support for phx-port.
   """
 
   alias PhxPortHandoff.Native
@@ -10,12 +10,10 @@ defmodule PhxPortHandoff do
 
   @spec endpoint_path(Path.t(), String.t()) :: Path.t()
   def endpoint_path(project, role) do
-    runtime = System.fetch_env!("XDG_RUNTIME_DIR")
-
     hash =
       :crypto.hash(:sha256, [Path.expand(project), <<0>>, role]) |> Base.encode16(case: :lower)
 
-    Path.join([runtime, "phx-port", "handoff", hash <> ".sock"])
+    Path.join(runtime_handoff_directory(), hash <> ".sock")
   end
 
   @spec listen(Path.t(), String.t()) :: {:ok, broker()} | {:error, term()}
@@ -61,8 +59,36 @@ defmodule PhxPortHandoff do
 
     with {:ok, receipt, fd, sni, peeked_length} <-
            :global.trans(lock, fn -> Native.accept(broker) end),
+         {:ok, ^fd} <- Native.take_fd(receipt),
          {:ok, socket} <- fdopen(receipt, fd) do
       {:ok, socket, receipt, %{sni: sni, peeked_length: peeked_length}}
+    end
+  end
+
+  defp runtime_handoff_directory do
+    case nonempty_env("PHX_PORT_RUNTIME_DIR") do
+      nil ->
+        case :os.type() do
+          {:unix, :linux} ->
+            Path.join([System.fetch_env!("XDG_RUNTIME_DIR"), "phx-port", "handoff"])
+
+          {:unix, :darwin} ->
+            Path.join(["/tmp", "phx-port-#{Native.effective_uid()}", "handoff"])
+
+          platform ->
+            raise "socket handoff is unavailable on #{inspect(platform)}"
+        end
+
+      runtime ->
+        Path.join(runtime, "handoff")
+    end
+  end
+
+  defp nonempty_env(name) do
+    case System.get_env(name) do
+      nil -> nil
+      "" -> nil
+      value -> value
     end
   end
 

@@ -11,8 +11,10 @@ env:
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
     - uses: actions/checkout@v4
@@ -20,3 +22,7 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+    - name: Test Rust handoff sample
+      run: cargo test --manifest-path samples/rust/Cargo.toml --verbose
+    - name: Test Rustler handoff broker
+      run: cargo test --manifest-path integrations/elixir/phx_port_handoff/native/phx_port_handoff_native/Cargo.toml --verbose

@@ -1,10 +1,10 @@
 # PHXP Rust handoff server
 
-This Linux-only standalone example runs three listeners:
+This Linux and macOS standalone example runs three listeners:
 
 - ordinary HTTP,
 - ordinary HTTPS,
-- the repository's PHXP v1 `AF_UNIX` `SOCK_SEQPACKET` endpoint.
+- the repository's PHXP v1 Unix-domain endpoint.
 
 The PHXP listener performs the `HELLO`/`READY` handshake, receives exactly one
 connected TCP descriptor with `SCM_RIGHTS`, acknowledges adoption, performs
@@ -89,17 +89,22 @@ All settings have CLI and environment forms:
 | `--role NAME` | `PHXP_ROLE` | `https` |
 | `--handoff-socket PATH` | `PHXP_HANDOFF_SOCKET` | PHXP-derived path |
 
-`XDG_RUNTIME_DIR` is required unless the handoff socket is overridden.
+The derived endpoint is
+`$XDG_RUNTIME_DIR/phx-port/handoff/<hash>.sock` on Linux and
+`/tmp/phx-port-<euid>/handoff/<hash>.sock` on macOS. Set
+`PHX_PORT_RUNTIME_DIR` to use `<runtime>/handoff/<hash>.sock`, or use
+`--handoff-socket` for a complete path override.
 
 ## Scope and limitations
 
-- Linux only; the handoff transport depends on `SCM_RIGHTS` and
-  `SO_PEERCRED`.
+- Linux uses `SOCK_SEQPACKET`, `SO_PEERCRED`, and atomic close-on-exec flags.
+  macOS uses `SOCK_STREAM`, `getpeereid`, bounded frame assembly, and explicit
+  `FD_CLOEXEC`.
 - Axum and Hyper handle HTTP/1.1, HTTP/2, keep-alive, upgrades, request bodies,
   and response framing on all three ingress paths.
 - One configured certificate chain/private key is used for both ordinary and
   handed-off TLS. There is no multi-certificate SNI resolver or client auth.
-- The PHXP `SOCK_SEQPACKET` control protocol uses blocking worker threads;
-  adopted TCP connections run as Tokio tasks.
+- The PHXP control protocol uses blocking worker threads; adopted TCP
+  connections run as Tokio tasks.
 - The sample hostname and certificate directory are configurable through the
   root `justfile`.

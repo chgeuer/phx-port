@@ -2,7 +2,10 @@
 
 ## Status
 
-Proposed.
+Implemented for the daemon sender, Phoenix/Bandit integration, and Rust sample.
+The Darwin descriptor path has been exercised on macOS arm64 with real Unix
+and TCP sockets plus end-to-end TLS requests over HTTP/1.1 and HTTP/2. The
+.NET receiver and `launchd` service installation remain follow-up work.
 
 This document specifies the macOS port of the optional PHXP connected-socket
 handoff path. It is intended to be implementation-ready on a macOS development
@@ -942,4 +945,3 @@ alone.
   <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/getpeereid.3.html>
 - Erlang `gen_tcp`:
   <https://www.erlang.org/doc/apps/kernel/gen_tcp.html>
-

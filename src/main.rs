@@ -16,6 +16,8 @@ mod config_tests;
 mod discover_tests;
 mod handoff;
 mod handoff_protocol;
+#[cfg(any(target_os = "macos", test))]
+mod handoff_stream;
 mod proxy;
 mod route_cache;
 mod systemd_service;

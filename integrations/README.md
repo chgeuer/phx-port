@@ -1,16 +1,17 @@
 # Socket handoff integrations
 
-`phx-port` can pass an accepted Linux TCP socket to a cooperating workload over
-the PHXP v1 `AF_UNIX` `SOCK_SEQPACKET` protocol. The daemon sends the descriptor
-with `SCM_RIGHTS`; the workload keeps ownership of TLS and serves the client on
-the original connection.
+`phx-port` can pass an accepted Linux or macOS TCP socket to a cooperating
+workload over PHXP v1. Linux uses `AF_UNIX/SOCK_SEQPACKET`; macOS uses
+`AF_UNIX/SOCK_STREAM` with bounded PHXP frame assembly. The daemon sends the
+descriptor with `SCM_RIGHTS`; the workload keeps ownership of TLS and serves
+the client on the original connection.
 
-| Integration | Purpose | Handed-off protocol surface |
+| Integration | Platforms | Handed-off protocol surface |
 |---|---|---|
-| [`elixir/phx_port_handoff`](elixir/phx_port_handoff) | Reusable Phoenix/Bandit integration | HTTP/1.1, HTTP/2, WebSocket, and the normal Plug pipeline |
-| [`../samples/elixir`](../samples/elixir) | Minimal Elixir/Bandit example | Plug over ordinary and handed-off Bandit listeners |
-| [`../samples/rust`](../samples/rust) | Rust interoperability example | Tokio/tokio-rustls transport feeding one Axum router through Hyper |
-| [`../samples/dotnet`](../samples/dotnet) | .NET 10 interoperability example | Custom connection listener feeding direct and handed-off sockets through Kestrel |
+| [`elixir/phx_port_handoff`](elixir/phx_port_handoff) | Linux, macOS | HTTP/1.1, HTTP/2, WebSocket, and the normal Plug pipeline |
+| [`../samples/elixir`](../samples/elixir) | Linux, macOS | Plug over ordinary and handed-off Bandit listeners |
+| [`../samples/rust`](../samples/rust) | Linux, macOS | Tokio/tokio-rustls transport feeding one Axum router through Hyper |
+| [`../samples/dotnet`](../samples/dotnet) | Linux | Custom connection listener feeding direct and handed-off sockets through Kestrel |
 
 All receivers:
 

@@ -1,10 +1,13 @@
-#[cfg(not(target_os = "linux"))]
-compile_error!("the PHXP socket-handoff example requires Linux");
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("the PHXP socket-handoff example requires Linux or macOS");
 
 mod handoff;
 
 #[path = "../../../src/handoff_protocol.rs"]
 mod handoff_protocol;
+#[cfg(any(target_os = "macos", test))]
+#[path = "../../../src/handoff_stream.rs"]
+mod handoff_stream;
 
 use std::env;
 use std::error::Error;
@@ -416,7 +419,7 @@ fn env_value(name: &str) -> Option<String> {
 
 fn print_help() {
     println!(
-        "PHXP Rust handoff server (Linux only)\n\n\
+        "PHXP Rust handoff server (Linux and macOS)\n\n\
          Usage: phxp-handoff-server [OPTIONS]\n\n\
          Options:\n\
            --http ADDR             HTTP listener [env PHXP_HTTP_ADDR, default 127.0.0.1:8080]\n\
