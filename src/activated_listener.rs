@@ -608,8 +608,11 @@ fn set_close_on_exec(fd: RawFd) -> Result<(), String> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{ExpectedListener, acquire, listener_address_matches, validate_systemd_listener};
+    use super::{
+        ExpectedListener, bind_listener, listener_address_matches, validate_systemd_listener,
+    };
     use socket2::{Domain, Protocol, Socket, Type};
+    use std::io::ErrorKind;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener};
     use std::os::fd::{FromRawFd, IntoRawFd};
     use std::os::unix::net::UnixListener;
@@ -676,15 +679,19 @@ mod tests {
 
     #[test]
     fn direct_ipv6_listener_is_v6_only_so_ipv4_can_share_its_port() {
-        let Ok(mut ipv6) = acquire(&["[::]:0".to_string()]) else {
-            return;
-        };
-        let ipv6 = ipv6.pop().unwrap().listener;
-        let port = ipv6.local_addr().unwrap().port();
-        let mut ipv4 = acquire(&[format!("0.0.0.0:{port}")]).unwrap();
-        let ipv4 = ipv4.pop().unwrap().listener;
-
-        assert!(ipv6.local_addr().unwrap().is_ipv6());
-        assert!(ipv4.local_addr().unwrap().is_ipv4());
+        for _ in 0..32 {
+            let ipv6 = bind_listener("[::]:0".parse().unwrap()).unwrap();
+            let port = ipv6.local_addr().unwrap().port();
+            match bind_listener(format!("0.0.0.0:{port}").parse().unwrap()) {
+                Ok(ipv4) => {
+                    assert!(ipv6.local_addr().unwrap().is_ipv6());
+                    assert!(ipv4.local_addr().unwrap().is_ipv4());
+                    return;
+                }
+                Err(error) if error.kind() == ErrorKind::AddrInUse => continue,
+                Err(error) => panic!("cannot bind matching IPv4 listener: {error}"),
+            }
+        }
+        panic!("could not reserve one dual-stack test port after 32 attempts");
     }
 }

@@ -21,6 +21,7 @@ mod ingress_config;
 mod ingress_limits;
 mod observability;
 mod port_registry;
+mod preflight;
 mod privilege;
 mod production_paths;
 mod proxy;
@@ -64,6 +65,8 @@ USAGE:
                                 Validate public intent, state, and runtime paths
     phx-port proxy config migrate --from FILE --output DIRECTORY
                                 Split a combined registry without modifying it
+    phx-port proxy preflight --file PATH [--listen ADDRESS]... [CAPACITY OPTIONS]
+                                Verify a public host without accepting traffic
     phx-port proxy install-service
                                 Install and start the systemd user service
     phx-port proxy uninstall-service
@@ -1091,6 +1094,17 @@ fn main() {
                     process::exit(1);
                 }
             },
+            Some("preflight") => {
+                let config = preflight::parse(&args[2..]).unwrap_or_else(|error| {
+                    eprintln!("Error: {error}");
+                    eprintln!("{}", preflight::USAGE);
+                    process::exit(1);
+                });
+                if let Err(error) = preflight::run(config) {
+                    eprintln!("Error: {error}");
+                    process::exit(1);
+                }
+            }
             Some("config")
                 if args.get(2).map(String::as_str) == Some("check")
                     && args.get(3).map(String::as_str) == Some("--file")
@@ -1156,7 +1170,7 @@ fn main() {
             },
             _ => {
                 eprintln!(
-                    "Usage: phx-port proxy <status|check|routes|reload|stop|config|install-service|uninstall-service>"
+                    "Usage: phx-port proxy <status|check|routes|reload|stop|config|preflight|install-service|uninstall-service>"
                 );
                 process::exit(1);
             }

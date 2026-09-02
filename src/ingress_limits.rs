@@ -346,10 +346,7 @@ pub struct SystemCapacity {
 }
 
 impl SystemCapacity {
-    fn detect(
-        configured_task_budget: Option<usize>,
-        minimum_file_descriptor_limit: u64,
-    ) -> Result<Self, String> {
+    fn detected_tasks(configured_task_budget: Option<usize>) -> Result<Option<u64>, String> {
         let configured_task_budget = configured_task_budget
             .map(|value| {
                 u64::try_from(value)
@@ -357,14 +354,26 @@ impl SystemCapacity {
             })
             .transpose()?;
         let system_task_budget = detect_system_task_budget()?;
-        let tasks = match (configured_task_budget, system_task_budget) {
+        Ok(match (configured_task_budget, system_task_budget) {
             (Some(configured), Some(system)) => Some(configured.min(system)),
             (configured, system) => configured.or(system),
-        };
+        })
+    }
 
+    fn detect(
+        configured_task_budget: Option<usize>,
+        minimum_file_descriptor_limit: u64,
+    ) -> Result<Self, String> {
         Ok(Self {
             file_descriptors: detect_file_descriptor_limit(minimum_file_descriptor_limit)?,
-            tasks,
+            tasks: Self::detected_tasks(configured_task_budget)?,
+        })
+    }
+
+    fn inspect(configured_task_budget: Option<usize>) -> Result<Self, String> {
+        Ok(Self {
+            file_descriptors: current_file_descriptor_limit()?,
+            tasks: Self::detected_tasks(configured_task_budget)?,
         })
     }
 }
@@ -373,6 +382,33 @@ impl SystemCapacity {
 struct ResourceDemand {
     file_descriptors: usize,
     tasks: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapacityPreflight {
+    required_file_descriptors: u64,
+    minimum_file_descriptor_limit: u64,
+    effective_file_descriptor_limit: Option<u64>,
+    required_tasks: u64,
+    effective_task_budget: Option<u64>,
+}
+
+impl CapacityPreflight {
+    pub fn summary(self) -> String {
+        let file_descriptor_limit = self.effective_file_descriptor_limit.map_or_else(
+            || "unlimited or unavailable".to_string(),
+            |value| value.to_string(),
+        );
+        let task_budget = self
+            .effective_task_budget
+            .map_or_else(|| "unreported".to_string(), |value| value.to_string());
+        format!(
+            "requires {} file descriptors with RLIMIT_NOFILE >= {} for the 30% reserve \
+             (effective {file_descriptor_limit}); requires up to {} tasks \
+             (configured/systemd budget {task_budget})",
+            self.required_file_descriptors, self.minimum_file_descriptor_limit, self.required_tasks,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -435,6 +471,33 @@ impl IngressLimits {
             minimum_limit_with_reserve(required_file_descriptors, FILE_DESCRIPTOR_RESERVE_PERCENT)?;
         let system = SystemCapacity::detect(configured_task_budget, minimum_file_descriptor_limit)?;
         self.validate_system_capacity(system, demand)
+    }
+
+    pub fn validate_for_preflight(
+        self,
+        configured_task_budget: Option<usize>,
+        listener_count: usize,
+        metrics_enabled: bool,
+    ) -> Result<CapacityPreflight, String> {
+        if configured_task_budget == Some(0) {
+            return Err("task_budget must be greater than zero".to_string());
+        }
+        let demand = self.resource_demand(listener_count, metrics_enabled)?;
+        let required_file_descriptors = u64::try_from(demand.file_descriptors)
+            .map_err(|_| "file descriptor demand does not fit u64".to_string())?;
+        let minimum_file_descriptor_limit =
+            minimum_limit_with_reserve(required_file_descriptors, FILE_DESCRIPTOR_RESERVE_PERCENT)?;
+        let required_tasks =
+            u64::try_from(demand.tasks).map_err(|_| "task demand does not fit u64".to_string())?;
+        let system = SystemCapacity::inspect(configured_task_budget)?;
+        self.validate_system_capacity(system, demand)?;
+        Ok(CapacityPreflight {
+            required_file_descriptors,
+            minimum_file_descriptor_limit,
+            effective_file_descriptor_limit: system.file_descriptors,
+            required_tasks,
+            effective_task_budget: system.tasks,
+        })
     }
 
     #[cfg(test)]
@@ -686,6 +749,18 @@ fn minimum_limit_with_reserve(required: u64, reserve_percent: u64) -> Result<u64
     whole
         .checked_add(remainder)
         .ok_or_else(|| "RLIMIT_NOFILE requirement overflowed".to_string())
+}
+
+#[cfg(unix)]
+fn current_file_descriptor_limit() -> Result<Option<u64>, String> {
+    let (soft, _) = getrlimit(Resource::RLIMIT_NOFILE)
+        .map_err(|error| format!("cannot read RLIMIT_NOFILE: {error}"))?;
+    Ok((soft != RLIM_INFINITY).then_some(soft))
+}
+
+#[cfg(not(unix))]
+fn current_file_descriptor_limit() -> Result<Option<u64>, String> {
+    Ok(None)
 }
 
 #[cfg(unix)]

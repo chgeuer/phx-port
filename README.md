@@ -287,6 +287,33 @@ phx-port proxy config migrate \
   --output /var/lib/phx-port/migrated
 ```
 
+Before opening a public firewall or publishing DNS, run the non-serving host
+preflight as the production service identity. Pass the exact listener and
+capacity arguments used by the daemon:
+
+```bash
+# Execute this as the service identity inside the systemd/launchd job so the
+# named listener descriptors and sandbox are present.
+phx-port proxy preflight \
+  --file /etc/phx-port/ingress.toml \
+  --listen 0.0.0.0:443 --listen '[::]:443'
+```
+
+Preflight validates the explicit public config, rootless identity, secure
+state/runtime paths, bounded sandbox writes, local control group, current
+`RLIMIT_NOFILE` and task budget, named or direct listener acquisition, every
+declared Workload/role registration, and exact-hostname system-trust TLS for
+each loopback Workload. It acquires and immediately releases listeners without
+calling `accept`; it never starts the control socket or data plane. Required
+route failures and host misconfiguration produce a nonzero status. Optional
+route failures are warnings. Production is never inferred: `--file` or
+`PHX_PORT_INGRESS_CONFIG` is mandatory.
+
+Run preflight inside the systemd or launchd job when proving activated
+listeners and the service sandbox rather than direct binding. See the
+[host preflight runbook](docs/public-hosting-preflight-runbook.md) and
+[backup, recovery, and restart runbook](docs/public-hosting-recovery-runbook.md).
+
 Migration publishes `ports.toml` and `routes.toml` together by atomic directory
 rename, refuses an existing output path, and never changes the source file.
 The retained source is the permission-preserving rollback snapshot. The split
@@ -554,7 +581,10 @@ The plist's `tls-ipv4` and `tls-ipv6` sockets own port 443. The non-root daemon
 retrieves them by name with `launch_activate_socket()`, requires exactly one
 listening TCP descriptor on each configured address, and sets both
 nonblocking and close-on-exec without rebinding. Adjust the account and paths
-in the plist only together with the provisioned ownership. Remove it with
+in the plist only together with the provisioned ownership. Its explicit
+`--task-budget 1024` bounds the same runtime, probe, route-selection, and PHXP
+worker demand checked during preflight; lower it only with matching capacity
+arguments and executable evidence. Remove it with
 `sudo launchctl bootout system/dev.phx-port.ingress` before deleting the
 plist. The ignored `real_launchd_job_adopts_named_socket_and_runs_as_owner`
 test exercises the same API in a disposable user launchd domain without

@@ -4895,6 +4895,19 @@ fn probe_backend(
     )
 }
 
+pub(crate) fn verify_declared_route_certificate(
+    hostname: &str,
+    port: u16,
+    connector: &TlsConnector,
+) -> Result<(), String> {
+    let backend = Backend {
+        project: "preflight".to_string(),
+        role: "preflight".to_string(),
+        port,
+    };
+    probe_backend(hostname, &backend, Some(connector)).map(|_| ())
+}
+
 fn probe_backend_until(
     hostname: &str,
     backend: &Backend,

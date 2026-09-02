@@ -16,6 +16,8 @@
     <string>0.0.0.0:443</string>
     <string>--listen</string>
     <string>[::]:443</string>
+    <string>--task-budget</string>
+    <string>1024</string>
   </array>
 
   <key>EnvironmentVariables</key>

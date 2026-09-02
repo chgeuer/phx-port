@@ -3,7 +3,7 @@ use std::env;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::DocumentMut;
@@ -13,7 +13,7 @@ use std::os::fd::AsRawFd;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 
 const DEFAULT_PORT_REGISTRY: &str = "/var/lib/phx-port/ports.toml";
 const DEFAULT_RUNTIME_ROOT: &str = "/run/phx-port";
@@ -81,6 +81,17 @@ impl ProductionPaths {
 
     pub fn prepare_for_startup(&self) -> Result<(), String> {
         self.validate_paths(true)
+    }
+
+    pub fn validate_sandbox_access(&self) -> Result<(), String> {
+        let state_directory = self
+            .port_registry
+            .parent()
+            .expect("resolved production registry has a parent");
+        validate_owned_directory(state_directory, "production state directory", &[0o700])?;
+        validate_runtime_root(&self.runtime_root)?;
+        probe_directory_write(state_directory, "production state directory")?;
+        probe_directory_write(&self.runtime_root, "production runtime root")
     }
 
     fn validate_paths(&self, repair_derived_state: bool) -> Result<(), String> {
@@ -154,6 +165,91 @@ impl ProductionPaths {
         }
         Ok((directory, control_gid))
     }
+
+    #[cfg(unix)]
+    pub fn validate_preflight_control(&self, require_named_group: bool) -> Result<u32, String> {
+        let expected_gid = if require_named_group {
+            self.validate_control_group()?
+        } else {
+            self.control_group()?
+        };
+        let (_, prepared_gid) = self.ensure_control_directory()?;
+        if prepared_gid != expected_gid {
+            return Err(format!(
+                "production control directory uses GID {prepared_gid}, expected {expected_gid}"
+            ));
+        }
+
+        let socket = self.control_socket();
+        match fs::symlink_metadata(&socket) {
+            Ok(metadata)
+                if metadata.file_type().is_socket()
+                    && metadata.uid() == nix::unistd::geteuid().as_raw()
+                    && metadata.gid() == expected_gid
+                    && metadata.mode() & 0o7777 == 0o660 => {}
+            Ok(_) => {
+                return Err(format!(
+                    "existing production control socket {} has unsafe type, ownership, or mode",
+                    socket.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect production control socket {}: {error}",
+                    socket.display()
+                ));
+            }
+        }
+        Ok(expected_gid)
+    }
+
+    #[cfg(not(unix))]
+    pub fn validate_preflight_control(&self, _require_named_group: bool) -> Result<u32, String> {
+        Err("production control authorization requires Unix peer credentials".to_string())
+    }
+}
+
+#[cfg(unix)]
+fn probe_directory_write(path: &Path, description: &str) -> Result<(), String> {
+    let probe = path.join(format!(".phx-port-preflight-{}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    let mut file = options.open(&probe).map_err(|error| {
+        format!(
+            "cannot create a preflight write probe in {description} {}: {error}",
+            path.display()
+        )
+    })?;
+    let write_result = file.write_all(b"phx-port preflight");
+    drop(file);
+    let cleanup_result = fs::remove_file(&probe);
+    match (write_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(format!(
+            "cannot write a preflight probe in {description} {}: {error}",
+            path.display()
+        )),
+        (Ok(()), Err(error)) => Err(format!(
+            "cannot remove preflight write probe {}: {error}",
+            probe.display()
+        )),
+        (Err(write_error), Err(cleanup_error)) => Err(format!(
+            "cannot write a preflight probe in {description} {}: {write_error}; \
+             cannot remove {}: {cleanup_error}",
+            path.display(),
+            probe.display()
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+fn probe_directory_write(_path: &Path, _description: &str) -> Result<(), String> {
+    Err("the public Hosting Profile requires Unix sandbox path checks".to_string())
 }
 
 #[cfg(unix)]
