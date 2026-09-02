@@ -739,7 +739,15 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir_in};
+
+    fn tempdir() -> std::io::Result<TempDir> {
+        #[cfg(unix)]
+        let root = Path::new("/tmp").canonicalize()?;
+        #[cfg(not(unix))]
+        let root = std::env::temp_dir().canonicalize()?;
+        tempdir_in(root)
+    }
 
     #[cfg(unix)]
     #[test]

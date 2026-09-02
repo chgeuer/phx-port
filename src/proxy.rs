@@ -2635,8 +2635,16 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime};
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir_in};
     use toml_edit::value;
+
+    fn tempdir() -> io::Result<TempDir> {
+        #[cfg(unix)]
+        let root = Path::new("/tmp").canonicalize()?;
+        #[cfg(not(unix))]
+        let root = std::env::temp_dir().canonicalize()?;
+        tempdir_in(root)
+    }
 
     fn backend() -> Backend {
         Backend {

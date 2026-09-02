@@ -360,8 +360,17 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use tempfile::tempdir;
+    use std::path::Path;
+    use tempfile::{TempDir, tempdir_in};
     use toml_edit::value;
+
+    fn tempdir() -> std::io::Result<TempDir> {
+        #[cfg(unix)]
+        let root = Path::new("/tmp").canonicalize()?;
+        #[cfg(not(unix))]
+        let root = std::env::temp_dir().canonicalize()?;
+        tempdir_in(root)
+    }
 
     #[test]
     fn persists_and_loads_a_discovered_route_without_changing_ports() {
