@@ -30,10 +30,16 @@ mod unix {
     use std::io::{ErrorKind, Read, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
     use std::os::unix::net::UnixStream;
+    use std::path::Path;
     use std::process::{Child, Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
-    use tempfile::TempDir;
+    use tempfile::{TempDir, tempdir_in};
+
+    fn tempdir() -> std::io::Result<TempDir> {
+        let root = Path::new("/tmp").canonicalize()?;
+        tempdir_in(root)
+    }
 
     struct Daemon {
         child: Option<Child>,
@@ -50,7 +56,7 @@ mod unix {
             active_connections: usize,
             pre_routing_connections: usize,
         ) -> Self {
-            let home = tempfile::tempdir().unwrap();
+            let home = tempdir().unwrap();
             let child = Command::new(env!("CARGO_BIN_EXE_phx-port"))
                 .args([
                     "daemon".to_string(),
