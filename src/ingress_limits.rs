@@ -1,5 +1,7 @@
+use crate::ingress_config::HostingProfile;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -8,10 +10,10 @@ use nix::sys::resource::{RLIM_INFINITY, Resource, getrlimit, rlim_t, setrlimit};
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 pub const DAEMON_USAGE: &str = "\
-Usage: phx-port daemon [--listen ADDRESS]...
+Usage: phx-port daemon [--listen ADDRESS]... [--ingress-config PATH]
        [--active-connections N] [--pre-routing-connections N]
        [--relay-connections N] [--handoff-negotiations N]
        [--accepts-per-second N] [--accept-burst N]
@@ -180,6 +182,7 @@ pub struct DaemonConfig {
     pub listen_addresses: Vec<String>,
     pub limits: IngressLimits,
     pub task_budget: Option<usize>,
+    pub hosting_profile: HostingProfile,
 }
 
 impl DaemonConfig {
@@ -187,6 +190,7 @@ impl DaemonConfig {
         let mut listen_addresses = Vec::new();
         let mut limits = IngressLimits::default();
         let mut task_budget = None;
+        let mut ingress_config = None;
         let mut index = 0;
 
         while index < args.len() {
@@ -196,6 +200,11 @@ impl DaemonConfig {
                 .ok_or_else(|| format!("{option} requires a value"))?;
             match option {
                 "--listen" => listen_addresses.push(value.clone()),
+                "--ingress-config" => {
+                    if ingress_config.replace(PathBuf::from(value)).is_some() {
+                        return Err("--ingress-config may be specified only once".to_string());
+                    }
+                }
                 "--active-connections" => {
                     limits.active_connections = parse_usize(value, "active_connections")?;
                 }
@@ -251,11 +260,13 @@ impl DaemonConfig {
         if listen_addresses.is_empty() {
             listen_addresses.extend(["0.0.0.0:443".to_string(), "[::]:443".to_string()]);
         }
+        let hosting_profile = HostingProfile::load(ingress_config)?;
 
         Ok(Self {
             listen_addresses,
             limits,
             task_budget,
+            hosting_profile,
         })
     }
 }

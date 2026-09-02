@@ -1,14 +1,11 @@
-use atomicwrites::{AllowOverwrite, AtomicFile};
-use fs2::FileExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, Instant};
-use toml_edit::{DocumentMut, value};
+use toml_edit::DocumentMut;
 
 mod admission;
 #[cfg(test)]
@@ -19,7 +16,9 @@ mod handoff;
 mod handoff_protocol;
 #[cfg(any(target_os = "macos", test))]
 mod handoff_stream;
+mod ingress_config;
 mod ingress_limits;
+mod port_registry;
 mod proxy;
 mod route_cache;
 mod systemd_service;
@@ -41,11 +40,13 @@ USAGE:
     phx-port list --port-only   Show tree with port numbers instead of URLs
     phx-port register           Register the current directory for a new port
     phx-port register debug     Register a named port role
+    phx-port --workload-id ID [ROLE]
+                                Allocate by logical Workload ID instead of directory
     phx-port delete <X>         Remove all ports (X = port number, directory name, or '.')
     phx-port delete <X> debug   Remove a specific port role
     phx-port running            Show which registered projects are currently running
     phx-port discover           Open a browser page to pick a running project
-    phx-port daemon [--listen ADDRESS]... [CAPACITY OPTIONS]
+    phx-port daemon [--listen ADDRESS]... [--ingress-config PATH] [CAPACITY OPTIONS]
                                 Route TLS by SNI to live https/main workloads
     phx-port proxy status       Show live daemon state and counters
     phx-port proxy routes       Show persistently discovered TLS routes
@@ -63,6 +64,8 @@ auto-registering if needed. An optional positional argument specifies the
 port role (default: main). Port 4000 is kept free.
 
 Config: ~\\.config\\phx-ports.toml (override with PHX_PORT_CONFIG env var)
+Logical Workload: PHX_PORT_WORKLOAD_ID or --workload-id ID
+Public profile: PHX_PORT_INGRESS_CONFIG or daemon --ingress-config PATH
 Home:   USERPROFILE or HOMEDRIVE+HOMEPATH (Windows), HOME (Linux/macOS)";
 
 fn home_dir() -> PathBuf {
@@ -96,96 +99,18 @@ pub(crate) fn config_path() -> PathBuf {
     home_dir().join(".config").join("phx-ports.toml")
 }
 
-fn ensure_config_parent(path: &Path) {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap_or_else(|e| {
-            eprintln!("Error creating {}: {}", parent.display(), e);
-            process::exit(1);
-        });
-    }
-}
-
-fn config_lock(path: &Path) -> File {
-    ensure_config_parent(path);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("phx-ports.toml");
-    let lock_path = path.with_file_name(format!("{file_name}.lock"));
-    OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .unwrap_or_else(|e| {
-            eprintln!("Error opening config lock {}: {}", lock_path.display(), e);
-            process::exit(1);
-        })
-}
-
-fn load_config(path: &Path) -> DocumentMut {
-    let mut doc = if path.exists() {
-        let content = fs::read_to_string(path).unwrap_or_else(|e| {
-            eprintln!("Error reading {}: {}", path.display(), e);
-            process::exit(1);
-        });
-        content.parse::<DocumentMut>().unwrap_or_else(|e| {
-            eprintln!("Error parsing {}: {}", path.display(), e);
-            process::exit(1);
-        })
-    } else {
-        "[ports]\n".parse::<DocumentMut>().unwrap()
-    };
-
-    ensure_ports_table(&mut doc);
-    let old_entries: Vec<(String, i64)> = doc["ports"]
-        .as_table()
-        .map(|t| {
-            t.iter()
-                .filter_map(|(k, v)| v.as_integer().map(|p| (k.to_string(), p)))
-                .collect()
-        })
-        .unwrap_or_default();
-    if !old_entries.is_empty() {
-        for (dir, port) in &old_entries {
-            doc["ports"][dir] = toml_edit::table();
-            doc["ports"][dir][DEFAULT_ROLE] = value(*port);
-        }
-    }
-
-    doc
-}
-
 pub(crate) fn read_config(path: &Path) -> DocumentMut {
-    let lock = config_lock(path);
-    FileExt::lock_shared(&lock).unwrap_or_else(|e| {
-        eprintln!("Error locking {} for reading: {}", path.display(), e);
-        process::exit(1);
-    });
-    let doc = load_config(path);
-    FileExt::unlock(&lock).ok();
-    doc
+    port_registry::read(path, port_registry::RegistrySecurity::Development)
+        .unwrap_or_else(exit_registry_error)
 }
 
 pub(crate) fn update_config<R>(path: &Path, update: impl FnOnce(&mut DocumentMut) -> R) -> R {
-    let lock = config_lock(path);
-    FileExt::lock_exclusive(&lock).unwrap_or_else(|e| {
-        eprintln!("Error locking {} for update: {}", path.display(), e);
-        process::exit(1);
-    });
-
-    let mut doc = load_config(path);
-    let result = update(&mut doc);
-    let content = doc.to_string();
-    AtomicFile::new(path, AllowOverwrite)
-        .write(|file| file.write_all(content.as_bytes()))
-        .unwrap_or_else(|e| {
-            eprintln!("Error atomically writing {}: {}", path.display(), e);
-            process::exit(1);
-        });
-    FileExt::unlock(&lock).ok();
-    result
+    port_registry::update(
+        path,
+        port_registry::RegistrySecurity::Development,
+        |document| Ok(update(document)),
+    )
+    .unwrap_or_else(exit_registry_error)
 }
 
 fn cwd_string() -> String {
@@ -198,32 +123,78 @@ fn cwd_string() -> String {
         .to_string()
 }
 
-fn ensure_ports_table(doc: &mut DocumentMut) {
-    if !doc.contains_table("ports") {
-        doc["ports"] = toml_edit::table();
+fn ensure_ports_table(document: &mut DocumentMut) {
+    if !document.contains_table("ports") {
+        document["ports"] = toml_edit::table();
     }
 }
 
-fn next_port(doc: &DocumentMut) -> i64 {
-    let mut used = BTreeSet::new();
-    if let Some(table) = doc["ports"].as_table() {
-        for (_, dir_value) in table.iter() {
-            if let Some(dir_table) = dir_value.as_table() {
-                for (_, port_value) in dir_table.iter() {
-                    if let Some(port) = port_value.as_integer() {
-                        used.insert(port);
-                    }
+fn exit_registry_error<T>(error: String) -> T {
+    eprintln!("Error: {error}");
+    process::exit(1);
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AllocationIdentity {
+    key: String,
+    logical: bool,
+}
+
+fn allocation_identity(explicit_workload_id: Option<&str>) -> Result<AllocationIdentity, String> {
+    let workload_id = match explicit_workload_id {
+        Some(workload_id) => Some(workload_id.to_string()),
+        None => match env::var("PHX_PORT_WORKLOAD_ID") {
+            Ok(workload_id) => Some(workload_id),
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err("PHX_PORT_WORKLOAD_ID must be valid UTF-8".to_string());
+            }
+        },
+    };
+    if let Some(workload_id) = workload_id {
+        port_registry::validate_workload_id(&workload_id)?;
+        return Ok(AllocationIdentity {
+            key: workload_id,
+            logical: true,
+        });
+    }
+    Ok(AllocationIdentity {
+        key: cwd_string(),
+        logical: false,
+    })
+}
+
+fn parse_allocation_args(args: &[String]) -> Result<(String, Option<String>), String> {
+    let mut role = None;
+    let mut workload_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workload-id" => {
+                if workload_id.is_some() {
+                    return Err("--workload-id may be specified only once".to_string());
                 }
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--workload-id requires a value".to_string())?;
+                workload_id = Some(value.clone());
+                index += 2;
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown allocation option: {option}"));
+            }
+            value => {
+                if role.replace(value.to_string()).is_some() {
+                    return Err("port allocation accepts at most one role".to_string());
+                }
+                index += 1;
             }
         }
     }
-
-    // Find the first gap starting from 4001
-    let mut port = 4001;
-    while used.contains(&port) {
-        port += 1;
-    }
-    port
+    Ok((
+        role.unwrap_or_else(|| DEFAULT_ROLE.to_string()),
+        workload_id,
+    ))
 }
 
 fn cmd_list(config: &Path) {
@@ -453,42 +424,44 @@ fn cmd_list_tree(config: &Path, as_url: bool) {
     }
 }
 
-fn cmd_register(config: &Path, role: &str) {
-    let cwd_str = cwd_string();
-    let (port, created) = update_config(config, |doc| {
-        ensure_ports_table(doc);
+fn allocate_port(
+    config: &Path,
+    role: &str,
+    explicit_workload_id: Option<&str>,
+) -> Result<(AllocationIdentity, i64, bool), String> {
+    let identity = allocation_identity(explicit_workload_id)?;
+    let (port, created) = port_registry::allocate(config, &identity.key, role, identity.logical)?;
+    Ok((identity, port, created))
+}
 
-        if let Some(port) = doc["ports"]
-            .as_table()
-            .and_then(|t| t.get(&cwd_str))
-            .and_then(|v| v.as_table())
-            .and_then(|t| t.get(role))
-            .and_then(|v| v.as_integer())
-        {
-            return (port, false);
-        }
+fn describe_assignment(identity: &AllocationIdentity, role: &str) -> String {
+    let subject = if identity.logical {
+        format!("Workload {}", identity.key)
+    } else {
+        identity.key.clone()
+    };
+    if role == DEFAULT_ROLE {
+        subject
+    } else {
+        format!("{subject} ({role})")
+    }
+}
 
-        let new_port = next_port(doc);
-        if doc["ports"]
-            .as_table()
-            .is_none_or(|t| !t.contains_key(&cwd_str))
-        {
-            doc["ports"][&cwd_str] = toml_edit::table();
-        }
-        doc["ports"][&cwd_str][role] = value(new_port);
-        (new_port, true)
-    });
+fn cmd_register(config: &Path, role: &str, explicit_workload_id: Option<&str>) {
+    let (identity, port, created) =
+        allocate_port(config, role, explicit_workload_id).unwrap_or_else(exit_registry_error);
 
     let action = if created {
         "Registered"
     } else {
         "Already registered:"
     };
-    if role == DEFAULT_ROLE {
-        eprintln!("{} {} → port {}", action, cwd_str, port);
-    } else {
-        eprintln!("{} {} ({}) → port {}", action, cwd_str, role, port);
-    }
+    eprintln!(
+        "{} {} → port {}",
+        action,
+        describe_assignment(&identity, role),
+        port
+    );
     println!("{}", port);
 }
 
@@ -619,36 +592,15 @@ fn cmd_delete(config: &Path, arg: &str, role: Option<&str>) {
     }
 }
 
-fn cmd_port(config: &Path, role: &str) {
-    let cwd_str = cwd_string();
-    let (port, created) = update_config(config, |doc| {
-        ensure_ports_table(doc);
-        if let Some(port) = doc["ports"]
-            .as_table()
-            .and_then(|t| t.get(&cwd_str))
-            .and_then(|v| v.as_table())
-            .and_then(|t| t.get(role))
-            .and_then(|v| v.as_integer())
-        {
-            return (port, false);
-        }
-
-        let new_port = next_port(doc);
-        if doc["ports"]
-            .as_table()
-            .is_none_or(|t| !t.contains_key(&cwd_str))
-        {
-            doc["ports"][&cwd_str] = toml_edit::table();
-        }
-        doc["ports"][&cwd_str][role] = value(new_port);
-        (new_port, true)
-    });
+fn cmd_port(config: &Path, role: &str, explicit_workload_id: Option<&str>) {
+    let (identity, port, created) =
+        allocate_port(config, role, explicit_workload_id).unwrap_or_else(exit_registry_error);
     if created {
-        if role == DEFAULT_ROLE {
-            eprintln!("Registered {} → port {}", cwd_str, port);
-        } else {
-            eprintln!("Registered {} ({}) → port {}", cwd_str, role, port);
-        }
+        eprintln!(
+            "Registered {} → port {}",
+            describe_assignment(&identity, role),
+            port
+        );
     }
     println!("{}", port);
 }
@@ -1016,8 +968,9 @@ fn main() {
             }
         }
         Some("register") => {
-            let role = args.get(1).map(|s| s.as_str()).unwrap_or(DEFAULT_ROLE);
-            cmd_register(&config, role);
+            let (role, workload_id) =
+                parse_allocation_args(&args[1..]).unwrap_or_else(exit_registry_error);
+            cmd_register(&config, &role, workload_id.as_deref());
         }
         Some("delete") => {
             if let Some(target) = args.get(1) {
@@ -1092,6 +1045,11 @@ fn main() {
                 process::exit(1);
             }
         },
+        Some("--workload-id") => {
+            let (role, workload_id) =
+                parse_allocation_args(&args).unwrap_or_else(exit_registry_error);
+            cmd_port(&config, &role, workload_id.as_deref());
+        }
         Some(other) if other.starts_with('-') => {
             eprintln!("Unknown option: {}", other);
             eprintln!();
@@ -1106,8 +1064,9 @@ fn main() {
                 eprintln!("{}", HELP);
                 process::exit(1);
             } else {
-                // Piped mode: treat first arg as port role name
-                cmd_port(&config, args[0].as_str());
+                let (role, workload_id) =
+                    parse_allocation_args(&args).unwrap_or_else(exit_registry_error);
+                cmd_port(&config, &role, workload_id.as_deref());
             }
         }
 
@@ -1115,7 +1074,7 @@ fn main() {
             if std::io::stdout().is_terminal() {
                 println!("{}", HELP);
             } else {
-                cmd_port(&config, DEFAULT_ROLE);
+                cmd_port(&config, DEFAULT_ROLE, None);
             }
         }
     }

@@ -60,6 +60,29 @@ export PHX_PORT_CONFIG="$HOME/.phx-ports.toml"       # Linux/macOS alternative
 export PHX_PORT_CONFIG="C:\Users\me\.phx-ports.toml"  # Windows
 ```
 
+Production workload automation can replace the current-directory key with an
+explicit logical Workload ID:
+
+```bash
+export PHX_PORT_CONFIG=/var/lib/phx-port/ports.toml
+export PHX_PORT_WORKLOAD_ID=contoso-web
+
+PORT="$(phx-port)" HTTPS_PORT="$(phx-port https)" exec application-server
+
+# Equivalent explicit CLI identity; the CLI value overrides the environment.
+phx-port --workload-id contoso-web https
+```
+
+Logical IDs contain 1-128 lowercase ASCII characters, start and end with a
+letter or digit, and may contain `.`, `_`, and `-`. Use a separate logical
+registry rather than mixing production IDs with development paths. Its parent
+directory must be owned by the effective user with mode `0700`; the registry
+and sibling lock are regular, single-link files with mode `0600`. Allocation
+uses the same exclusive lock and atomic replacement as development, is
+idempotent under concurrent workload starts, and does not contact a running
+ingress process. `PHX_PORT_WORKLOAD_ID` selects only allocator identity; it
+does not activate public ingress.
+
 ## Usage
 
 ### In scripts and shell wrappers (piped mode)
@@ -123,6 +146,21 @@ HTTPS_PORT="$(phx-port https)" my-https-server
 # Foreground proxy; repeat --listen for additional addresses
 phx-port daemon --listen 0.0.0.0:443 --listen '[::]:443'
 ```
+
+Development is the default Hosting Profile and retains dynamic certificate
+discovery. Public mode is selected only by `--ingress-config PATH` or
+`PHX_PORT_INGRESS_CONFIG`; the referenced TOML file must explicitly contain:
+
+```toml
+[ingress]
+mode = "public"
+```
+
+At this implementation stage the public profile fails closed with no eligible
+routes and never falls back to development discovery. Exact public Route
+Declarations are a separate implementation milestone, so this activation
+mechanism is not yet a production-ready ingress claim. `proxy status` reports
+the active `hosting_profile`.
 
 The threaded daemon has explicit startup capacity options:
 

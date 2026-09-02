@@ -154,6 +154,14 @@ The daemon entry point is an explicit, foreground command:
 phx-port daemon --listen 0.0.0.0:443 --listen '[::]:443'
 ```
 
+Without an explicit ingress configuration, the daemon uses the development
+Hosting Profile described by this document. `--ingress-config PATH` or
+`PHX_PORT_INGRESS_CONFIG` selects the public profile only when the referenced
+file declares `[ingress] mode = "public"`. `PHX_PORT_WORKLOAD_ID` is not a
+profile selector. Until exact Route Declaration handling lands, public mode
+fails closed with no eligible routes and does not read dynamic or persisted
+development discoveries.
+
 The transitional threaded configuration defaults to 256 active connections,
 128 pre-routing connections, 128 relays, 64 handoff negotiations, 200 accepts
 per second with burst 400, and a two-second ClientHello deadline. Per-source
@@ -267,6 +275,9 @@ new work, existing relays receive up to 30 seconds to finish, and the control
 socket is removed.
 
 ## Workload discovery
+
+This section describes the default development Hosting Profile. Public mode
+does not perform this dynamic discovery.
 
 The daemon rereads and reconciles the existing port registry once per second.
 This simple polling model also handles atomic registry replacement without
@@ -564,7 +575,9 @@ hostname. The implementation consists of:
 - `route_cache.rs` for atomically persisted derived routes.
 - `handoff.rs` and `handoff_protocol.rs` for the optional Linux descriptor
   transfer path.
-- The existing registry helpers in `main.rs` for stable project/role ports.
+- `ingress_config.rs` for explicit Hosting Profile activation.
+- `port_registry.rs` for locked stable development path/role and logical
+  Workload/role assignments.
 
 ```text
 src/

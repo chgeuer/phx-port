@@ -3,6 +3,7 @@ use crate::ingress_limits::{IngressLimits, SystemCapacity};
 use crate::{
     admission::{AdmissionController, AdmissionRejection, PreRoutingAdmission, RelayPermit},
     config_path, handoff,
+    ingress_config::HostingProfile,
     ingress_limits::{DaemonConfig, ValidatedIngressLimits},
     is_port_open, read_config, route_cache, tls_client_hello,
     worker_pool::BoundedWorkerPool,
@@ -202,6 +203,7 @@ impl std::fmt::Display for OverloadEvent {
 
 struct ProxyState {
     config: PathBuf,
+    hosting_profile: HostingProfile,
     limits: ValidatedIngressLimits,
     admission: AdmissionController,
     listeners: RwLock<Vec<SocketAddr>>,
@@ -234,10 +236,15 @@ struct ProxyState {
 }
 
 impl ProxyState {
-    fn with_limits(config: PathBuf, limits: ValidatedIngressLimits) -> Self {
+    fn with_limits(
+        config: PathBuf,
+        hosting_profile: HostingProfile,
+        limits: ValidatedIngressLimits,
+    ) -> Self {
         let admission = AdmissionController::new(&limits);
         Self {
             config,
+            hosting_profile,
             limits,
             admission,
             listeners: RwLock::new(Vec::new()),
@@ -272,6 +279,11 @@ impl ProxyState {
 
     #[cfg(test)]
     fn new(config: PathBuf) -> Self {
+        Self::new_with_profile(config, HostingProfile::Development)
+    }
+
+    #[cfg(test)]
+    fn new_with_profile(config: PathBuf, hosting_profile: HostingProfile) -> Self {
         let limits = IngressLimits::default()
             .validate(
                 SystemCapacity {
@@ -281,7 +293,7 @@ impl ProxyState {
                 2,
             )
             .unwrap();
-        Self::with_limits(config, limits)
+        Self::with_limits(config, hosting_profile, limits)
     }
 
     fn discover_once(
@@ -394,14 +406,22 @@ struct ConnectionJob {
 
 pub fn run(config: DaemonConfig) -> Result<(), String> {
     PROCESS_START.get_or_init(Instant::now);
-    let limits = config
-        .limits
-        .validate_for_startup(config.task_budget, config.listen_addresses.len())?;
-    let state = Arc::new(ProxyState::with_limits(config_path(), limits));
+    let DaemonConfig {
+        listen_addresses,
+        limits,
+        task_budget,
+        hosting_profile,
+    } = config;
+    let limits = limits.validate_for_startup(task_budget, listen_addresses.len())?;
+    let state = Arc::new(ProxyState::with_limits(
+        config_path(),
+        hosting_profile,
+        limits,
+    ));
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut listeners = Vec::new();
 
-    for address in &config.listen_addresses {
+    for address in &listen_addresses {
         let listener = bind_listener(address)
             .map_err(|error| format!("cannot listen on {address}: {error}"))?;
         eprintln!("TLS proxy listening on {}", listener.local_addr().unwrap());
@@ -691,7 +711,8 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 .unwrap_or(0);
             let probes = state.probes.in_use.lock().map(|count| *count).unwrap_or(0);
             format!(
-                "running\nlisteners={listeners}\nactive_routes={active_routes}\nconflicts={conflicts}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nsource_entries={source_entries}\nsource_entry_limit={source_entry_limit}\nsource_accepts_per_second_limit={source_accepts_per_second_limit}\nsource_accept_burst_limit={source_accept_burst_limit}\nsource_pre_routing_limit={source_pre_routing_limit}\nsource_ipv6_prefix={source_ipv6_prefix}\nsource_entry_ttl_seconds={source_entry_ttl_seconds}\nsource_policy_overrides={source_policy_overrides}\nqueued_connections={queued_connections}\nconnection_queue_limit={CONNECTION_QUEUE_CAPACITY}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_source_rate={rejected_source_rate}\nrejected_source_concurrency={rejected_source_concurrency}\nrejected_source_state_capacity={rejected_source_state_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
+                "running\nhosting_profile={hosting_profile}\nlisteners={listeners}\nactive_routes={active_routes}\nconflicts={conflicts}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nsource_entries={source_entries}\nsource_entry_limit={source_entry_limit}\nsource_accepts_per_second_limit={source_accepts_per_second_limit}\nsource_accept_burst_limit={source_accept_burst_limit}\nsource_pre_routing_limit={source_pre_routing_limit}\nsource_ipv6_prefix={source_ipv6_prefix}\nsource_entry_ttl_seconds={source_entry_ttl_seconds}\nsource_policy_overrides={source_policy_overrides}\nqueued_connections={queued_connections}\nconnection_queue_limit={CONNECTION_QUEUE_CAPACITY}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_source_rate={rejected_source_rate}\nrejected_source_concurrency={rejected_source_concurrency}\nrejected_source_state_capacity={rejected_source_state_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
+                hosting_profile = state.hosting_profile.name(),
                 active_connections = admission.global.in_use,
                 active_connection_limit = admission.global.limit,
                 pre_routing_connections = admission.pre_routing.in_use,
@@ -926,6 +947,11 @@ fn acquire_relay_capacity(state: &ProxyState) -> Option<RelayPermit> {
 }
 
 fn resolve_backend(hostname: &str, state: &ProxyState) -> Result<Backend, String> {
+    if state.hosting_profile.is_public() {
+        return Err(format!(
+            "public ingress has no verified Route Declaration for {hostname}"
+        ));
+    }
     let cached = route_cache::load(&state.config, hostname);
     let candidates = candidate_backends(&state.config, cached.as_ref());
     observe_workloads(state, &candidates);
@@ -1044,6 +1070,9 @@ fn observe_workloads(state: &ProxyState, candidates: &[Backend]) -> Vec<Backend>
 }
 
 fn reconcile_workloads(state: &ProxyState) {
+    if state.hosting_profile.is_public() {
+        return;
+    }
     let candidates = candidate_backends(&state.config, None);
     let added = observe_workloads(state, &candidates);
 
@@ -1147,6 +1176,9 @@ fn dns_names_from_certificate(der: &[u8]) -> Result<Vec<String>, String> {
 }
 
 fn reconcile_routes(state: &ProxyState) {
+    if state.hosting_profile.is_public() {
+        return;
+    }
     let routes: Vec<(String, ActiveRoute)> = match state.routes.read() {
         Ok(routes) => routes
             .iter()
@@ -1504,9 +1536,12 @@ mod tests {
         ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL,
         ProbeLimiter, ProbeMatch, ProxyState, WaitingClient, bind_listener, cache_negative,
         clear_conflict, collect_probe_matches, observe_workloads, prefer_https_per_project,
-        reconcile_routes, record_conflict, render_control_response, supports_eager_discovery,
+        reconcile_routes, reconcile_workloads, record_conflict, render_control_response,
+        resolve_backend, supports_eager_discovery,
     };
-    use crate::{admission::AdmissionRejection, route_cache, update_config};
+    use crate::{
+        admission::AdmissionRejection, ingress_config::HostingProfile, route_cache, update_config,
+    };
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
@@ -1676,6 +1711,7 @@ mod tests {
         let handoff = state.admission.try_acquire_handoff().unwrap();
 
         let status = render_control_response(&state, &shutdown, "STATUS");
+        assert!(status.contains("hosting_profile=development"));
         assert!(status.contains("active_routes=1"));
         assert!(status.contains("accepted_connections=7"));
         assert!(status.contains("active_connections=1"));
@@ -1717,6 +1753,35 @@ mod tests {
             "stopping\n"
         );
         assert!(shutdown.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn public_profile_is_observable_and_disables_dynamic_registry_discovery() {
+        let directory = tempdir().unwrap();
+        let registry = directory.path().join("ports.toml");
+        update_config(&registry, |document| {
+            document["ports"]["contoso-web"]["https"] = value(4401);
+        });
+        let state = ProxyState::new_with_profile(
+            registry,
+            HostingProfile::Public {
+                ingress_config: directory.path().join("ingress.toml"),
+            },
+        );
+
+        reconcile_workloads(&state);
+        assert!(state.workloads.lock().unwrap().is_empty());
+        let error = resolve_backend("www.example.com", &state).unwrap_err();
+        assert_eq!(
+            error,
+            "public ingress has no verified Route Declaration for www.example.com"
+        );
+        assert_eq!(state.successful_discoveries.load(Ordering::Relaxed), 0);
+
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let status = render_control_response(&state, &shutdown, "STATUS");
+        assert!(status.contains("hosting_profile=public"));
+        assert!(status.contains("active_routes=0"));
     }
 
     #[test]
