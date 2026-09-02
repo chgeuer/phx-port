@@ -134,6 +134,12 @@ The threaded daemon has explicit startup capacity options:
 | `--handoff-negotiations` | 64 |
 | `--accepts-per-second` | 200 |
 | `--accept-burst` | 400 |
+| `--source-accepts-per-second` | 20 |
+| `--source-accept-burst` | 40 |
+| `--source-pre-routing-connections` | 16 |
+| `--source-ipv6-prefix` | 64 |
+| `--source-table-capacity` | 4096 |
+| `--source-entry-ttl-seconds` | 300 |
 | `--client-hello-timeout-ms` | 2000 |
 
 Before binding any listener, the daemon rejects zero values, sublimits above
@@ -149,19 +155,31 @@ the systemd cgroup task ceiling and its existing occupants when available;
 `--task-budget N` supplies an additional operator ceiling on any platform.
 
 The daemon enforces the global accept-rate/burst and active, pre-routing,
-relay, and handoff ceilings at runtime. It acquires active and pre-routing
-permits immediately after `accept` and before dispatching to a fixed worker
-pool whose only user-space queue slot is also covered by those permits.
-Saturation closes the newly accepted socket immediately. Handoff negotiation
-uses its own permit; relay capacity is reserved before opening a backend
-socket, then pre-routing capacity is released while the active and relay
-permits remain held until encrypted copying ends. `proxy status` reports each
-current count and configured limit, along with worker and queue bounds.
-Bounded counters distinguish accept-rate, global, pre-routing, relay, and
-worker-queue rejection, while a separate counter records handoff capacity
-skips that safely use relay instead.
-Per-source admission and production load qualification remain separate
-milestones; these threaded bounds are not a public-load support claim.
+relay, handoff, and per-source ceilings at runtime. IPv4 peers use exact-address
+buckets; IPv6 peers use the configured prefix. Source buckets default to 20
+accepts per second with burst 40 and 16 simultaneous pre-routing connections.
+The expiring source table retains at most 4096 entries and evicts the
+least-recent idle entry when full; if every entry is active, a new source is
+rejected. Source identity comes only from the accepted socket's kernel peer
+address, never SNI, headers, or public protocol bytes.
+
+Repeat
+`--source-policy CIDR=RATE,BURST,PRE_ROUTING[,IPV6_PREFIX]` to give an
+operator-declared network different finite limits. The longest matching CIDR
+wins, duplicate normalized CIDRs are rejected, and at most 256 overrides are
+accepted. An optional fourth field changes IPv6 bucketing inside that CIDR and
+must be at least as specific as the CIDR itself.
+
+The daemon acquires active, source, and pre-routing permits immediately after
+`accept` and before dispatching to a fixed worker pool whose only user-space
+queue slot is also covered by those permits. Saturation closes the newly
+accepted socket immediately. Handoff negotiation uses its own permit; relay
+capacity is reserved before opening a backend socket, then source and
+pre-routing capacity are released while the active and relay permits remain
+held until encrypted copying ends. `proxy status` reports aggregate source
+table use, configured limits, and bounded rejection-reason counters without
+source-address labels. Production load qualification remains a separate
+milestone; these threaded bounds are not a public-load support claim.
 
 For an unknown SNI hostname, `phx-port` probes active `https` and `main`
 workloads over loopback using that exact hostname. It routes only when exactly

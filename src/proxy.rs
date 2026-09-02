@@ -164,6 +164,9 @@ struct ProxyState {
     rejected_connections: AtomicU64,
     rejected_accept_rate: AtomicU64,
     rejected_global_capacity: AtomicU64,
+    rejected_source_rate: AtomicU64,
+    rejected_source_concurrency: AtomicU64,
+    rejected_source_state_capacity: AtomicU64,
     rejected_pre_routing_capacity: AtomicU64,
     rejected_relay_capacity: AtomicU64,
     rejected_worker_queue: AtomicU64,
@@ -196,6 +199,9 @@ impl ProxyState {
             rejected_connections: AtomicU64::new(0),
             rejected_accept_rate: AtomicU64::new(0),
             rejected_global_capacity: AtomicU64::new(0),
+            rejected_source_rate: AtomicU64::new(0),
+            rejected_source_concurrency: AtomicU64::new(0),
+            rejected_source_state_capacity: AtomicU64::new(0),
             rejected_pre_routing_capacity: AtomicU64::new(0),
             rejected_relay_capacity: AtomicU64::new(0),
             rejected_worker_queue: AtomicU64::new(0),
@@ -259,6 +265,9 @@ impl ProxyState {
         let counter = match rejection {
             AdmissionRejection::AcceptRate => &self.rejected_accept_rate,
             AdmissionRejection::Global => &self.rejected_global_capacity,
+            AdmissionRejection::SourceRate => &self.rejected_source_rate,
+            AdmissionRejection::SourceConcurrency => &self.rejected_source_concurrency,
+            AdmissionRejection::SourceStateCapacity => &self.rejected_source_state_capacity,
             AdmissionRejection::PreRouting => &self.rejected_pre_routing_capacity,
             AdmissionRejection::Relay => &self.rejected_relay_capacity,
             AdmissionRejection::Handoff => &self.handoff_capacity_skips,
@@ -378,10 +387,10 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         listener_threads.push(thread::spawn(move || {
             while !shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
-                    Ok((stream, _)) => {
+                    Ok((stream, peer)) => {
                         let accepted_at = Instant::now();
                         state.accepted_connections.fetch_add(1, Ordering::Relaxed);
-                        let admission = match state.admission.try_admit() {
+                        let admission = match state.admission.try_admit(peer.ip()) {
                             Ok(admission) => admission,
                             Err(rejection) => {
                                 state.record_admission_rejection(rejection);
@@ -613,7 +622,7 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 .unwrap_or(0);
             let probes = state.probes.in_use.lock().map(|count| *count).unwrap_or(0);
             format!(
-                "running\nlisteners={listeners}\nactive_routes={active_routes}\nconflicts={conflicts}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nqueued_connections={queued_connections}\nconnection_queue_limit={CONNECTION_QUEUE_CAPACITY}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
+                "running\nlisteners={listeners}\nactive_routes={active_routes}\nconflicts={conflicts}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nsource_entries={source_entries}\nsource_entry_limit={source_entry_limit}\nsource_accepts_per_second_limit={source_accepts_per_second_limit}\nsource_accept_burst_limit={source_accept_burst_limit}\nsource_pre_routing_limit={source_pre_routing_limit}\nsource_ipv6_prefix={source_ipv6_prefix}\nsource_entry_ttl_seconds={source_entry_ttl_seconds}\nsource_policy_overrides={source_policy_overrides}\nqueued_connections={queued_connections}\nconnection_queue_limit={CONNECTION_QUEUE_CAPACITY}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_source_rate={rejected_source_rate}\nrejected_source_concurrency={rejected_source_concurrency}\nrejected_source_state_capacity={rejected_source_state_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
                 active_connections = admission.global.in_use,
                 active_connection_limit = admission.global.limit,
                 pre_routing_connections = admission.pre_routing.in_use,
@@ -624,6 +633,14 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 handoff_negotiation_limit = admission.handoff.limit,
                 accepts_per_second_limit = state.limits.accepts_per_second(),
                 accept_burst_limit = state.limits.accept_burst(),
+                source_entries = admission.source_entries,
+                source_entry_limit = admission.source_entry_limit,
+                source_accepts_per_second_limit = state.limits.source().accepts_per_second,
+                source_accept_burst_limit = state.limits.source().accept_burst,
+                source_pre_routing_limit = state.limits.source().pre_routing_connections,
+                source_ipv6_prefix = state.limits.source().ipv6_prefix,
+                source_entry_ttl_seconds = state.limits.source().entry_ttl_seconds,
+                source_policy_overrides = state.limits.source().overrides.len(),
                 queued_connections = state.queued_connections.load(Ordering::Relaxed),
                 connection_workers = state.limits.active_connections(),
                 waiting_clients = state.waiting_clients.load(Ordering::Relaxed),
@@ -632,6 +649,11 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 rejected_connections = state.rejected_connections.load(Ordering::Relaxed),
                 rejected_accept_rate = state.rejected_accept_rate.load(Ordering::Relaxed),
                 rejected_global_capacity = state.rejected_global_capacity.load(Ordering::Relaxed),
+                rejected_source_rate = state.rejected_source_rate.load(Ordering::Relaxed),
+                rejected_source_concurrency =
+                    state.rejected_source_concurrency.load(Ordering::Relaxed),
+                rejected_source_state_capacity =
+                    state.rejected_source_state_capacity.load(Ordering::Relaxed),
                 rejected_pre_routing_capacity =
                     state.rejected_pre_routing_capacity.load(Ordering::Relaxed),
                 rejected_relay_capacity = state.rejected_relay_capacity.load(Ordering::Relaxed),
@@ -1578,7 +1600,10 @@ mod tests {
             .insert("www.example.com".to_string(), active_route(backend()));
         state.accepted_connections.store(7, Ordering::Relaxed);
         let shutdown = std::sync::atomic::AtomicBool::new(false);
-        let routing = state.admission.try_admit().unwrap();
+        let routing = state
+            .admission
+            .try_admit(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .unwrap();
         let handoff = state.admission.try_acquire_handoff().unwrap();
 
         let status = render_control_response(&state, &shutdown, "STATUS");
@@ -1594,6 +1619,14 @@ mod tests {
         assert!(status.contains("handoff_negotiation_limit=64"));
         assert!(status.contains("accepts_per_second_limit=200"));
         assert!(status.contains("accept_burst_limit=400"));
+        assert!(status.contains("source_entries=1"));
+        assert!(status.contains("source_entry_limit=4096"));
+        assert!(status.contains("source_accepts_per_second_limit=20"));
+        assert!(status.contains("source_accept_burst_limit=40"));
+        assert!(status.contains("source_pre_routing_limit=16"));
+        assert!(status.contains("source_ipv6_prefix=64"));
+        assert!(status.contains("source_entry_ttl_seconds=300"));
+        assert!(status.contains("source_policy_overrides=0"));
         assert!(status.contains("connection_queue_limit=1"));
         assert!(status.contains("connection_workers=256"));
 

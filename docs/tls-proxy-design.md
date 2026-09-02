@@ -156,9 +156,12 @@ phx-port daemon --listen 0.0.0.0:443 --listen '[::]:443'
 
 The transitional threaded configuration defaults to 256 active connections,
 128 pre-routing connections, 128 relays, 64 handoff negotiations, 200 accepts
-per second with burst 400, and a two-second ClientHello deadline. Each value
-has a matching `daemon` option. `--task-budget` can declare an operator task
-ceiling; on Linux the daemon also reads the enclosing systemd cgroup task
+per second with burst 400, and a two-second ClientHello deadline. Per-source
+defaults are 20 accepts per second, burst 40, and 16 simultaneous pre-routing
+connections. IPv4 buckets are exact addresses; IPv6 buckets use `/64` by
+default. The source table defaults to 4096 entries and a 300-second TTL. Each
+value has a matching `daemon` option. `--task-budget` can declare an operator
+task ceiling; on Linux the daemon also reads the enclosing systemd cgroup task
 limit when one exists.
 
 Capacity validation runs before the first listener bind. It rejects zero
@@ -169,17 +172,23 @@ descriptor demand that would leave less than 30% of `RLIMIT_NOFILE` in
 reserve. When the configured descriptor budget fits the hard limit, startup
 may raise the process soft limit to the calculated minimum and then revalidates
 the resulting limit. It never derives or lowers configured ingress ceilings
-from ambient limits. The validated ClientHello timeout is already used by
-connection handling. The daemon also enforces the global accept-rate/burst and
-active, pre-routing, relay, and handoff ceilings. It acquires active and
-pre-routing permits immediately after `accept`, before dispatch to a fixed
-worker pool with one bounded queue slot. Saturation closes the new socket
-without allocating a per-connection thread. Relay capacity is reserved before
-opening the loopback backend; after route selection, pre-routing capacity is
-released while active and relay permits remain held until copying ends.
-Per-source admission and production load qualification remain later
-milestones, so these threaded bounds do not constitute a public-load support
-claim.
+from ambient limits. The validated ClientHello timeout is already used by connection handling. The
+daemon also enforces the global accept-rate/burst and active, source,
+pre-routing, relay, and handoff ceilings. It derives source identity only from
+the kernel-reported peer address and acquires active, source, and pre-routing
+permits immediately after `accept`, before dispatch to a fixed worker pool with
+one bounded queue slot. Saturation closes the new socket without allocating a
+per-connection thread. Relay capacity is reserved before opening the loopback
+backend; after route selection, source and pre-routing capacity are released
+while active and relay permits remain held until copying ends. Production load
+qualification remains a later milestone, so these threaded bounds do not
+constitute a public-load support claim.
+
+Operator-only CIDR policy is configured with repeatable
+`--source-policy CIDR=RATE,BURST,PRE_ROUTING[,IPV6_PREFIX]` options. Longest
+prefix wins, normalized duplicates and unsafe IPv6 prefix relationships fail
+startup, and the override list is capped at 256. No ClientHello, SNI, header,
+or other client-provided protocol value can select a policy.
 
 `daemon` is preferable to a global `--daemon` option because it has its own
 lifecycle, configuration, status, and diagnostics. The IPv4 and IPv6 listeners
@@ -490,6 +499,11 @@ requires strict bounds. The implementation currently:
 - Limits ClientHello inspection to 64 KiB and a startup-validated 500-10000
   millisecond deadline (two seconds by default).
 - Gives discovery a 250 millisecond deadline.
+- Applies a token bucket and simultaneous pre-routing ceiling to exact IPv4
+  peers and configurable-prefix IPv6 peers before worker dispatch.
+- Keeps at most 4096 source entries by default, expires idle entries after 300
+  seconds, evicts the deterministic least-recent idle entry at capacity, and
+  rejects a new source if every retained entry is active.
 - Permits at most 64 waiting clients and 32 concurrent backend probes.
 - Probes at most 32 live candidate registrations per discovery.
 - Uses one single-flight operation per normalized hostname.
@@ -506,9 +520,7 @@ A wildcard certificate may validate a concrete hostname during lazy
 discovery, but the daemon caches only that observed hostname. It never creates
 an implicit wildcard route from the certificate.
 
-Per-source admission control and a bound on positive persisted routes remain
-possible hardening work if hostile local or public traffic makes the current
-global bounds insufficient.
+A bound on positive persisted routes remains separate hardening work.
 
 ## Failure behavior
 
@@ -531,13 +543,14 @@ global bounds insufficient.
 
 The daemon is implemented in Rust with OS threads and synchronized shared
 state. Accepted connections enter a fixed worker pool only after obtaining
-global and pre-routing admission permits. The one-slot user-space queue,
-active workers, relay copy threads, and certificate-probe threads all have
-hard bounds. Probe permits are acquired before their threads are created, and
-single-flight discovery prevents duplicate work for one SNI hostname. The
-implementation consists of:
+global, source, and pre-routing admission permits. Source state, the one-slot
+user-space queue, active workers, relay copy threads, and certificate-probe
+threads all have hard bounds. Probe permits are acquired before their threads
+are created, and single-flight discovery prevents duplicate work for one SNI
+hostname. The implementation consists of:
 
-- `admission.rs` for token-bucket and RAII connection-stage capacity.
+- `admission.rs` for global/source token buckets, bounded source state, and
+  RAII connection-stage capacity.
 - `worker_pool.rs` for fixed bounded connection execution.
 - `proxy.rs` for listeners, reconciliation, discovery, route health, control,
   handoff selection, and relay.

@@ -42,24 +42,32 @@ mod unix {
 
     impl Daemon {
         fn start(address: SocketAddr) -> Self {
+            Self::start_with_limits(address, 1, 1)
+        }
+
+        fn start_with_limits(
+            address: SocketAddr,
+            active_connections: usize,
+            pre_routing_connections: usize,
+        ) -> Self {
             let home = tempfile::tempdir().unwrap();
             let child = Command::new(env!("CARGO_BIN_EXE_phx-port"))
                 .args([
-                    "daemon",
-                    "--listen",
-                    &address.to_string(),
-                    "--active-connections",
-                    "1",
-                    "--pre-routing-connections",
-                    "1",
-                    "--relay-connections",
-                    "1",
-                    "--handoff-negotiations",
-                    "1",
-                    "--client-hello-timeout-ms",
-                    "10000",
-                    "--task-budget",
-                    "64",
+                    "daemon".to_string(),
+                    "--listen".to_string(),
+                    address.to_string(),
+                    "--active-connections".to_string(),
+                    active_connections.to_string(),
+                    "--pre-routing-connections".to_string(),
+                    pre_routing_connections.to_string(),
+                    "--relay-connections".to_string(),
+                    "1".to_string(),
+                    "--handoff-negotiations".to_string(),
+                    "1".to_string(),
+                    "--client-hello-timeout-ms".to_string(),
+                    "10000".to_string(),
+                    "--task-budget".to_string(),
+                    "128".to_string(),
                 ])
                 .env("HOME", home.path())
                 .env_remove("PHX_PORT_CONFIG")
@@ -185,6 +193,51 @@ mod unix {
         daemon.wait_for_count("active_connections", 1);
         daemon.wait_for_count("pre_routing_connections", 1);
         drop(recovered);
+        daemon.wait_for_count("active_connections", 0);
+        daemon.wait_for_count("pre_routing_connections", 0);
+    }
+
+    #[test]
+    fn source_pre_routing_limit_rejects_before_worker_and_recovers() {
+        let address = reserve_address();
+        let daemon = Daemon::start_with_limits(address, 32, 32);
+        let mut admitted = Vec::new();
+
+        for expected in 1..=16 {
+            admitted.push(TcpStream::connect(address).unwrap());
+            daemon.wait_for_count("active_connections", expected);
+            daemon.wait_for_count("pre_routing_connections", expected);
+        }
+
+        let mut rejected = TcpStream::connect(address).unwrap();
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        match rejected.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionAborted
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::BrokenPipe
+                ) => {}
+            result => panic!("seventeenth source connection was not rejected: {result:?}"),
+        }
+        daemon.wait_for_count("rejected_source_concurrency", 1);
+        daemon.wait_for_count("active_connections", 16);
+        daemon.wait_for_count("pre_routing_connections", 16);
+
+        drop(admitted.pop());
+        daemon.wait_for_count("active_connections", 15);
+        daemon.wait_for_count("pre_routing_connections", 15);
+
+        admitted.push(TcpStream::connect(address).unwrap());
+        daemon.wait_for_count("active_connections", 16);
+        daemon.wait_for_count("pre_routing_connections", 16);
+
+        drop(admitted);
         daemon.wait_for_count("active_connections", 0);
         daemon.wait_for_count("pre_routing_connections", 0);
     }

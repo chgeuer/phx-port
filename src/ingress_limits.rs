@@ -1,3 +1,6 @@
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::str::FromStr;
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -12,6 +15,10 @@ Usage: phx-port daemon [--listen ADDRESS]...
        [--active-connections N] [--pre-routing-connections N]
        [--relay-connections N] [--handoff-negotiations N]
        [--accepts-per-second N] [--accept-burst N]
+       [--source-accepts-per-second N] [--source-accept-burst N]
+       [--source-pre-routing-connections N] [--source-ipv6-prefix N]
+       [--source-table-capacity N] [--source-entry-ttl-seconds N]
+       [--source-policy CIDR=RATE,BURST,PRE_ROUTING[,IPV6_PREFIX]]...
        [--client-hello-timeout-ms N] [--task-budget N]";
 
 const MAX_THREADED_ACTIVE_CONNECTIONS: usize = 256;
@@ -22,6 +29,124 @@ const AUXILIARY_TASKS: usize = 4;
 const CONTROL_AND_STATE_FILE_DESCRIPTORS: usize = 8;
 const RELAY_ADDITIONAL_FILE_DESCRIPTORS: usize = 3;
 const FILE_DESCRIPTOR_RESERVE_PERCENT: u64 = 30;
+const DEFAULT_SOURCE_TABLE_CAPACITY: usize = 4_096;
+const DEFAULT_SOURCE_ENTRY_TTL_SECONDS: u64 = 300;
+const MAX_SOURCE_POLICY_OVERRIDES: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SourceCidr {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl SourceCidr {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        let (address, prefix) = value
+            .rsplit_once('/')
+            .ok_or_else(|| format!("source policy CIDR must include a prefix, got {value:?}"))?;
+        let address = IpAddr::from_str(address)
+            .map_err(|error| format!("invalid source policy address {address:?}: {error}"))?;
+        let prefix = prefix
+            .parse::<u8>()
+            .map_err(|_| format!("invalid source policy prefix {prefix:?}"))?;
+        let maximum = if address.is_ipv4() { 32 } else { 128 };
+        if prefix > maximum {
+            return Err(format!(
+                "source policy prefix for {address} must be between 0 and {maximum}, got {prefix}"
+            ));
+        }
+
+        let network = match address {
+            IpAddr::V4(address) => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
+                IpAddr::V4(Ipv4Addr::from(u32::from(address) & mask))
+            }
+            IpAddr::V6(address) => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
+                IpAddr::V6(Ipv6Addr::from(u128::from(address) & mask))
+            }
+        };
+        Ok(Self { network, prefix })
+    }
+
+    pub(crate) fn contains(self, address: IpAddr) -> bool {
+        match (self.network, address) {
+            (IpAddr::V4(network), IpAddr::V4(address)) => {
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - self.prefix)
+                };
+                u32::from(address) & mask == u32::from(network)
+            }
+            (IpAddr::V6(network), IpAddr::V6(address)) => {
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - self.prefix)
+                };
+                u128::from(address) & mask == u128::from(network)
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn prefix(self) -> u8 {
+        self.prefix
+    }
+
+    pub(crate) fn is_ipv6(self) -> bool {
+        self.network.is_ipv6()
+    }
+}
+
+impl fmt::Display for SourceCidr {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.network, self.prefix)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceLimitOverride {
+    pub cidr: SourceCidr,
+    pub accepts_per_second: usize,
+    pub accept_burst: usize,
+    pub pre_routing_connections: usize,
+    pub ipv6_prefix: Option<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceLimits {
+    pub accepts_per_second: usize,
+    pub accept_burst: usize,
+    pub pre_routing_connections: usize,
+    pub ipv6_prefix: u8,
+    pub table_capacity: usize,
+    pub entry_ttl_seconds: u64,
+    pub overrides: Vec<SourceLimitOverride>,
+}
+
+impl Default for SourceLimits {
+    fn default() -> Self {
+        Self {
+            accepts_per_second: 20,
+            accept_burst: 40,
+            pre_routing_connections: 16,
+            ipv6_prefix: 64,
+            table_capacity: DEFAULT_SOURCE_TABLE_CAPACITY,
+            entry_ttl_seconds: DEFAULT_SOURCE_ENTRY_TTL_SECONDS,
+            overrides: Vec::new(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IngressLimits {
@@ -32,6 +157,7 @@ pub struct IngressLimits {
     pub accepts_per_second: usize,
     pub accept_burst: usize,
     pub client_hello_timeout_ms: u64,
+    pub source: SourceLimits,
 }
 
 impl Default for IngressLimits {
@@ -44,6 +170,7 @@ impl Default for IngressLimits {
             accepts_per_second: 200,
             accept_burst: 400,
             client_hello_timeout_ms: 2_000,
+            source: SourceLimits::default(),
         }
     }
 }
@@ -87,6 +214,29 @@ impl DaemonConfig {
                 "--accept-burst" => {
                     limits.accept_burst = parse_usize(value, "accept_burst")?;
                 }
+                "--source-accepts-per-second" => {
+                    limits.source.accepts_per_second =
+                        parse_usize(value, "source_accepts_per_second")?;
+                }
+                "--source-accept-burst" => {
+                    limits.source.accept_burst = parse_usize(value, "source_accept_burst")?;
+                }
+                "--source-pre-routing-connections" => {
+                    limits.source.pre_routing_connections =
+                        parse_usize(value, "source_pre_routing_connections")?;
+                }
+                "--source-ipv6-prefix" => {
+                    limits.source.ipv6_prefix = parse_u8(value, "source_ipv6_prefix")?;
+                }
+                "--source-table-capacity" => {
+                    limits.source.table_capacity = parse_usize(value, "source_table_capacity")?;
+                }
+                "--source-entry-ttl-seconds" => {
+                    limits.source.entry_ttl_seconds = parse_u64(value, "source_entry_ttl_seconds")?;
+                }
+                "--source-policy" => {
+                    limits.source.overrides.push(parse_source_policy(value)?);
+                }
                 "--client-hello-timeout-ms" => {
                     limits.client_hello_timeout_ms = parse_u64(value, "client_hello_timeout_ms")?;
                 }
@@ -120,6 +270,43 @@ fn parse_u64(value: &str, field: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|_| format!("{field} must be a non-negative integer, got {value:?}"))
+}
+
+fn parse_u8(value: &str, field: &str) -> Result<u8, String> {
+    value
+        .parse::<u8>()
+        .map_err(|_| format!("{field} must be an integer from 0 through 255, got {value:?}"))
+}
+
+fn parse_source_policy(value: &str) -> Result<SourceLimitOverride, String> {
+    let (cidr, policy) = value.split_once('=').ok_or_else(|| {
+        format!("--source-policy must use CIDR=RATE,BURST,PRE_ROUTING[,IPV6_PREFIX], got {value:?}")
+    })?;
+    let fields = policy.split(',').map(str::trim).collect::<Vec<_>>();
+    if !(3..=4).contains(&fields.len()) {
+        return Err(format!(
+            "--source-policy must use CIDR=RATE,BURST,PRE_ROUTING[,IPV6_PREFIX], got {value:?}"
+        ));
+    }
+
+    let cidr = SourceCidr::parse(cidr.trim())?;
+    let ipv6_prefix = fields
+        .get(3)
+        .map(|value| parse_u8(value, "source policy ipv6_prefix"))
+        .transpose()?;
+    if ipv6_prefix.is_some() && !cidr.is_ipv6() {
+        return Err(format!(
+            "source policy {cidr} cannot set an IPv6 bucket prefix"
+        ));
+    }
+
+    Ok(SourceLimitOverride {
+        cidr,
+        accepts_per_second: parse_usize(fields[0], "source policy accepts_per_second")?,
+        accept_burst: parse_usize(fields[1], "source policy accept_burst")?,
+        pre_routing_connections: parse_usize(fields[2], "source policy pre_routing_connections")?,
+        ipv6_prefix,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +378,10 @@ impl ValidatedIngressLimits {
     pub fn client_hello_timeout(&self) -> Duration {
         Duration::from_millis(self.limits.client_hello_timeout_ms)
     }
+
+    pub(crate) fn source(&self) -> &SourceLimits {
+        &self.limits.source
+    }
 }
 
 impl IngressLimits {
@@ -229,9 +420,69 @@ impl IngressLimits {
             ("handoff_negotiations", self.handoff_negotiations),
             ("accepts_per_second", self.accepts_per_second),
             ("accept_burst", self.accept_burst),
+            ("source_accepts_per_second", self.source.accepts_per_second),
+            ("source_accept_burst", self.source.accept_burst),
+            (
+                "source_pre_routing_connections",
+                self.source.pre_routing_connections,
+            ),
+            ("source_table_capacity", self.source.table_capacity),
         ] {
             if value == 0 {
                 return Err(format!("{field} must be greater than zero"));
+            }
+        }
+        if self.source.entry_ttl_seconds == 0 {
+            return Err("source_entry_ttl_seconds must be greater than zero".to_string());
+        }
+        if self.source.ipv6_prefix > 128 {
+            return Err(format!(
+                "source_ipv6_prefix must be between 0 and 128, got {}",
+                self.source.ipv6_prefix
+            ));
+        }
+        if self.source.overrides.len() > MAX_SOURCE_POLICY_OVERRIDES {
+            return Err(format!(
+                "source policy override count must not exceed {MAX_SOURCE_POLICY_OVERRIDES}, got {}",
+                self.source.overrides.len()
+            ));
+        }
+        let mut source_cidrs = std::collections::BTreeSet::new();
+        for policy in &self.source.overrides {
+            for (field, value) in [
+                (
+                    "source policy accepts_per_second",
+                    policy.accepts_per_second,
+                ),
+                ("source policy accept_burst", policy.accept_burst),
+                (
+                    "source policy pre_routing_connections",
+                    policy.pre_routing_connections,
+                ),
+            ] {
+                if value == 0 {
+                    return Err(format!("{field} must be greater than zero"));
+                }
+            }
+            if !source_cidrs.insert(policy.cidr) {
+                return Err(format!("duplicate source policy CIDR {}", policy.cidr));
+            }
+            if let Some(prefix) = policy.ipv6_prefix {
+                if prefix > 128 {
+                    return Err(format!(
+                        "IPv6 bucket prefix for source policy {} must be between 0 and 128, got \
+                         {prefix}",
+                        policy.cidr
+                    ));
+                }
+                if prefix < policy.cidr.prefix() {
+                    return Err(format!(
+                        "IPv6 bucket prefix {prefix} for source policy {} must be at least its \
+                         CIDR prefix {}",
+                        policy.cidr,
+                        policy.cidr.prefix()
+                    ));
+                }
             }
         }
         if self.client_hello_timeout_ms == 0 {
@@ -568,8 +819,8 @@ fn detect_system_task_budget() -> Result<Option<u64>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonConfig, IngressLimits, SystemCapacity, minimum_limit_with_reserve,
-        percentage_rounded_up,
+        DaemonConfig, IngressLimits, SourceCidr, SourceLimitOverride, SourceLimits, SystemCapacity,
+        minimum_limit_with_reserve, percentage_rounded_up,
     };
     #[cfg(target_os = "linux")]
     use super::{effective_task_budget, task_cgroup};
@@ -585,6 +836,12 @@ mod tests {
     fn threaded_defaults_are_valid_and_capped_at_256() {
         let limits = IngressLimits::default();
         assert_eq!(limits.active_connections, 256);
+        assert_eq!(limits.source.accepts_per_second, 20);
+        assert_eq!(limits.source.accept_burst, 40);
+        assert_eq!(limits.source.pre_routing_connections, 16);
+        assert_eq!(limits.source.ipv6_prefix, 64);
+        assert_eq!(limits.source.table_capacity, 4_096);
+        assert_eq!(limits.source.entry_ttl_seconds, 300);
         assert_eq!(
             limits
                 .clone()
@@ -604,6 +861,10 @@ mod tests {
             "handoff_negotiations",
             "accepts_per_second",
             "accept_burst",
+            "source_accepts_per_second",
+            "source_accept_burst",
+            "source_pre_routing_connections",
+            "source_table_capacity",
         ] {
             let mut limits = IngressLimits::default();
             match field {
@@ -613,6 +874,12 @@ mod tests {
                 "handoff_negotiations" => limits.handoff_negotiations = 0,
                 "accepts_per_second" => limits.accepts_per_second = 0,
                 "accept_burst" => limits.accept_burst = 0,
+                "source_accepts_per_second" => limits.source.accepts_per_second = 0,
+                "source_accept_burst" => limits.source.accept_burst = 0,
+                "source_pre_routing_connections" => {
+                    limits.source.pre_routing_connections = 0;
+                }
+                "source_table_capacity" => limits.source.table_capacity = 0,
                 _ => unreachable!(),
             }
             let error = limits.validate(capacity(2_048, 1_024), 2).unwrap_err();
@@ -632,6 +899,70 @@ mod tests {
                 .unwrap_err()
                 .contains("client_hello_timeout_ms")
         );
+
+        let mut limits = IngressLimits::default();
+        limits.source.entry_ttl_seconds = 0;
+        assert!(
+            limits
+                .validate(capacity(2_048, 1_024), 2)
+                .unwrap_err()
+                .contains("source_entry_ttl_seconds")
+        );
+    }
+
+    #[test]
+    fn source_prefix_and_cidr_policies_fail_closed_when_invalid() {
+        let args = ["--source-ipv6-prefix", "129"].map(str::to_string);
+        let error = DaemonConfig::parse(&args)
+            .unwrap()
+            .limits
+            .validate(capacity(2_048, 1_024), 2)
+            .unwrap_err();
+        assert!(error.contains("source_ipv6_prefix"), "{error}");
+
+        let args = [
+            "--source-policy",
+            "10.0.0.1/8=20,40,16",
+            "--source-policy",
+            "10.0.0.0/8=40,80,32",
+        ]
+        .map(str::to_string);
+        let error = DaemonConfig::parse(&args)
+            .unwrap()
+            .limits
+            .validate(capacity(2_048, 1_024), 2)
+            .unwrap_err();
+        assert!(error.contains("duplicate source policy CIDR 10.0.0.0/8"));
+
+        let args = ["--source-policy", "2001:db8::/48=20,40,16,32"].map(str::to_string);
+        let error = DaemonConfig::parse(&args)
+            .unwrap()
+            .limits
+            .validate(capacity(2_048, 1_024), 2)
+            .unwrap_err();
+        assert!(
+            error.contains("must be at least its CIDR prefix"),
+            "{error}"
+        );
+
+        let args = ["--source-policy", "192.0.2.0/24=20,40,16,64"].map(str::to_string);
+        let error = DaemonConfig::parse(&args).unwrap_err();
+        assert!(
+            error.contains("cannot set an IPv6 bucket prefix"),
+            "{error}"
+        );
+
+        let policy = SourceLimitOverride {
+            cidr: SourceCidr::parse("192.0.2.0/24").unwrap(),
+            accepts_per_second: 20,
+            accept_burst: 40,
+            pre_routing_connections: 16,
+            ipv6_prefix: None,
+        };
+        let mut limits = IngressLimits::default();
+        limits.source.overrides = vec![policy; 257];
+        let error = limits.validate(capacity(2_048, 1_024), 2).unwrap_err();
+        assert!(error.contains("must not exceed 256"), "{error}");
     }
 
     #[test]
@@ -732,6 +1063,22 @@ mod tests {
             "150",
             "--accept-burst",
             "300",
+            "--source-accepts-per-second",
+            "25",
+            "--source-accept-burst",
+            "50",
+            "--source-pre-routing-connections",
+            "20",
+            "--source-ipv6-prefix",
+            "56",
+            "--source-table-capacity",
+            "8192",
+            "--source-entry-ttl-seconds",
+            "600",
+            "--source-policy",
+            "192.0.2.0/24=100,200,40",
+            "--source-policy",
+            "2001:db8::/32=50,100,30,48",
             "--client-hello-timeout-ms",
             "1500",
             "--task-budget",
@@ -741,18 +1088,40 @@ mod tests {
 
         let config = DaemonConfig::parse(&args).unwrap();
         assert_eq!(config.listen_addresses, ["127.0.0.1:8443"]);
-        assert_eq!(
-            config.limits,
-            IngressLimits {
-                active_connections: 200,
-                pre_routing_connections: 100,
-                relay_connections: 75,
-                handoff_negotiations: 50,
-                accepts_per_second: 150,
-                accept_burst: 300,
-                client_hello_timeout_ms: 1_500,
-            }
-        );
+        let expected = IngressLimits {
+            active_connections: 200,
+            pre_routing_connections: 100,
+            relay_connections: 75,
+            handoff_negotiations: 50,
+            accepts_per_second: 150,
+            accept_burst: 300,
+            client_hello_timeout_ms: 1_500,
+            source: SourceLimits {
+                accepts_per_second: 25,
+                accept_burst: 50,
+                pre_routing_connections: 20,
+                ipv6_prefix: 56,
+                table_capacity: 8_192,
+                entry_ttl_seconds: 600,
+                overrides: vec![
+                    SourceLimitOverride {
+                        cidr: SourceCidr::parse("192.0.2.0/24").unwrap(),
+                        accepts_per_second: 100,
+                        accept_burst: 200,
+                        pre_routing_connections: 40,
+                        ipv6_prefix: None,
+                    },
+                    SourceLimitOverride {
+                        cidr: SourceCidr::parse("2001:db8::/32").unwrap(),
+                        accepts_per_second: 50,
+                        accept_burst: 100,
+                        pre_routing_connections: 30,
+                        ipv6_prefix: Some(48),
+                    },
+                ],
+            },
+        };
+        assert_eq!(config.limits, expected);
         assert_eq!(config.task_budget, Some(600));
     }
 
