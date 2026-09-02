@@ -1769,9 +1769,7 @@ mod tests {
         AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr,
         accept, bind, listen, recv, recvmsg, send, socket,
     };
-    use rcgen::{
-        CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_RSA_SHA256,
-    };
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_RSA_SHA256};
     use std::fs;
     #[cfg(target_os = "linux")]
     use std::io::IoSliceMut;
@@ -1823,10 +1821,6 @@ mod tests {
             certificate_params.not_before = (now - Duration::from_secs(24 * 60 * 60)).into();
             certificate_params.not_after = (now + Duration::from_secs(30 * 24 * 60 * 60)).into();
             certificate_params.is_ca = IsCa::ExplicitNoCa;
-            certificate_params.key_usages = vec![
-                KeyUsagePurpose::DigitalSignature,
-                KeyUsagePurpose::KeyEncipherment,
-            ];
             certificate_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
             certificate_params
         }
