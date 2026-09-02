@@ -24,6 +24,7 @@ mod port_registry;
 mod privilege;
 mod production_paths;
 mod proxy;
+mod relay;
 mod route_cache;
 mod systemd_service;
 mod tls_client_hello;

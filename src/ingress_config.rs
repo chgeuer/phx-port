@@ -8,11 +8,12 @@ use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Table};
 
 const INGRESS_CONFIG_ENV: &str = "PHX_PORT_INGRESS_CONFIG";
 pub(crate) const MAX_ROUTE_DECLARATIONS: usize = 1_000;
+pub(crate) const DEFAULT_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_INGRESS_LISTENERS: usize = 2;
 const MAX_SOURCE_DIAGNOSTIC_DURATION_SECONDS: u64 = 60 * 60;
 
@@ -39,6 +40,7 @@ pub struct RouteDeclaration {
     pub workload: String,
     pub role: String,
     pub required: bool,
+    pub relay_idle_timeout: Option<Duration>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -253,7 +255,10 @@ impl HostingProfile {
                 )
             })?;
             for (key, _) in declaration {
-                if !matches!(key, "workload" | "role" | "required") {
+                if !matches!(
+                    key,
+                    "workload" | "role" | "required" | "relay_idle_timeout_seconds"
+                ) {
                     return Err(format!(
                         "ingress config {} Route Declaration {configured_hostname:?} contains unknown key {key:?}",
                         path.display()
@@ -301,6 +306,38 @@ impl HostingProfile {
                 })?,
                 None => false,
             };
+            let relay_idle_timeout = match declaration.get("relay_idle_timeout_seconds") {
+                None => Some(DEFAULT_RELAY_IDLE_TIMEOUT),
+                configured => {
+                    let seconds = Self::parse_nonnegative_u64(
+                        configured,
+                        &path,
+                        &format!(
+                            "Route Declaration {configured_hostname:?} relay_idle_timeout_seconds"
+                        ),
+                    )?;
+                    if seconds == 0 {
+                        None
+                    } else if seconds < DEFAULT_RELAY_IDLE_TIMEOUT.as_secs() {
+                        return Err(format!(
+                            "ingress config {} Route Declaration {configured_hostname:?} \
+                             relay_idle_timeout_seconds must be 0 to disable or at least {}",
+                            path.display(),
+                            DEFAULT_RELAY_IDLE_TIMEOUT.as_secs()
+                        ));
+                    } else {
+                        let timeout = Duration::from_secs(seconds);
+                        if Instant::now().checked_add(timeout).is_none() {
+                            return Err(format!(
+                                "ingress config {} Route Declaration {configured_hostname:?} \
+                                 relay_idle_timeout_seconds is too large for the monotonic timer",
+                                path.display()
+                            ));
+                        }
+                        Some(timeout)
+                    }
+                }
+            };
 
             routes.insert(
                 hostname.clone(),
@@ -309,6 +346,7 @@ impl HostingProfile {
                     workload,
                     role,
                     required,
+                    relay_idle_timeout,
                 },
             );
         }
@@ -561,8 +599,8 @@ impl HostingProfile {
 #[cfg(test)]
 mod tests {
     use super::{
-        HostingProfile, MAX_ROUTE_DECLARATIONS, MAX_SOURCE_DIAGNOSTIC_DURATION_SECONDS,
-        PublicIngressSnapshot, RouteDeclaration,
+        DEFAULT_RELAY_IDLE_TIMEOUT, HostingProfile, MAX_ROUTE_DECLARATIONS,
+        MAX_SOURCE_DIAGNOSTIC_DURATION_SECONDS, PublicIngressSnapshot, RouteDeclaration,
     };
     use crate::production_paths::IntentOwner;
     use std::collections::BTreeMap;
@@ -570,7 +608,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempfile::{TempDir, tempdir_in};
 
     fn tempdir() -> std::io::Result<TempDir> {
@@ -599,6 +637,7 @@ mod tests {
             workload: workload.to_string(),
             role: "https".to_string(),
             required,
+            relay_idle_timeout: Some(DEFAULT_RELAY_IDLE_TIMEOUT),
         }
     }
 
@@ -694,6 +733,41 @@ mod tests {
         assert_eq!(snapshot.routes.len(), 2);
         assert!(snapshot.routes["www.example.com"].required);
         assert!(!snapshot.routes["api.example.com"].required);
+    }
+
+    #[test]
+    fn public_routes_support_default_override_and_disabled_relay_idle_policy() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("ingress.toml");
+        fs::write(
+            &config,
+            "[ingress]\nmode = \"public\"\n\
+             [ingress.hosts.\"default.example.com\"]\n\
+             workload = \"default-web\"\nrole = \"https\"\n\
+             [ingress.hosts.\"extended.example.com\"]\n\
+             workload = \"extended-web\"\nrole = \"https\"\n\
+             relay_idle_timeout_seconds = 3600\n\
+             [ingress.hosts.\"disabled.example.com\"]\n\
+             workload = \"disabled-web\"\nrole = \"https\"\n\
+             relay_idle_timeout_seconds = 0\n",
+        )
+        .unwrap();
+
+        let profile =
+            HostingProfile::load_with_env(Some(config), None, IntentOwner::EffectiveUser).unwrap();
+        let routes = profile.public_snapshot().unwrap();
+        assert_eq!(
+            routes.routes["default.example.com"].relay_idle_timeout,
+            Some(DEFAULT_RELAY_IDLE_TIMEOUT)
+        );
+        assert_eq!(
+            routes.routes["extended.example.com"].relay_idle_timeout,
+            Some(Duration::from_secs(3600))
+        );
+        assert_eq!(
+            routes.routes["disabled.example.com"].relay_idle_timeout,
+            None
+        );
     }
 
     #[test]
@@ -1023,9 +1097,37 @@ mod tests {
         )
         .unwrap();
         assert!(
-            HostingProfile::load_with_env(Some(config), None, IntentOwner::EffectiveUser)
+            HostingProfile::load_with_env(Some(config.clone()), None, IntentOwner::EffectiveUser,)
                 .unwrap_err()
                 .contains("required must be a boolean")
+        );
+
+        fs::write(
+            &config,
+            "[ingress]\nmode = \"public\"\n\
+             [ingress.hosts.\"www.example.com\"]\n\
+             workload = \"contoso-web\"\nrole = \"https\"\n\
+             relay_idle_timeout_seconds = -1\n",
+        )
+        .unwrap();
+        assert!(
+            HostingProfile::load_with_env(Some(config.clone()), None, IntentOwner::EffectiveUser,)
+                .unwrap_err()
+                .contains("relay_idle_timeout_seconds must be nonnegative")
+        );
+
+        fs::write(
+            &config,
+            "[ingress]\nmode = \"public\"\n\
+             [ingress.hosts.\"www.example.com\"]\n\
+             workload = \"contoso-web\"\nrole = \"https\"\n\
+             relay_idle_timeout_seconds = 1799\n",
+        )
+        .unwrap();
+        assert!(
+            HostingProfile::load_with_env(Some(config), None, IntentOwner::EffectiveUser)
+                .unwrap_err()
+                .contains("must be 0 to disable or at least 1800")
         );
     }
 

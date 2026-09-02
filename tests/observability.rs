@@ -226,6 +226,11 @@ fn metrics_listener_is_bounded_read_only_and_uses_only_declared_labels() {
     assert!(body.contains("phx_port_admission_limit{stage=\"active\"} 4"));
     assert!(body.contains("phx_port_handoffs_total{outcome=\"success\"} 0"));
     assert!(body.contains("phx_port_relays_total{outcome=\"started\"} 0"));
+    assert!(body.contains("phx_port_relay_bytes_total{direction=\"client_to_workload\"} 0"));
+    assert!(body.contains("phx_port_relay_bytes_total{direction=\"workload_to_client\"} 0"));
+    assert!(body.contains("phx_port_relay_duration_seconds_total 0.000000000"));
+    assert!(body.contains("phx_port_relay_idle_timeouts_total 0"));
+    assert!(body.contains("phx_port_relay_backend_connect_failures_total 0"));
     assert!(body.contains("phx_port_config_reloads_total{outcome=\"rejected\"} 0"));
     assert!(
         body.contains(

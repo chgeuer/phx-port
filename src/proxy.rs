@@ -5,7 +5,8 @@ use crate::{
     admission::{AdmissionController, AdmissionRejection, PreRoutingAdmission, RelayPermit},
     config_path, handoff,
     ingress_config::{
-        HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot, RouteDeclaration,
+        DEFAULT_RELAY_IDLE_TIMEOUT, HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot,
+        RouteDeclaration,
     },
     ingress_limits::{
         CERTIFICATE_PROBE_WORKERS, DaemonConfig, ROUTE_SELECTION_WORKERS, TOKIO_RUNTIME_WORKERS,
@@ -13,7 +14,7 @@ use crate::{
     },
     is_port_open, observability, port_registry, privilege,
     production_paths::{IntentOwner, ProductionPaths},
-    read_config, route_cache, tls_client_hello,
+    read_config, relay, route_cache, tls_client_hello,
     worker_pool::BoundedWorkerPool,
 };
 use native_tls::TlsConnector;
@@ -40,6 +41,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt}
 use std::os::unix::net::{UnixListener, UnixStream};
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(250);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROBES: usize = CERTIFICATE_PROBE_WORKERS;
 const MAX_WAITING_CLIENTS: usize = 64;
 const MAX_NEGATIVE_ROUTES: usize = 1024;
@@ -64,6 +66,12 @@ const CONTROL_REQUEST_LIMIT: u64 = 1024;
 const CONTROL_RESPONSE_LIMIT: u64 = 64 * 1024;
 const CONTROL_SCHEMA_VERSION: u32 = 1;
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+fn saturating_atomic_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct Backend {
@@ -414,6 +422,11 @@ struct ProxyState {
     delivered_handoff_failures: AtomicU64,
     completed_relays: AtomicU64,
     failed_relays: AtomicU64,
+    relay_idle_timeouts: AtomicU64,
+    relay_backend_connect_failures: AtomicU64,
+    relay_client_to_workload_bytes: AtomicU64,
+    relay_workload_to_client_bytes: AtomicU64,
+    relay_duration_nanoseconds: AtomicU64,
 }
 
 impl ProxyState {
@@ -476,6 +489,11 @@ impl ProxyState {
             delivered_handoff_failures: AtomicU64::new(0),
             completed_relays: AtomicU64::new(0),
             failed_relays: AtomicU64::new(0),
+            relay_idle_timeouts: AtomicU64::new(0),
+            relay_backend_connect_failures: AtomicU64::new(0),
+            relay_client_to_workload_bytes: AtomicU64::new(0),
+            relay_workload_to_client_bytes: AtomicU64::new(0),
+            relay_duration_nanoseconds: AtomicU64::new(0),
         }
     }
 
@@ -488,6 +506,18 @@ impl ProxyState {
 
     fn public_snapshot(&self) -> Option<Arc<PublicIngressSnapshot>> {
         self.hosting_profile().public_snapshot()
+    }
+
+    fn relay_idle_timeout(&self, hostname: &str) -> Option<Duration> {
+        match self.public_snapshot() {
+            Some(snapshot) => snapshot
+                .routes
+                .get(hostname)
+                .map_or(Some(DEFAULT_RELAY_IDLE_TIMEOUT), |route| {
+                    route.relay_idle_timeout
+                }),
+            None => None,
+        }
     }
 
     fn route_cache(&self) -> Option<(&Path, route_cache::Storage)> {
@@ -714,6 +744,24 @@ impl ProxyState {
             .map(|count| DeliveryEvent { outcome, count })
     }
 
+    fn record_relay_report(&self, report: &relay::RelayReport) {
+        saturating_atomic_add(
+            &self.relay_client_to_workload_bytes,
+            report.client_to_workload_bytes,
+        );
+        saturating_atomic_add(
+            &self.relay_workload_to_client_bytes,
+            report.workload_to_client_bytes,
+        );
+        let elapsed = report
+            .elapsed
+            .as_nanos()
+            .min(u128::from(u64::MAX))
+            .try_into()
+            .unwrap_or(u64::MAX);
+        saturating_atomic_add(&self.relay_duration_nanoseconds, elapsed);
+    }
+
     fn record_source_diagnostic(&self, source: IpAddr, hostname: &str) {
         let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
             return;
@@ -831,6 +879,12 @@ struct TokioIngress {
 }
 
 struct ConnectionJob {
+    handoff: HandoffJob,
+    queued: QueuedConnection,
+    result: oneshot::Sender<Result<Option<RelayJob>, String>>,
+}
+
+struct HandoffJob {
     client: TcpStream,
     accepted_at: Instant,
     admission: PreRoutingAdmission,
@@ -838,7 +892,16 @@ struct ConnectionJob {
     peeked_length: usize,
     backend: Backend,
     cached: bool,
-    queued: QueuedConnection,
+    relay_idle_timeout: Option<Duration>,
+}
+
+struct RelayJob {
+    client: TcpStream,
+    admission: PreRoutingAdmission,
+    hostname: String,
+    backend: Backend,
+    cached: bool,
+    idle_timeout: Option<Duration>,
 }
 
 fn same_route_target(left: &RouteDeclaration, right: &RouteDeclaration) -> bool {
@@ -1136,16 +1199,10 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
 
     let worker_state = Arc::clone(&state);
     let mut connection_workers = BoundedWorkerPool::start(
-        "phx-port-connection",
-        state.limits.delivery_workers(),
+        "phx-port-handoff",
+        state.limits.handoff_workers(),
         CONNECTION_QUEUE_CAPACITY,
-        move |job: ConnectionJob| {
-            if handle_routed_connection(job, Arc::clone(&worker_state)).is_err() {
-                worker_state
-                    .rejected_connections
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        },
+        move |job: ConnectionJob| handle_routed_connection(job, Arc::clone(&worker_state)),
     )?;
 
     let route_state = Arc::clone(&state);
@@ -1210,7 +1267,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         let _ = metrics_thread.join();
     }
 
-    // Pre-routing tasks and their permits are gone before the delivery drain begins.
+    // Tokio-owned routing and relay work is cancelled before the bounded handoff pool drains.
     let drain_deadline = Instant::now() + shutdown_drain_timeout;
     while state.admission.snapshot().global.in_use > 0 && Instant::now() < drain_deadline {
         thread::sleep(Duration::from_millis(50));
@@ -1316,14 +1373,14 @@ async fn accept_tokio_connections(
     let mut accept_error_reported = false;
 
     while !shutdown.load(Ordering::Acquire) {
-        reap_ready_pre_routing_tasks(&mut connections, &state, &mut failure);
+        reap_ready_connection_tasks(&mut connections, &state, &mut failure);
         if failure.is_some() {
             shutdown.store(true, Ordering::Release);
             break;
         }
         tokio::select! {
             Some(joined) = connections.join_next(), if !connections.is_empty() => {
-                record_pre_routing_completion(joined, &state, &mut failure);
+                record_connection_completion(joined, &state, &mut failure);
                 if failure.is_some() {
                     shutdown.store(true, Ordering::Release);
                     break;
@@ -1378,13 +1435,13 @@ async fn accept_tokio_connections(
 
     connections.abort_all();
     while let Some(joined) = connections.join_next().await {
-        record_pre_routing_completion(joined, &state, &mut failure);
+        record_connection_completion(joined, &state, &mut failure);
     }
 
     failure.map_or(Ok(()), Err)
 }
 
-fn reap_ready_pre_routing_tasks(
+fn reap_ready_connection_tasks(
     connections: &mut JoinSet<Result<(), String>>,
     state: &ProxyState,
     failure: &mut Option<String>,
@@ -1392,12 +1449,12 @@ fn reap_ready_pre_routing_tasks(
     let mut reaped = 0;
     while let Some(joined) = connections.try_join_next() {
         reaped += 1;
-        record_pre_routing_completion(joined, state, failure);
+        record_connection_completion(joined, state, failure);
     }
     reaped
 }
 
-fn record_pre_routing_completion(
+fn record_connection_completion(
     joined: Result<Result<(), String>, tokio::task::JoinError>,
     state: &ProxyState,
     failure: &mut Option<String>,
@@ -1409,7 +1466,7 @@ fn record_pre_routing_completion(
         }
         Err(error) if error.is_cancelled() => {}
         Err(error) if failure.is_none() => {
-            *failure = Some(format!("Tokio pre-routing task failed: {error}"));
+            *failure = Some(format!("Tokio connection task failed: {error}"));
         }
         Err(_) => {}
     }
@@ -1435,32 +1492,46 @@ async fn route_tokio_connection(
     state.record_source_diagnostic(source, &hostname);
 
     let (backend, cached) = select_tokio_route(&hostname, &ingress).await?;
+    let relay_idle_timeout = state.relay_idle_timeout(&hostname);
     let client = client
         .into_std()
         .map_err(|error| format!("cannot release accepted socket from Tokio: {error}"))?;
+    let (result, completed) = oneshot::channel();
     let job = ConnectionJob {
-        client,
-        accepted_at,
-        admission,
-        hostname,
-        peeked_length,
-        backend,
-        cached,
+        handoff: HandoffJob {
+            client,
+            accepted_at,
+            admission,
+            hostname,
+            peeked_length,
+            backend,
+            cached,
+            relay_idle_timeout,
+        },
         queued: QueuedConnection::new(Arc::clone(&state.queued_connections)),
+        result,
     };
 
     match ingress.connection_sender.try_send(job) {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(mpsc::TrySendError::Full(_)) => {
             state.record_admission_rejection(AdmissionRejection::WorkerQueue);
-            Err("connection delivery queue capacity exhausted".to_string())
+            return Err("connection delivery queue capacity exhausted".to_string());
         }
         Err(mpsc::TrySendError::Disconnected(_)) => {
             if !ingress.shutdown.swap(true, Ordering::AcqRel) {
                 eprintln!("TLS proxy connection worker pool stopped");
             }
-            Err("connection delivery worker pool stopped".to_string())
+            return Err("connection delivery worker pool stopped".to_string());
         }
+    };
+
+    match completed
+        .await
+        .map_err(|_| "connection delivery worker dropped its result".to_string())??
+    {
+        None => Ok(()),
+        Some(job) => relay_tokio_connection(job, &ingress).await,
     }
 }
 
@@ -2209,6 +2280,11 @@ struct ControlCounterStatus {
     relayed_connections: u64,
     completed_relays: u64,
     failed_relays: u64,
+    relay_idle_timeouts: u64,
+    relay_backend_connect_failures: u64,
+    relay_client_to_workload_bytes: u64,
+    relay_workload_to_client_bytes: u64,
+    relay_duration_nanoseconds: u64,
     rejected_connections: u64,
     rejected_accept_rate: u64,
     rejected_global_capacity: u64,
@@ -2403,7 +2479,7 @@ fn render_json_control_status(state: &ProxyState) -> String {
             route_selection_workers: ROUTE_SELECTION_WORKERS,
             queued_connections: state.queued_connections.load(Ordering::Relaxed),
             connection_queue_limit: CONNECTION_QUEUE_CAPACITY,
-            connection_workers: state.limits.delivery_workers(),
+            connection_workers: state.limits.handoff_workers(),
             waiting_clients: state.waiting_clients.load(Ordering::Relaxed),
             inflight_discoveries: discoveries,
             active_probes: probes,
@@ -2413,6 +2489,17 @@ fn render_json_control_status(state: &ProxyState) -> String {
             relayed_connections: state.relayed_connections.load(Ordering::Relaxed),
             completed_relays: state.completed_relays.load(Ordering::Relaxed),
             failed_relays: state.failed_relays.load(Ordering::Relaxed),
+            relay_idle_timeouts: state.relay_idle_timeouts.load(Ordering::Relaxed),
+            relay_backend_connect_failures: state
+                .relay_backend_connect_failures
+                .load(Ordering::Relaxed),
+            relay_client_to_workload_bytes: state
+                .relay_client_to_workload_bytes
+                .load(Ordering::Relaxed),
+            relay_workload_to_client_bytes: state
+                .relay_workload_to_client_bytes
+                .load(Ordering::Relaxed),
+            relay_duration_nanoseconds: state.relay_duration_nanoseconds.load(Ordering::Relaxed),
             rejected_connections: state.rejected_connections.load(Ordering::Relaxed),
             rejected_accept_rate: state.rejected_accept_rate.load(Ordering::Relaxed),
             rejected_global_capacity: state.rejected_global_capacity.load(Ordering::Relaxed),
@@ -2591,6 +2678,32 @@ fn render_prometheus_metrics(state: &ProxyState) -> String {
     ] {
         metric!("phx_port_relays_total{{outcome=\"{outcome}\"}} {value}");
     }
+    for (direction, value) in [
+        (
+            "client_to_workload",
+            state.relay_client_to_workload_bytes.load(Ordering::Relaxed),
+        ),
+        (
+            "workload_to_client",
+            state.relay_workload_to_client_bytes.load(Ordering::Relaxed),
+        ),
+    ] {
+        metric!("phx_port_relay_bytes_total{{direction=\"{direction}\"}} {value}");
+    }
+    let relay_duration_nanoseconds = state.relay_duration_nanoseconds.load(Ordering::Relaxed);
+    metric!(
+        "phx_port_relay_duration_seconds_total {}.{:09}",
+        relay_duration_nanoseconds / 1_000_000_000,
+        relay_duration_nanoseconds % 1_000_000_000
+    );
+    metric!(
+        "phx_port_relay_idle_timeouts_total {}",
+        state.relay_idle_timeouts.load(Ordering::Relaxed)
+    );
+    metric!(
+        "phx_port_relay_backend_connect_failures_total {}",
+        state.relay_backend_connect_failures.load(Ordering::Relaxed)
+    );
     for (outcome, value) in [
         ("accepted", reload_status.accepted_reloads),
         ("rejected", reload_status.rejected_reloads),
@@ -2722,7 +2835,7 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
             let last_rejected_config_generation =
                 reload_status.last_rejected_generation.unwrap_or(0);
             format!(
-                "running\nhosting_profile={hosting_profile}\nconfig_generation={config_generation}\ndeclared_routes={declared_routes}\nrequired_routes={required_routes}\noptional_routes={optional_routes}\nactive_routes={active_routes}\ndegraded_routes={degraded_routes}\nready={ready}\nregistry_valid={registry_valid}\nundeclared_registrations={undeclared_registrations}\nrejected_registry_snapshots={rejected_registry_snapshots}\naccepted_config_reloads={accepted_config_reloads}\nrejected_config_reloads={rejected_config_reloads}\nlast_rejected_config_generation={last_rejected_config_generation}\nlast_reload_error={last_reload_error}\nlisteners={listeners}\nconflicts={conflicts}\nconflict_capacity_drops={conflict_capacity_drops}\nroute_capacity_rejections={route_capacity_rejections}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nsource_entries={source_entries}\nsource_entry_limit={source_entry_limit}\nsource_accepts_per_second_limit={source_accepts_per_second_limit}\nsource_accept_burst_limit={source_accept_burst_limit}\nsource_pre_routing_limit={source_pre_routing_limit}\nsource_ipv6_prefix={source_ipv6_prefix}\nsource_entry_ttl_seconds={source_entry_ttl_seconds}\nsource_policy_overrides={source_policy_overrides}\nqueued_route_selections={queued_route_selections}\nroute_selection_queue_limit={ROUTE_SELECTION_QUEUE_CAPACITY}\nroute_selection_workers={ROUTE_SELECTION_WORKERS}\nqueued_connections={queued_connections}\nconnection_queue_limit={CONNECTION_QUEUE_CAPACITY}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\ncompleted_relays={completed_relays}\nfailed_relays={failed_relays}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_source_rate={rejected_source_rate}\nrejected_source_concurrency={rejected_source_concurrency}\nrejected_source_state_capacity={rejected_source_state_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_routing_queue={rejected_routing_queue}\nrejected_routing_timeout={rejected_routing_timeout}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
+                "running\nhosting_profile={hosting_profile}\nconfig_generation={config_generation}\ndeclared_routes={declared_routes}\nrequired_routes={required_routes}\noptional_routes={optional_routes}\nactive_routes={active_routes}\ndegraded_routes={degraded_routes}\nready={ready}\nregistry_valid={registry_valid}\nundeclared_registrations={undeclared_registrations}\nrejected_registry_snapshots={rejected_registry_snapshots}\naccepted_config_reloads={accepted_config_reloads}\nrejected_config_reloads={rejected_config_reloads}\nlast_rejected_config_generation={last_rejected_config_generation}\nlast_reload_error={last_reload_error}\nlisteners={listeners}\nconflicts={conflicts}\nconflict_capacity_drops={conflict_capacity_drops}\nroute_capacity_rejections={route_capacity_rejections}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nsource_entries={source_entries}\nsource_entry_limit={source_entry_limit}\nsource_accepts_per_second_limit={source_accepts_per_second_limit}\nsource_accept_burst_limit={source_accept_burst_limit}\nsource_pre_routing_limit={source_pre_routing_limit}\nsource_ipv6_prefix={source_ipv6_prefix}\nsource_entry_ttl_seconds={source_entry_ttl_seconds}\nsource_policy_overrides={source_policy_overrides}\nqueued_route_selections={queued_route_selections}\nroute_selection_queue_limit={ROUTE_SELECTION_QUEUE_CAPACITY}\nroute_selection_workers={ROUTE_SELECTION_WORKERS}\nqueued_connections={queued_connections}\nconnection_queue_limit={CONNECTION_QUEUE_CAPACITY}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\ncompleted_relays={completed_relays}\nfailed_relays={failed_relays}\nrelay_idle_timeouts={relay_idle_timeouts}\nrelay_backend_connect_failures={relay_backend_connect_failures}\nrelay_client_to_workload_bytes={relay_client_to_workload_bytes}\nrelay_workload_to_client_bytes={relay_workload_to_client_bytes}\nrelay_duration_nanoseconds={relay_duration_nanoseconds}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_source_rate={rejected_source_rate}\nrejected_source_concurrency={rejected_source_concurrency}\nrejected_source_state_capacity={rejected_source_state_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_routing_queue={rejected_routing_queue}\nrejected_routing_timeout={rejected_routing_timeout}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
                 hosting_profile = route_summary.hosting_profile,
                 config_generation = route_summary.config_generation,
                 declared_routes = route_summary.declared_routes,
@@ -2759,12 +2872,21 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 source_policy_overrides = state.limits.source().overrides.len(),
                 queued_route_selections = state.queued_route_selections.load(Ordering::Relaxed),
                 queued_connections = state.queued_connections.load(Ordering::Relaxed),
-                connection_workers = state.limits.delivery_workers(),
+                connection_workers = state.limits.handoff_workers(),
                 waiting_clients = state.waiting_clients.load(Ordering::Relaxed),
                 accepted_connections = state.accepted_connections.load(Ordering::Relaxed),
                 relayed_connections = state.relayed_connections.load(Ordering::Relaxed),
                 completed_relays = state.completed_relays.load(Ordering::Relaxed),
                 failed_relays = state.failed_relays.load(Ordering::Relaxed),
+                relay_idle_timeouts = state.relay_idle_timeouts.load(Ordering::Relaxed),
+                relay_backend_connect_failures =
+                    state.relay_backend_connect_failures.load(Ordering::Relaxed),
+                relay_client_to_workload_bytes =
+                    state.relay_client_to_workload_bytes.load(Ordering::Relaxed),
+                relay_workload_to_client_bytes =
+                    state.relay_workload_to_client_bytes.load(Ordering::Relaxed),
+                relay_duration_nanoseconds =
+                    state.relay_duration_nanoseconds.load(Ordering::Relaxed),
                 rejected_connections = state.rejected_connections.load(Ordering::Relaxed),
                 rejected_accept_rate = state.rejected_accept_rate.load(Ordering::Relaxed),
                 rejected_global_capacity = state.rejected_global_capacity.load(Ordering::Relaxed),
@@ -2931,43 +3053,85 @@ fn handle_connection(
     } else {
         resolve_backend(&hostname, &state)?
     };
+    let relay_idle_timeout = state.relay_idle_timeout(&hostname);
+    let (result, completed) = oneshot::channel();
     let job = ConnectionJob {
-        client,
-        accepted_at,
-        admission,
-        hostname,
-        peeked_length,
-        backend,
-        cached: cached_backend.is_some(),
+        handoff: HandoffJob {
+            client,
+            accepted_at,
+            admission,
+            hostname,
+            peeked_length,
+            backend,
+            cached: cached_backend.is_some(),
+            relay_idle_timeout,
+        },
         queued: QueuedConnection::new(Arc::clone(&state.queued_connections)),
+        result,
     };
-    handle_routed_connection(job, state)
+    handle_routed_connection(job, Arc::clone(&state));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| format!("cannot start test Tokio runtime: {error}"))?;
+    match runtime
+        .block_on(completed)
+        .map_err(|_| "connection delivery worker dropped its result".to_string())??
+    {
+        None => Ok(()),
+        Some(job) => {
+            let (route_sender, _route_receiver) = mpsc::sync_channel(1);
+            let (connection_sender, _connection_receiver) = mpsc::sync_channel(1);
+            let ingress = TokioIngress {
+                state,
+                shutdown: Arc::new(AtomicBool::new(false)),
+                route_sender,
+                connection_sender,
+            };
+            runtime.block_on(relay_tokio_connection(job, &ingress))
+        }
+    }
 }
 
-fn handle_routed_connection(job: ConnectionJob, state: Arc<ProxyState>) -> Result<(), String> {
+fn handle_routed_connection(job: ConnectionJob, state: Arc<ProxyState>) {
     let ConnectionJob {
+        handoff,
+        queued,
+        result,
+    } = job;
+    drop(queued);
+    let completed = handoff
+        .client
+        .set_nonblocking(false)
+        .map_err(|error| format!("cannot configure accepted client socket: {error}"))
+        .and_then(|()| {
+            handoff
+                .client
+                .set_read_timeout(None)
+                .map_err(|error| format!("cannot clear accepted client timeout: {error}"))
+        })
+        .and_then(|()| prepare_handoff(handoff, &state));
+    let _ = result.send(completed);
+}
+
+fn prepare_handoff(handoff: HandoffJob, state: &ProxyState) -> Result<Option<RelayJob>, String> {
+    let HandoffJob {
         mut client,
         accepted_at,
         admission,
         hostname,
         peeked_length,
-        mut backend,
+        backend,
         cached,
-        queued,
-    } = job;
-    drop(queued);
-    client
-        .set_nonblocking(false)
-        .map_err(|error| format!("cannot configure accepted client socket: {error}"))?;
-    client
-        .set_read_timeout(None)
-        .map_err(|error| format!("cannot clear accepted client timeout: {error}"))?;
+        relay_idle_timeout,
+    } = handoff;
     let process_start = *PROCESS_START.get_or_init(Instant::now);
     let accepted_at_ns = accepted_at
         .saturating_duration_since(process_start)
         .as_nanos()
         .min(u128::from(u64::MAX)) as u64;
-    let client_hello_timeout = state.limits.client_hello_timeout();
     let public_profile = state.public_snapshot().is_some();
 
     match state.admission.try_acquire_handoff() {
@@ -2994,7 +3158,7 @@ fn handle_routed_connection(job: ConnectionJob, state: Arc<ProxyState>) -> Resul
                         handoff::Outcome::Transferred => {
                             state.successful_handoffs.fetch_add(1, Ordering::Relaxed);
                             state.record_delivery_outcome(DeliveryOutcome::HandoffSuccess);
-                            return Ok(());
+                            return Ok(None);
                         }
                         handoff::Outcome::Delivered(error) => {
                             state
@@ -3024,57 +3188,90 @@ fn handle_routed_connection(job: ConnectionJob, state: Arc<ProxyState>) -> Resul
         }
     }
 
-    let relay_permit = match acquire_relay_capacity(&state) {
+    Ok(Some(RelayJob {
+        client,
+        admission,
+        hostname,
+        backend,
+        cached,
+        idle_timeout: relay_idle_timeout,
+    }))
+}
+
+async fn relay_tokio_connection(job: RelayJob, ingress: &TokioIngress) -> Result<(), String> {
+    let RelayJob {
+        client,
+        admission,
+        hostname,
+        mut backend,
+        cached,
+        idle_timeout,
+    } = job;
+    let state = &ingress.state;
+    let relay_permit = match acquire_relay_capacity(state) {
         Some(permit) => permit,
         None => return Ok(()),
     };
+    let _relay_admission = admission.into_relay(relay_permit);
 
-    let (upstream, relay_permit) = match connect_backend(&backend) {
-        Ok(stream) => (stream, relay_permit),
+    client
+        .set_nonblocking(true)
+        .map_err(|error| format!("cannot return accepted socket to Tokio: {error}"))?;
+    let mut client = TokioTcpStream::from_std(client)
+        .map_err(|error| format!("cannot adopt accepted socket into Tokio: {error}"))?;
+    let mut upstream = match connect_tokio_backend(&backend).await {
+        Ok(stream) => stream,
         Err(_) if cached => {
-            drop(relay_permit);
+            state
+                .relay_backend_connect_failures
+                .fetch_add(1, Ordering::Relaxed);
             state
                 .routes
                 .write()
                 .map_err(|_| "route table lock poisoned".to_string())?
                 .remove(&hostname);
-            backend = resolve_backend(&hostname, &state)?;
-            let relay_permit = match acquire_relay_capacity(&state) {
-                Some(permit) => permit,
-                None => return Ok(()),
-            };
-            let stream = connect_backend(&backend)
-                .map_err(|error| format!("verified backend disappeared: {error}"))?;
-            (stream, relay_permit)
+            backend = select_tokio_route(&hostname, ingress).await?.0;
+            connect_tokio_backend(&backend).await.map_err(|error| {
+                state
+                    .relay_backend_connect_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                format!("verified backend disappeared: {error}")
+            })?
         }
-        Err(error) => return Err(format!("verified backend disappeared: {error}")),
+        Err(error) => {
+            state
+                .relay_backend_connect_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(format!("verified backend disappeared: {error}"));
+        }
     };
-    let _relay_admission = admission.into_relay(relay_permit);
 
-    let mut buffered = vec![0_u8; peeked_length];
-    client
-        .set_read_timeout(Some(client_hello_timeout))
-        .map_err(|error| format!("cannot restore ClientHello timeout: {error}"))?;
-    client
-        .read_exact(&mut buffered)
-        .map_err(|error| format!("cannot consume peeked ClientHello: {error}"))?;
-    client
-        .set_read_timeout(None)
-        .map_err(|error| format!("cannot clear ClientHello timeout: {error}"))?;
     state.relayed_connections.fetch_add(1, Ordering::Relaxed);
     state.record_delivery_outcome(DeliveryOutcome::RelayStarted);
-    match relay(client, upstream, &buffered) {
-        Ok(()) => {
+    let report = relay::copy_bidirectional(&mut client, &mut upstream, idle_timeout).await;
+    state.record_relay_report(&report);
+    match report.error {
+        None => {
             state.completed_relays.fetch_add(1, Ordering::Relaxed);
             state.record_delivery_outcome(DeliveryOutcome::RelayCompleted);
             Ok(())
         }
-        Err(error) => {
+        Some(error) => {
+            if error.kind() == io::ErrorKind::TimedOut {
+                state.relay_idle_timeouts.fetch_add(1, Ordering::Relaxed);
+            }
             state.failed_relays.fetch_add(1, Ordering::Relaxed);
             state.record_delivery_outcome(DeliveryOutcome::RelayFailed);
             Err(format!("relay failed: {error}"))
         }
     }
+}
+
+async fn connect_tokio_backend(backend: &Backend) -> io::Result<TokioTcpStream> {
+    let address: SocketAddr = ([127, 0, 0, 1], backend.port).into();
+    tokio::time::timeout(BACKEND_CONNECT_TIMEOUT, TokioTcpStream::connect(address))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend connection timed out"))?
 }
 
 fn acquire_relay_capacity(state: &ProxyState) -> Option<RelayPermit> {
@@ -3099,6 +3296,7 @@ fn route_deadline_remaining(deadline: Instant) -> Result<Duration, String> {
         .ok_or_else(|| "route selection timed out".to_string())
 }
 
+#[cfg(test)]
 fn resolve_backend(hostname: &str, state: &ProxyState) -> Result<Backend, String> {
     resolve_backend_until(hostname, state, Instant::now() + DISCOVERY_TIMEOUT)
 }
@@ -4128,10 +4326,6 @@ fn probe_backend_until(
         .join(":"))
 }
 
-fn connect_backend(backend: &Backend) -> io::Result<TcpStream> {
-    connect_backend_with_timeout(backend, Duration::from_secs(2))
-}
-
 fn connect_backend_with_timeout(backend: &Backend, timeout: Duration) -> io::Result<TcpStream> {
     let address: SocketAddr = ([127, 0, 0, 1], backend.port).into();
     let stream = TcpStream::connect_timeout(&address, timeout)?;
@@ -4140,50 +4334,27 @@ fn connect_backend_with_timeout(backend: &Backend, timeout: Duration) -> io::Res
     Ok(stream)
 }
 
-fn relay(mut client: TcpStream, mut upstream: TcpStream, buffered: &[u8]) -> io::Result<()> {
-    upstream.write_all(buffered)?;
-    upstream.set_read_timeout(None)?;
-    upstream.set_write_timeout(None)?;
-
-    let mut client_reader = client.try_clone()?;
-    let mut upstream_writer = upstream.try_clone()?;
-    let client_to_upstream = thread::spawn(move || {
-        let result = io::copy(&mut client_reader, &mut upstream_writer);
-        let _ = upstream_writer.shutdown(Shutdown::Write);
-        result
-    });
-
-    let upstream_to_client = io::copy(&mut upstream, &mut client);
-    let _ = client.shutdown(Shutdown::Write);
-    let client_to_upstream = client_to_upstream
-        .join()
-        .map_err(|_| io::Error::other("relay thread panicked"))?;
-
-    upstream_to_client?;
-    client_to_upstream?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         ActiveRoute, Backend, CONTROL_RESPONSE_LIMIT, DELIVERY_EVENT_INTERVAL, DeliveryOutcome,
         MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS, MAX_VERIFIED_ROUTES,
         MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter, ProbeMatch, ProxyState,
-        QueuedRouteSelection, RouteSelectionJob, SOURCE_DIAGNOSTIC_EVENT_INTERVAL, TokioIngress,
-        WaitingClient, cache_negative, clear_conflict, collect_probe_matches, handle_connection,
-        handle_route_selection, install_active_route, observe_workloads, prefer_https_per_project,
-        reap_ready_pre_routing_tasks, reconcile_routes, reconcile_workloads, record_conflict,
-        reload_public_profile, render_control_response, render_prometheus_metrics, resolve_backend,
-        select_tokio_route, supports_eager_discovery,
+        QueuedRouteSelection, RelayJob, RouteSelectionJob, SOURCE_DIAGNOSTIC_EVENT_INTERVAL,
+        TokioIngress, WaitingClient, cache_negative, clear_conflict, collect_probe_matches,
+        handle_connection, handle_route_selection, install_active_route, observe_workloads,
+        prefer_https_per_project, reap_ready_connection_tasks, reconcile_routes,
+        reconcile_workloads, record_conflict, relay_tokio_connection, reload_public_profile,
+        render_control_response, render_prometheus_metrics, resolve_backend, select_tokio_route,
+        supports_eager_discovery,
     };
     #[cfg(unix)]
     use super::{ControlAccess, ControlEndpointPolicy, ControlPeer, bind_private_control_socket};
     use crate::{
         admission::AdmissionRejection,
         ingress_config::{
-            HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot, RouteDeclaration,
-            SourceDiagnosticsConfig,
+            DEFAULT_RELAY_IDLE_TIMEOUT, HostingProfile, MAX_ROUTE_DECLARATIONS,
+            PublicIngressSnapshot, RouteDeclaration, SourceDiagnosticsConfig,
         },
         observability::PROMETHEUS_BODY_LIMIT,
         production_paths::{IntentOwner, ProductionPaths},
@@ -4461,6 +4632,7 @@ mod tests {
             workload: workload.to_string(),
             role: "https".to_string(),
             required: true,
+            relay_idle_timeout: Some(DEFAULT_RELAY_IDLE_TIMEOUT),
         };
         HostingProfile::Public(Arc::new(PublicIngressSnapshot {
             ingress_config: PathBuf::from("ingress.toml"),
@@ -4538,6 +4710,7 @@ mod tests {
                     workload: workload.to_string(),
                     role: "https".to_string(),
                     required,
+                    relay_idle_timeout: Some(DEFAULT_RELAY_IDLE_TIMEOUT),
                 },
             )
         })
@@ -4788,6 +4961,17 @@ mod tests {
         assert_eq!(state.handoff_attempts.load(Ordering::Relaxed), 1);
         assert_eq!(state.successful_handoffs.load(Ordering::Relaxed), 0);
         assert_eq!(state.handoff_fallbacks.load(Ordering::Relaxed), 1);
+        assert!(state.relay_client_to_workload_bytes.load(Ordering::Relaxed) > 0);
+        assert!(state.relay_workload_to_client_bytes.load(Ordering::Relaxed) > 0);
+        assert!(state.relay_duration_nanoseconds.load(Ordering::Relaxed) > 0);
+        let admission = state.admission.snapshot();
+        assert_eq!(admission.global.in_use, 0);
+        assert_eq!(admission.pre_routing.in_use, 0);
+        assert_eq!(admission.relay.in_use, 0);
+        let metrics = render_prometheus_metrics(&state);
+        assert!(metrics.contains("phx_port_relay_bytes_total{direction=\"client_to_workload\"} "));
+        assert!(metrics.contains("phx_port_relay_bytes_total{direction=\"workload_to_client\"} "));
+        assert!(metrics.contains("phx_port_relay_duration_seconds_total "));
         let status = render_control_response(&state, &AtomicBool::new(false), "STATUS");
         assert!(status.contains("ready=true"), "{status}");
         assert!(status.contains("degraded_routes=0"), "{status}");
@@ -5031,7 +5215,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_pre_routing_tasks_are_reaped_in_one_bounded_pass() {
+    fn completed_connection_tasks_are_reaped_in_one_bounded_pass() {
         const COMPLETED_TASKS: usize = 256;
 
         let directory = tempdir().unwrap();
@@ -5050,7 +5234,7 @@ mod tests {
 
             let mut failure = None;
             assert_eq!(
-                reap_ready_pre_routing_tasks(&mut connections, &state, &mut failure),
+                reap_ready_connection_tasks(&mut connections, &state, &mut failure),
                 COMPLETED_TASKS
             );
             assert!(connections.is_empty());
@@ -5060,6 +5244,131 @@ mod tests {
                 COMPLETED_TASKS as u64
             );
         });
+    }
+
+    #[test]
+    fn async_backend_connect_failure_releases_relay_capacity() {
+        let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let public_peer = TcpStream::connect(frontend.local_addr().unwrap()).unwrap();
+        let (accepted, peer) = frontend.accept().unwrap();
+        let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable_port = unavailable.local_addr().unwrap().port();
+        drop(unavailable);
+
+        let directory = tempdir().unwrap();
+        let state = Arc::new(ProxyState::new(directory.path().join("ports.toml")));
+        let admission = state.admission.try_admit(peer.ip()).unwrap();
+        let job = RelayJob {
+            client: accepted,
+            admission,
+            hostname: "unavailable.example.test".to_string(),
+            backend: Backend {
+                project: "/unavailable".to_string(),
+                role: "https".to_string(),
+                port: unavailable_port,
+            },
+            cached: false,
+            idle_timeout: None,
+        };
+        let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(1);
+        let (connection_sender, _connection_receiver) = std::sync::mpsc::sync_channel(1);
+        let ingress = TokioIngress {
+            state: Arc::clone(&state),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            route_sender,
+            connection_sender,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let error = runtime
+            .block_on(relay_tokio_connection(job, &ingress))
+            .unwrap_err();
+        assert!(error.contains("verified backend disappeared"), "{error}");
+        assert_eq!(
+            state.relay_backend_connect_failures.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(state.relayed_connections.load(Ordering::Relaxed), 0);
+        let admission = state.admission.snapshot();
+        assert_eq!(admission.global.in_use, 0);
+        assert_eq!(admission.pre_routing.in_use, 0);
+        assert_eq!(admission.relay.in_use, 0);
+        drop(public_peer);
+    }
+
+    #[test]
+    fn cancelling_async_relay_releases_sockets_and_permits() {
+        let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut public_peer = TcpStream::connect(frontend.local_addr().unwrap()).unwrap();
+        let (accepted, peer) = frontend.accept().unwrap();
+        let workload = TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let directory = tempdir().unwrap();
+        let state = Arc::new(ProxyState::new(directory.path().join("ports.toml")));
+        let admission = state.admission.try_admit(peer.ip()).unwrap();
+        let job = RelayJob {
+            client: accepted,
+            admission,
+            hostname: "cancelled.example.test".to_string(),
+            backend: Backend {
+                project: "/cancelled".to_string(),
+                role: "https".to_string(),
+                port: workload.local_addr().unwrap().port(),
+            },
+            cached: false,
+            idle_timeout: None,
+        };
+        let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(1);
+        let (connection_sender, _connection_receiver) = std::sync::mpsc::sync_channel(1);
+        let ingress = TokioIngress {
+            state: Arc::clone(&state),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            route_sender,
+            connection_sender,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let relay = tokio::spawn(async move { relay_tokio_connection(job, &ingress).await });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while state.relayed_connections.load(Ordering::Relaxed) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(state.admission.snapshot().relay.in_use, 1);
+
+            relay.abort();
+            assert!(relay.await.unwrap_err().is_cancelled());
+        });
+
+        let admission = state.admission.snapshot();
+        assert_eq!(admission.global.in_use, 0);
+        assert_eq!(admission.pre_routing.in_use, 0);
+        assert_eq!(admission.relay.in_use, 0);
+        public_peer
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        match public_peer.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset
+                ) => {}
+            result => panic!("cancelled relay kept the public socket open: {result:?}"),
+        }
+        drop(workload);
     }
 
     #[test]
@@ -5181,7 +5490,7 @@ mod tests {
         assert!(status.contains("route_selection_queue_limit=56"));
         assert!(status.contains("route_selection_workers=8"));
         assert!(status.contains("connection_queue_limit=1"));
-        assert!(status.contains("connection_workers=192"));
+        assert!(status.contains("connection_workers=64"));
 
         drop(handoff);
         let relay = state.admission.try_acquire_relay().unwrap();
@@ -5468,6 +5777,7 @@ mod tests {
                         workload: format!("w{index:04}-{}", "a".repeat(122)),
                         role: "r".repeat(128),
                         required: true,
+                        relay_idle_timeout: Some(DEFAULT_RELAY_IDLE_TIMEOUT),
                     },
                 )
             })

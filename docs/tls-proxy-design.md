@@ -130,9 +130,9 @@ sequenceDiagram
 
 The daemon peeks at a bounded ClientHello without consuming it, extracts its
 SNI hostname, and selects a route. If socket handoff is unavailable, it opens
-the backend TCP connection, consumes exactly the bytes that were peeked,
-writes them unchanged to the backend, and then copies bytes bidirectionally
-until either side closes.
+the backend TCP connection and asynchronously copies from the still-unconsumed
+public socket, forwarding the peeked bytes exactly once. TCP half-close
+propagates in each direction while the reverse direction may continue.
 
 Because the original handshake reaches the backend:
 
@@ -160,8 +160,13 @@ Hosting Profile described by this document. `--ingress-config PATH` or
 file declares `[ingress] mode = "public"`. The typed schema requires from one
 through 1,000 `[ingress.hosts."<hostname>"]` Route Declarations with unique
 normalized exact hostnames, a valid logical `workload`, a bounded lowercase
-`role`, and an optional boolean `required` that defaults to `false`;
-`unknown_sni`, when present, must be `"reject"`.
+`role`, an optional boolean `required` that defaults to `false`, and an
+optional integer `relay_idle_timeout_seconds` that is either zero or at least
+1,800. Public relays default to 1,800 seconds of bidirectional inactivity,
+reset on progress in either direction; larger values extend the window and
+zero disables the policy for that exact declaration.
+Development relays retain unlimited idle lifetime. `unknown_sni`, when
+present, must be `"reject"`.
 An optional `[ingress] listen` array declares at most one IPv4 and one IPv6
 socket address. It is mandatory for `--run-as` startup and immutable across
 configuration reloads.
@@ -238,9 +243,10 @@ limit when one exists.
 Capacity validation runs before the first listener bind. It rejects zero
 limits, sublimits above the global limit, ClientHello deadlines outside
 500-10000 milliseconds, arithmetic overflow, active limits above the 8,192
-async state-machine ceiling, blocking delivery demand above 256 workers, task
-demand above the configured/systemd budget, and descriptor demand that would
-leave less than 30% of `RLIMIT_NOFILE` in reserve. When the configured
+async state-machine ceiling, blocking PHXP demand above 256 handoff workers,
+task demand above the configured/systemd budget, and descriptor demand that
+would leave less than 30% of `RLIMIT_NOFILE` in reserve. Async relay capacity
+does not allocate native copy or delivery threads. When the configured
 descriptor budget fits the hard limit, startup may raise the process soft
 limit to the calculated minimum and then revalidates the resulting limit. It
 never derives or lowers configured ingress ceilings from ambient limits.
@@ -251,12 +257,13 @@ the kernel-reported peer address and acquires active, source, and pre-routing
 permits immediately after Tokio accepts a socket, before creating its tracked
 task. Saturation closes the new socket without allocating a per-connection
 thread. After non-consuming ClientHello inspection and exact route selection,
-the socket enters a separately bounded blocking delivery pool. Relay capacity
-is reserved before opening the loopback backend; after route selection, source
-and pre-routing capacity are released while active and relay permits remain
-held until copying ends. Production load qualification and async PHXP/relay
-delivery remain later milestones, so the pre-routing migration does not
-constitute a public-load support claim.
+the socket enters a separately bounded blocking PHXP pool. Pre-delivery
+fallback returns it to its tracked Tokio task. Relay capacity is reserved
+before opening the loopback backend; after route selection, source and pre-
+routing capacity are released while active and relay permits remain held until
+async copying ends. Each direction uses one fixed 16 KiB buffer. Production
+load qualification and async PHXP remain later milestones, so this migration
+does not constitute a public-load support claim.
 
 Operator-only CIDR policy is configured with repeatable
 `--source-policy CIDR=RATE,BURST,PRE_ROUTING[,IPV6_PREFIX]` options. Longest
@@ -681,7 +688,7 @@ requires strict bounds. The implementation currently:
   Tokio runtime workers. Each accepted socket obtains global, source, and
   pre-routing admission before its tracked task is created.
 - Grows each peek buffer from 4 KiB only as required, up to the fixed 64 KiB
-  ceiling, and aborts all tracked pre-routing tasks during shutdown.
+  ceiling, and aborts all tracked connection tasks during shutdown.
 - Sends cache-miss route selection through eight fixed coordinator threads
   plus a 56-entry queue. Queue residence and exact route selection share one
   250 millisecond deadline.
@@ -736,21 +743,27 @@ adopted by Tokio. Accepted connections obtain global, source, and pre-routing
 admission before entering tracked tasks that perform total-deadline
 non-consuming ClientHello inspection and exact route selection. Cache misses
 cross a fixed route-selection worker pool and bounded queue; verified
-connections then cross a separate one-slot delivery queue.
+connections then cross a separate one-slot handoff queue.
 
-PHXP negotiation and relay copying remain on a transitional blocking delivery
-pool pending their dedicated async migrations. Startup permits at most 8,192
-async ingress state machines but still rejects any configuration requiring
-more than 256 blocking delivery workers. Relay copy threads and certificate
-probe threads retain their existing hard bounds. Probe permits are acquired
-before their threads are created, and single-flight discovery prevents
-duplicate work for one SNI hostname. The implementation consists of:
+PHXP negotiation remains on a transitional bounded blocking pool. Its pre-
+delivery fallback returns the original socket to the owning Tokio task, which
+opens only the registered loopback backend after acquiring relay capacity and
+performs fixed-buffer bidirectional async copying. Public Route Declarations
+default to a 30-minute inactivity timeout that resets on progress and may be
+extended or disabled exactly; development retains its previous unlimited idle
+lifetime. Startup permits at most 8,192 async ingress state machines but still
+rejects any configuration requiring more than 256 blocking handoff workers.
+Certificate probe threads retain their existing hard bounds. Probe permits are
+acquired before their threads are created, and single-flight discovery
+prevents duplicate work for one SNI hostname. The implementation consists of:
 
 - `admission.rs` for global/source token buckets, bounded source state, and
   RAII connection-stage capacity.
 - `worker_pool.rs` for fixed bounded connection execution.
 - `proxy.rs` for listeners, reconciliation, discovery, route health, control,
-  handoff selection, and relay.
+  handoff selection, and relay ownership.
+- `relay.rs` for fixed-buffer async copying, half-close propagation, progress-
+  reset idle policy, and directional accounting.
 - `tls_client_hello.rs` for bounded, non-consuming ClientHello inspection.
 - `route_cache.rs` for bounded combined-development and split-public derived
   routes.
@@ -793,10 +806,14 @@ Automated tests currently cover:
 - Single-flight behavior under concurrent first requests.
 - Waiting-client and concurrent-probe limits.
 - Exact global, pre-routing, handoff, and relay permit transitions and release.
-- Tracked Tokio listener/pre-routing tasks, a 2,000-idle-socket constant-thread
+- Tracked Tokio listener/connection tasks, a 2,000-idle-socket constant-thread
   regression, and prompt cancellation on shutdown.
-- Fixed route-selection and blocking-delivery worker/queue bounds, panic
+- Fixed route-selection and blocking-handoff worker/queue bounds, panic
   recovery, deadlines, and immediate overload rejection.
+- Async relay forwarding of previously peeked bytes exactly once, bidirectional
+  half-close, progress-reset and disabled idle policy, bounded cancellation,
+  permit recovery, backend-connect failure, and fixed-label byte/duration
+  metrics.
 - Deterministic conflict recording and `https` role preference.
 - Persistent route creation and removal with registry changes.
 - Deactivation after three failed TCP checks while retaining the cached hint.

@@ -166,11 +166,13 @@ listen = "127.0.0.1:9464"
 workload = "contoso-web"
 role = "https"
 required = true
+relay_idle_timeout_seconds = 1800
 
 [ingress.hosts."api.contoso.com"]
 workload = "contoso-api"
 role = "https"
 required = false
+relay_idle_timeout_seconds = 0 # disable for an intentionally quiet long-lived protocol
 ```
 
 `[ingress.metrics]` is optional and accepts one numeric loopback socket
@@ -195,6 +197,12 @@ active, every `sample_every`-th successfully normalized ClientHello may emit
 at most one `event=source_diagnostic` per second containing its kernel peer IP
 and normalized SNI. Expired settings are inert; normal events and metrics
 contain no source address.
+
+Public relay inactivity defaults to 1,800 seconds per Route Declaration.
+`relay_idle_timeout_seconds` may extend that bidirectional inactivity window;
+zero explicitly disables it for the declaration. Progress in either direction
+resets the deadline. Development relays retain their existing unlimited idle
+lifetime.
 
 The public Hosting Profile keeps operator intent, stable assignments, derived
 state, and runtime endpoints in separate ownership domains:
@@ -304,18 +312,19 @@ The Tokio ingress has explicit startup capacity options:
 Before binding any listener, the daemon rejects zero values, sublimits above
 the global connection limit, ClientHello timeouts outside 500-10000
 milliseconds, arithmetic overflow, and active limits above the bounded 8,192
-async state-machine ceiling. PHXP and relay I/O remain on a transitional
-blocking delivery pool, so startup also rejects configurations requiring more
-than 256 delivery workers; raising `active_connections` or
-`pre_routing_connections` does not raise that native-thread ceiling. The daemon
-checks estimated descriptor demand against the process `RLIMIT_NOFILE` while
-preserving a 30% reserve. If the process soft limit is too low but its hard
-limit permits the configured capacity, startup raises only the process soft
-limit to the calculated minimum and verifies the result; the configured limits
-never change with the host environment. Otherwise startup fails with the
-required and available values. On Linux it also checks the systemd cgroup task
-ceiling and its existing occupants when available; `--task-budget N` supplies
-an additional operator ceiling on any platform.
+async state-machine ceiling. Relay connect and copy I/O run inside those
+tracked Tokio tasks. PHXP remains on a transitional blocking handoff pool, so
+startup also rejects configurations requiring more than 256 handoff workers;
+raising active, pre-routing, or relay capacity does not raise that native-
+thread ceiling. The daemon checks estimated descriptor demand against the
+process `RLIMIT_NOFILE` while preserving a 30% reserve. If the process soft
+limit is too low but its hard limit permits the configured capacity, startup
+raises only the process soft limit to the calculated minimum and verifies the
+result; the configured limits never change with the host environment.
+Otherwise startup fails with the required and available values. On Linux it
+also checks the systemd cgroup task ceiling and its existing occupants when
+available; `--task-budget N` supplies an additional operator ceiling on any
+platform.
 
 The daemon enforces the global accept-rate/burst and active, pre-routing,
 relay, handoff, and per-source ceilings at runtime. IPv4 peers use exact-address
@@ -334,28 +343,32 @@ accepted. An optional fourth field changes IPv6 bucketing inside that CIDR and
 must be at least as specific as the CIDR itself.
 
 The daemon acquires active, source, and pre-routing permits immediately after
-Tokio accepts a socket and before creating its tracked pre-routing task. Tokio
+Tokio accepts a socket and before creating its tracked connection task. Tokio
 peeks at a ClientHello without consuming it, using one total deadline and a
 buffer that grows from 4 KiB to the fixed 64 KiB ceiling. Cache-miss route
 selection crosses a fixed eight-worker blocking boundary with a 56-entry queue
 and a 250-millisecond total queue-and-selection deadline. A successfully
-verified route enters the one-slot bounded delivery queue; saturation at
-either queue closes the new socket and releases its RAII permits. Shutdown
-aborts and drains every tracked pre-routing task before the blocking delivery
-drain begins.
+verified route enters the one-slot bounded handoff queue. The PHXP result
+returns to the same tracked Tokio task before fallback relay begins;
+saturation at either queue closes the new socket and releases its RAII
+permits. Shutdown cancels and drains Tokio-owned routing and relay work before
+the blocking handoff pool drain begins.
 
 Handoff negotiation uses its own permit; relay capacity is reserved before
 opening a backend socket, then source and pre-routing capacity are released
 while the active and relay permits remain held until encrypted copying ends.
+Each relay uses two fixed 16 KiB copy buffers, forwards the still-unconsumed
+ClientHello exactly once, propagates TCP half-close in both directions, and
+records fixed-label directional byte totals, aggregate duration, idle timeout,
+and backend-connect failure counters.
 `proxy status` reports both queue bounds, aggregate source-table use,
 configured limits, and bounded rejection-reason counters without
 source-address labels. Saturation also emits a fixed-schema
 `event=ingress_overload` stderr record at most once per bounded reason every
 ten seconds. Further rejections in that window are suppressed and aggregated
 into the next event; neither source addresses nor SNI values appear in the
-event. Production load qualification and async PHXP/relay delivery remain
-separate milestones; the async pre-routing path alone is not a public-load
-support claim.
+event. Production load qualification and async PHXP remain separate
+milestones; the bounded async relay path is not a public-load support claim.
 
 For an unknown SNI hostname, `phx-port` probes active `https` and `main`
 workloads over loopback using that exact hostname. It routes only when exactly
