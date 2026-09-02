@@ -4,8 +4,12 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
-use tempfile::tempdir;
+use tempfile::tempdir_in;
 use toml_edit::DocumentMut;
+
+fn tempdir() -> std::io::Result<tempfile::TempDir> {
+    tempdir_in(std::env::temp_dir().canonicalize()?)
+}
 
 #[cfg(unix)]
 struct RunningDaemon {
