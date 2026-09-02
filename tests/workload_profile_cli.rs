@@ -901,7 +901,9 @@ fn public_profile_reconciles_multiple_routes_and_preserves_valid_generation() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let replaced = loop {
         let status = daemon.status();
-        if status.lines().any(|line| line == "config_generation=2") {
+        if status.lines().any(|line| line == "config_generation=2")
+            && status.contains("last_reload_error=none")
+        {
             break status;
         }
         assert!(
