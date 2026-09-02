@@ -4284,18 +4284,20 @@ fn connect_backend_with_timeout(backend: &Backend, timeout: Duration) -> io::Res
 mod tests {
     use super::{
         ActiveRoute, Backend, CONTROL_RESPONSE_LIMIT, DELIVERY_EVENT_INTERVAL, DeliveryOutcome,
-        HandoffJob, IngressLimits, MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS,
-        MAX_VERIFIED_ROUTES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter,
-        ProbeMatch, ProxyState, QueuedRouteSelection, RelayJob, RouteSelectionJob,
-        SOURCE_DIAGNOSTIC_EVENT_INTERVAL, SystemCapacity, TokioIngress, WaitingClient,
-        cache_negative, clear_conflict, collect_probe_matches, handle_connection,
-        handle_route_selection, install_active_route, observe_workloads, prefer_https_per_project,
-        prepare_handoff, reap_ready_connection_tasks, reconcile_routes, reconcile_workloads,
-        record_conflict, relay_tokio_connection, reload_public_profile, render_control_response,
-        render_prometheus_metrics, resolve_backend, select_tokio_route, supports_eager_discovery,
+        MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS, MAX_VERIFIED_ROUTES,
+        MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter, ProbeMatch, ProxyState,
+        QueuedRouteSelection, RelayJob, RouteSelectionJob, SOURCE_DIAGNOSTIC_EVENT_INTERVAL,
+        TokioIngress, WaitingClient, cache_negative, clear_conflict, collect_probe_matches,
+        handle_connection, handle_route_selection, install_active_route, observe_workloads,
+        prefer_https_per_project, reap_ready_connection_tasks, reconcile_routes,
+        reconcile_workloads, record_conflict, relay_tokio_connection, reload_public_profile,
+        render_control_response, render_prometheus_metrics, resolve_backend, select_tokio_route,
+        supports_eager_discovery,
     };
     #[cfg(unix)]
     use super::{ControlAccess, ControlEndpointPolicy, ControlPeer, bind_private_control_socket};
+    #[cfg(target_os = "linux")]
+    use super::{HandoffJob, IngressLimits, SystemCapacity, prepare_handoff};
     use crate::{
         admission::AdmissionRejection,
         ingress_config::{
