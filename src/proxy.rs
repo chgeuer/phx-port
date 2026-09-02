@@ -8,7 +8,7 @@ use crate::{
         HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot, RouteDeclaration,
     },
     ingress_limits::{DaemonConfig, ValidatedIngressLimits},
-    is_port_open, port_registry,
+    is_port_open, port_registry, privilege,
     production_paths::ProductionPaths,
     read_config, route_cache, tls_client_hello,
     worker_pool::BoundedWorkerPool,
@@ -759,28 +759,63 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     PROCESS_START.get_or_init(Instant::now);
     let DaemonConfig {
         listen_addresses,
+        listeners_explicit,
+        ingress_config,
+        run_as,
         limits,
         task_budget,
-        hosting_profile,
     } = config;
-    let limits = limits.validate_for_startup(task_budget, listen_addresses.len())?;
-    let production_paths = if hosting_profile.public_snapshot().is_some() {
-        let paths = ProductionPaths::from_environment()?;
-        let snapshot = hosting_profile
-            .public_snapshot()
-            .expect("public profile has an ingress snapshot");
-        paths.validate_intent_separation(&snapshot.ingress_config)?;
-        paths.prepare_for_startup()?;
-        Some(paths)
-    } else {
-        None
-    };
+    let privilege_drop = privilege::prepare(run_as.as_deref())?;
+    if privilege_drop.is_some() && !listeners_explicit {
+        return Err("--run-as requires at least one explicit --listen address".to_string());
+    }
+    let loopback_only = listen_addresses.iter().all(|address| {
+        address
+            .parse::<SocketAddr>()
+            .is_ok_and(|address| address.ip().is_loopback())
+    });
+
+    let (hosting_profile, production_paths, acquired_listeners, limits) =
+        if let Some(privilege_drop) = privilege_drop {
+            let limits = limits.validate_for_startup(task_budget, listen_addresses.len())?;
+            let acquired_listeners = activated_listener::acquire_direct(&listen_addresses)?;
+            privilege_drop.apply()?;
+            let hosting_profile = HostingProfile::load_for_daemon(ingress_config, loopback_only)?;
+            let bound_addresses = acquired_listeners
+                .iter()
+                .map(|acquired| {
+                    acquired
+                        .listener
+                        .local_addr()
+                        .map_err(|error| format!("cannot read bound listener address: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            hosting_profile.validate_bound_listeners(&bound_addresses, true)?;
+            let production_paths = prepare_production_paths(&hosting_profile)?;
+            (
+                hosting_profile,
+                production_paths,
+                acquired_listeners,
+                limits,
+            )
+        } else {
+            let hosting_profile = HostingProfile::load_for_daemon(ingress_config, loopback_only)?;
+            hosting_profile.validate_daemon_listeners(&listen_addresses, false)?;
+            let limits = limits.validate_for_startup(task_budget, listen_addresses.len())?;
+            let production_paths = prepare_production_paths(&hosting_profile)?;
+            let acquired_listeners = activated_listener::acquire(&listen_addresses)?;
+            (
+                hosting_profile,
+                production_paths,
+                acquired_listeners,
+                limits,
+            )
+        };
     let shutdown_drain_timeout = if production_paths.is_some() {
         PUBLIC_SHUTDOWN_DRAIN_TIMEOUT
     } else {
         DEVELOPMENT_SHUTDOWN_DRAIN_TIMEOUT
     };
-    let acquired_listeners = activated_listener::acquire(&listen_addresses)?;
     let registry = production_paths
         .as_ref()
         .map(|paths| paths.port_registry.clone())
@@ -810,6 +845,10 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
             #[cfg(target_os = "linux")]
             ListenerOrigin::Systemd(name) => {
                 eprintln!("Adopted systemd listener {name} on {address}")
+            }
+            #[cfg(target_os = "macos")]
+            ListenerOrigin::Launchd(name) => {
+                eprintln!("Adopted launchd listener {name} on {address}")
             }
         }
         listeners.push(acquired.listener);
@@ -948,6 +987,18 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     }
     eprintln!("TLS proxy stopped");
     Ok(())
+}
+
+fn prepare_production_paths(
+    hosting_profile: &HostingProfile,
+) -> Result<Option<ProductionPaths>, String> {
+    let Some(snapshot) = hosting_profile.public_snapshot() else {
+        return Ok(None);
+    };
+    let paths = ProductionPaths::from_environment()?;
+    paths.validate_intent_separation(&snapshot.ingress_config)?;
+    paths.prepare_for_startup()?;
+    Ok(Some(paths))
 }
 
 pub fn query_control(command: &str) -> Result<String, String> {
@@ -2838,6 +2889,7 @@ mod tests {
             ingress_config: PathBuf::from("ingress.toml"),
             intent_owner: IntentOwner::EffectiveUser,
             generation: 1,
+            listeners: None,
             routes: BTreeMap::from([(hostname.to_string(), declaration)]),
         }))
     }
@@ -2915,6 +2967,7 @@ mod tests {
             ingress_config: PathBuf::from("ingress.toml"),
             intent_owner: IntentOwner::EffectiveUser,
             generation: 1,
+            listeners: None,
             routes,
         }));
         let state =

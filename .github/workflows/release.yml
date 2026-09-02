@@ -56,7 +56,10 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../phx-port-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          mkdir launchd
+          cp ../../../packaging/launchd/dev.phx-port.ingress.plist launchd/
+          tar czf ../../../phx-port-${{ matrix.target }}.tar.gz \
+            ${{ matrix.artifact }} launchd
 
       - name: Package (Windows)
         if: runner.os == 'Windows'

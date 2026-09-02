@@ -157,6 +157,7 @@ exact Route Declarations:
 [ingress]
 mode = "public"
 unknown_sni = "reject"
+listen = ["0.0.0.0:443", "[::]:443"]
 
 [ingress.hosts."www.contoso.com"]
 workload = "contoso-web"
@@ -185,13 +186,14 @@ overrides the runtime root. Public overrides must be absolute. These variables
 do not activate public mode by themselves, and development keeps its existing
 per-user combined registry and runtime paths.
 
-Before binding a non-loopback listener, ingress requires every component of the
-intent path and the intent file itself to be root-owned and free of unsafe
-links or write permissions. An effective-user-owned intent file is accepted
-only for an explicitly loopback-only public-profile exercise. Stable and
-derived files and their locks require service ownership, private modes,
-single-link regular files, bounded content, and no symlinks. Runtime, handoff,
-and control directories receive the same no-symlink ownership/mode checks.
+For ordinary unprivileged startup, ingress validates every component of a
+non-loopback intent path and the intent file as root-owned and free of unsafe
+links or write permissions before listener acquisition. An effective-user-
+owned intent file is accepted only for an explicitly loopback-only public-
+profile exercise. Stable and derived files and their locks require service
+ownership, private modes, single-link regular files, bounded content, and no
+symlinks. Runtime, handoff, and control directories receive the same no-
+symlink ownership/mode checks.
 
 Public ingress reads one validated Port Registry snapshot populated by
 `PHX_PORT_WORKLOAD_ID`, rejects malformed assignments and ports shared by
@@ -353,6 +355,24 @@ daemon in the foreground with `Restart=on-failure`, `LimitNOFILE=65536`,
 `TasksMax=1024`, and the existing 35-second service-manager stop deadline.
 `uninstall-service` disables and stops the service before removing the unit.
 
+For deliberate foreground use from a root shell, `--run-as USER` is the only
+supported privileged daemon path:
+
+```bash
+sudo phx-port daemon --run-as phx-port \
+  --ingress-config /etc/phx-port/ingress.toml \
+  --listen 0.0.0.0:443 --listen '[::]:443'
+```
+
+Every listener must be explicit and must exactly match the public config's
+`[ingress] listen` array. The daemon resolves the target account and
+supplementary groups, binds only those listeners, permanently sets the target
+groups, GID, and UID, verifies that UID 0 cannot be regained, and enables Linux
+`no_new_privs`. Only then does it read ingress intent, initialize state/runtime
+paths, install signal handling, or start workers. A root-started daemon without
+`--run-as`, a root target, and `--run-as` from an unprivileged process are
+rejected. Other root CLI commands retain their existing behavior.
+
 The explicit public Hosting Profile ships separate system units in
 `packaging/systemd/` and in the Linux release archive's `systemd/` directory.
 Provision the non-login `phx-port` user and group, install the binary at
@@ -397,6 +417,39 @@ cargo test --test systemd_socket_activation \
 It requires a Linux system manager and noninteractive `sudo`; it proves
 certificate-verified routing, derived-state writes, local control, sandboxed
 non-root identity with no effective capabilities, and routing after restart.
+
+On macOS, the public Hosting Profile ships
+`packaging/launchd/dev.phx-port.ingress.plist`, also included under `launchd/`
+in macOS release archives. Provision the non-login `phx-port` account and its
+root-owned intent plus service-owned state/runtime directories, then install
+the LaunchDaemon:
+
+```bash
+sudo install -d -o root -g phx-port -m 0755 \
+  "/Library/Application Support/phx-port"
+sudo install -d -o phx-port -g phx-port -m 0700 \
+  "/Library/Application Support/phx-port/state"
+sudo install -d -o phx-port -g phx-port -m 0750 \
+  /private/var/run/phx-port
+sudo install -d -o phx-port -g phx-port -m 0700 \
+  /private/var/run/phx-port/handoff
+sudo install -o root -g phx-port -m 0640 ingress.toml \
+  "/Library/Application Support/phx-port/ingress.toml"
+sudo install -o root -g wheel -m 0644 \
+  packaging/launchd/dev.phx-port.ingress.plist /Library/LaunchDaemons/
+sudo launchctl bootstrap system \
+  /Library/LaunchDaemons/dev.phx-port.ingress.plist
+```
+
+The plist's `tls-ipv4` and `tls-ipv6` sockets own port 443. The non-root daemon
+retrieves them by name with `launch_activate_socket()`, requires exactly one
+listening TCP descriptor on each configured address, and sets both
+nonblocking and close-on-exec without rebinding. Adjust the account and paths
+in the plist only together with the provisioned ownership. Remove it with
+`sudo launchctl bootout system/dev.phx-port.ingress` before deleting the
+plist. The ignored `real_launchd_job_adopts_named_socket_and_runs_as_owner`
+test exercises the same API in a disposable user launchd domain without
+touching port 443.
 
 The daemon revalidates a persisted mapping before activating it in a new
 process. Newly active `https` workloads that present a no-SNI default

@@ -9,8 +9,9 @@ automation-complete.
 The repository's `macos-latest` CI builds and runs the Rust unit tests for the
 daemon, Rust sample, and native Rustler broker. It does not start the real
 daemon and framework backends or run the trusted TLS handoff scenarios below.
-The .NET receiver and `launchd` service installation also remain follow-up
-work.
+The .NET receiver remains follow-up work. Public-ingress launchd socket
+activation and a packaged LaunchDaemon are now implemented separately from the
+PHXP receiver work described here.
 
 ### Manual validation evidence, not committed regression coverage
 
@@ -95,7 +96,7 @@ The macOS implementation will therefore use:
 | Accepted control FD | `accept4(SOCK_CLOEXEC)` | `accept` then `fcntl(FD_CLOEXEC)` |
 | Received client FD | `MSG_CMSG_CLOEXEC` | `recvmsg` then `fcntl(FD_CLOEXEC)` |
 | Endpoint root | `$XDG_RUNTIME_DIR` | private short directory below `/tmp` |
-| Service management | systemd user unit | out of scope initially; later `launchd` |
+| Service management | systemd units | packaged public-ingress LaunchDaemon |
 
 Linux behavior and its `SOCK_SEQPACKET` transport remain unchanged.
 
@@ -144,7 +145,6 @@ different local transport profile, not a new application-level message format.
 - Making Linux and macOS receivers connect to one another; PHXP is local IPC.
 - Migrating TLS or application state after a handshake has begun.
 - Trusting an SNI value sent in PHXP instead of the socket's ClientHello.
-- Adding `launchd` service installation in the first implementation.
 - Redesigning route discovery or the generic TLS relay.
 - Guaranteeing the initial .NET reference receiver works on macOS.
 - Supporting sandboxed Mac App Store applications.
@@ -542,7 +542,7 @@ Darwin's Unix socket path limit.
 The public Hosting Profile extends the same transport with a logical Workload
 identity. It hashes `workload-id NUL role` and normally uses the accepted
 `/run/phx-port/handoff` production layout. Because macOS does not provide
-`/run`, production validation and a future launchd service must set
+`/run`, production validation and the packaged launchd service must set
 `PHX_PORT_RUNTIME_DIR` to an operator-created short runtime root. Both ingress
 and the Workload receive the same override. The Workload selects logical PHXP
 identity explicitly; `PHX_PORT_WORKLOAD_ID` by itself does not change this
@@ -624,10 +624,11 @@ Do not log raw descriptor numbers.
 
 ### Service commands
 
-`proxy install-service` and `proxy uninstall-service` remain Linux/systemd-only
-for the initial port. Running `phx-port daemon` directly on macOS must work.
-A later design may add a LaunchAgent, but it is independent of descriptor
-handoff.
+`proxy install-service` and `proxy uninstall-service` remain the existing
+Linux/systemd development-service commands. Running `phx-port daemon` directly
+on macOS continues to work. Public macOS deployments install
+`packaging/launchd/dev.phx-port.ingress.plist` administratively; its named
+public listener activation is independent of descriptor handoff.
 
 ## Phoenix/Bandit integration changes
 
@@ -784,7 +785,8 @@ When implementation is complete:
 - leave the .NET README Linux-only until that receiver is actually ported;
 - update the portability and delivery status in
   `docs/socket-forwarding-design.md`; and
-- document that system service installation remains Linux-only.
+- document that the convenience service commands remain Linux-only while the
+  public LaunchDaemon is installed administratively.
 
 Do not describe macOS handoff as supported before its end-to-end tests pass.
 
@@ -934,8 +936,9 @@ Implement in tracer-bullet order so each step leaves Linux usable:
 8. Port the Rust sample as an independent receiver implementation.
 9. Run HTTP/2, WebSocket, concurrency, restart, and fallback end-to-end tests.
 10. Update support documentation.
-11. Consider the .NET receiver and `launchd` integration as separate follow-up
-    changes.
+11. Consider the .NET receiver separately; public-ingress launchd activation
+    is delivered by the public-hosting hardening work rather than the PHXP
+    transport port.
 
 Do not start by changing documentation claims or widening all `cfg` gates.
 First establish a real Darwin descriptor-transfer test.

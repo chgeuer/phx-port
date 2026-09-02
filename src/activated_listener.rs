@@ -2,16 +2,18 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::env;
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const IPV4_DESCRIPTOR_NAME: &str = "tls-ipv4";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const IPV6_DESCRIPTOR_NAME: &str = "tls-ipv6";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -19,6 +21,8 @@ pub enum ListenerOrigin {
     Direct,
     #[cfg(target_os = "linux")]
     Systemd(String),
+    #[cfg(target_os = "macos")]
+    Launchd(String),
 }
 
 pub struct IngressListener {
@@ -29,12 +33,31 @@ pub struct IngressListener {
 struct ExpectedListener {
     configured: String,
     address: SocketAddr,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     descriptor_name: &'static str,
 }
 
 pub fn acquire(configured_addresses: &[String]) -> Result<Vec<IngressListener>, String> {
-    let expected = configured_addresses
+    let expected = expected_listeners(configured_addresses)?;
+
+    #[cfg(target_os = "linux")]
+    if let Some(descriptors) = systemd_descriptors(expected.len())? {
+        return acquire_systemd(&expected, descriptors);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(descriptors) = launchd_descriptors(&expected)? {
+        return acquire_launchd(&expected, descriptors);
+    }
+
+    acquire_direct_expected(expected)
+}
+
+pub fn acquire_direct(configured_addresses: &[String]) -> Result<Vec<IngressListener>, String> {
+    acquire_direct_expected(expected_listeners(configured_addresses)?)
+}
+
+fn expected_listeners(configured_addresses: &[String]) -> Result<Vec<ExpectedListener>, String> {
+    configured_addresses
         .iter()
         .map(|configured| {
             let address = configured.parse::<SocketAddr>().map_err(|error| {
@@ -43,7 +66,7 @@ pub fn acquire(configured_addresses: &[String]) -> Result<Vec<IngressListener>, 
             Ok(ExpectedListener {
                 configured: configured.clone(),
                 address,
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 descriptor_name: if address.is_ipv4() {
                     IPV4_DESCRIPTOR_NAME
                 } else {
@@ -51,13 +74,12 @@ pub fn acquire(configured_addresses: &[String]) -> Result<Vec<IngressListener>, 
                 },
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect()
+}
 
-    #[cfg(target_os = "linux")]
-    if let Some(descriptors) = systemd_descriptors(expected.len())? {
-        return acquire_systemd(&expected, descriptors);
-    }
-
+fn acquire_direct_expected(
+    expected: Vec<ExpectedListener>,
+) -> Result<Vec<IngressListener>, String> {
     expected
         .into_iter()
         .map(|expected| {
@@ -89,6 +111,166 @@ fn bind_listener(address: SocketAddr) -> io::Result<TcpListener> {
     Ok(socket.into())
 }
 
+#[cfg(target_os = "macos")]
+struct LaunchdDescriptor {
+    fd: OwnedFd,
+    name: String,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn launch_activate_socket(
+        name: *const nix::libc::c_char,
+        fds: *mut *mut nix::libc::c_int,
+        count: *mut usize,
+    ) -> nix::libc::c_int;
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_descriptors(
+    expected: &[ExpectedListener],
+) -> Result<Option<Vec<LaunchdDescriptor>>, String> {
+    let mut names = BTreeMap::new();
+    for listener in expected {
+        if names.insert(listener.descriptor_name, ()).is_some() {
+            return Err(format!(
+                "launchd activation requires at most one configured {} listener",
+                if listener.address.is_ipv4() {
+                    "IPv4"
+                } else {
+                    "IPv6"
+                }
+            ));
+        }
+    }
+
+    let mut descriptors = Vec::new();
+    let mut missing = Vec::new();
+
+    for listener in expected {
+        let name = CString::new(listener.descriptor_name)
+            .expect("launchd listener descriptor names are static and contain no NUL");
+        let mut raw_fds = std::ptr::null_mut();
+        let mut count = 0_usize;
+        let result = unsafe { launch_activate_socket(name.as_ptr(), &mut raw_fds, &mut count) };
+        if result != 0 {
+            if result == nix::libc::ENOENT || result == nix::libc::ESRCH {
+                missing.push(listener.descriptor_name);
+                continue;
+            }
+            return Err(format!(
+                "launchd activation failed for socket {:?}: {}",
+                listener.descriptor_name,
+                io::Error::from_raw_os_error(result)
+            ));
+        }
+
+        if count > 0 && raw_fds.is_null() {
+            return Err(format!(
+                "launchd returned a null descriptor array for socket {:?}",
+                listener.descriptor_name
+            ));
+        }
+        let supplied = if count == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(raw_fds, count) }
+                .iter()
+                .map(|fd| unsafe { OwnedFd::from_raw_fd(*fd) })
+                .collect::<Vec<_>>()
+        };
+        unsafe { nix::libc::free(raw_fds.cast()) };
+        if supplied.len() != 1 {
+            return Err(format!(
+                "launchd supplied {} descriptors for socket {:?}, expected exactly one",
+                supplied.len(),
+                listener.descriptor_name
+            ));
+        }
+        descriptors.push(LaunchdDescriptor {
+            fd: supplied.into_iter().next().unwrap(),
+            name: listener.descriptor_name.to_string(),
+        });
+    }
+
+    if descriptors.is_empty() {
+        return Ok(None);
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "launchd did not supply required listener descriptor(s): {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(Some(descriptors))
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_launchd(
+    expected: &[ExpectedListener],
+    descriptors: Vec<LaunchdDescriptor>,
+) -> Result<Vec<IngressListener>, String> {
+    let mut expected_by_name = BTreeMap::new();
+    for (index, listener) in expected.iter().enumerate() {
+        if expected_by_name
+            .insert(listener.descriptor_name, index)
+            .is_some()
+        {
+            return Err(format!(
+                "launchd activation requires at most one configured {} listener",
+                if listener.address.is_ipv4() {
+                    "IPv4"
+                } else {
+                    "IPv6"
+                }
+            ));
+        }
+    }
+
+    let mut acquired = std::iter::repeat_with(|| None)
+        .take(expected.len())
+        .collect::<Vec<Option<IngressListener>>>();
+    for descriptor in descriptors {
+        let Some(index) = expected_by_name.get(descriptor.name.as_str()).copied() else {
+            return Err(format!(
+                "launchd supplied unexpected listener descriptor name {:?}",
+                descriptor.name
+            ));
+        };
+        if acquired[index].is_some() {
+            return Err(format!(
+                "launchd supplied duplicate listener descriptor name {:?}",
+                descriptor.name
+            ));
+        }
+
+        let fd = descriptor.fd.as_raw_fd();
+        let listener = TcpListener::from(descriptor.fd);
+        validate_launchd_listener(&listener, &expected[index]).map_err(|error| {
+            format!(
+                "invalid launchd listener {} on fd {fd}: {error}",
+                descriptor.name
+            )
+        })?;
+        acquired[index] = Some(IngressListener {
+            listener,
+            origin: ListenerOrigin::Launchd(descriptor.name),
+        });
+    }
+
+    acquired
+        .into_iter()
+        .enumerate()
+        .map(|(index, listener)| {
+            listener.ok_or_else(|| {
+                format!(
+                    "launchd did not supply required listener descriptor {}",
+                    expected[index].descriptor_name
+                )
+            })
+        })
+        .collect()
+}
 #[cfg(target_os = "linux")]
 struct SystemdDescriptor {
     fd: RawFd,
@@ -263,13 +445,33 @@ fn validate_systemd_listener(
     listener: &TcpListener,
     expected: &ExpectedListener,
 ) -> Result<(), String> {
+    validate_activated_listener(listener, expected)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_launchd_listener(
+    listener: &TcpListener,
+    expected: &ExpectedListener,
+) -> Result<(), String> {
+    validate_activated_listener(listener, expected)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_activated_listener(
+    listener: &TcpListener,
+    expected: &ExpectedListener,
+) -> Result<(), String> {
     let fd = listener.as_raw_fd();
     if socket_option(fd, nix::libc::SOL_SOCKET, nix::libc::SO_TYPE)? != nix::libc::SOCK_STREAM {
         return Err("descriptor is not a TCP stream socket".to_string());
     }
+    #[cfg(target_os = "linux")]
     if socket_option(fd, nix::libc::SOL_SOCKET, nix::libc::SO_PROTOCOL)? != nix::libc::IPPROTO_TCP {
         return Err("descriptor does not use the TCP protocol".to_string());
     }
+    #[cfg(target_os = "macos")]
+    socket_option(fd, nix::libc::IPPROTO_TCP, nix::libc::TCP_NODELAY)
+        .map_err(|_| "descriptor does not use the TCP protocol".to_string())?;
     if socket_option(fd, nix::libc::SOL_SOCKET, nix::libc::SO_ACCEPTCONN)? != 1 {
         return Err("descriptor is not a listening socket".to_string());
     }
@@ -296,7 +498,7 @@ fn validate_systemd_listener(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn listener_address_matches(mut actual: SocketAddr, expected: SocketAddr) -> bool {
     if expected.port() == 0 {
         actual.set_port(0);
@@ -328,7 +530,7 @@ fn process_pidfd_id() -> Result<u64, String> {
     Ok(metadata.st_ino)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn socket_option(fd: RawFd, level: i32, option: i32) -> Result<i32, String> {
     let mut value = 0_i32;
     let mut length = std::mem::size_of::<i32>() as nix::libc::socklen_t;
@@ -352,7 +554,7 @@ fn socket_option(fd: RawFd, level: i32, option: i32) -> Result<i32, String> {
     Ok(value)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn set_close_on_exec(fd: RawFd) -> Result<(), String> {
     let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
     if flags == -1 {

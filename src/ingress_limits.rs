@@ -1,6 +1,5 @@
-use crate::ingress_config::HostingProfile;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -13,7 +12,7 @@ use std::fs;
 use std::path::{Component, Path};
 
 pub const DAEMON_USAGE: &str = "\
-Usage: phx-port daemon [--listen ADDRESS]... [--ingress-config PATH]
+Usage: phx-port daemon [--listen ADDRESS]... [--ingress-config PATH] [--run-as USER]
        [--active-connections N] [--pre-routing-connections N]
        [--relay-connections N] [--handoff-negotiations N]
        [--accepts-per-second N] [--accept-burst N]
@@ -180,9 +179,11 @@ impl Default for IngressLimits {
 #[derive(Debug, Eq, PartialEq)]
 pub struct DaemonConfig {
     pub listen_addresses: Vec<String>,
+    pub listeners_explicit: bool,
+    pub ingress_config: Option<PathBuf>,
+    pub run_as: Option<String>,
     pub limits: IngressLimits,
     pub task_budget: Option<usize>,
-    pub hosting_profile: HostingProfile,
 }
 
 impl DaemonConfig {
@@ -191,6 +192,7 @@ impl DaemonConfig {
         let mut limits = IngressLimits::default();
         let mut task_budget = None;
         let mut ingress_config = None;
+        let mut run_as = None;
         let mut index = 0;
 
         while index < args.len() {
@@ -203,6 +205,14 @@ impl DaemonConfig {
                 "--ingress-config" => {
                     if ingress_config.replace(PathBuf::from(value)).is_some() {
                         return Err("--ingress-config may be specified only once".to_string());
+                    }
+                }
+                "--run-as" => {
+                    if value.is_empty() {
+                        return Err("--run-as requires a nonempty user name".to_string());
+                    }
+                    if run_as.replace(value.clone()).is_some() {
+                        return Err("--run-as may be specified only once".to_string());
                     }
                 }
                 "--active-connections" => {
@@ -257,21 +267,21 @@ impl DaemonConfig {
             index += 2;
         }
 
-        if listen_addresses.is_empty() {
+        let listeners_explicit = !listen_addresses.is_empty();
+        if run_as.is_some() && !listeners_explicit {
+            return Err("--run-as requires at least one explicit --listen address".to_string());
+        }
+        if !listeners_explicit {
             listen_addresses.extend(["0.0.0.0:443".to_string(), "[::]:443".to_string()]);
         }
-        let loopback_only = listen_addresses.iter().all(|address| {
-            address
-                .parse::<SocketAddr>()
-                .is_ok_and(|address| address.ip().is_loopback())
-        });
-        let hosting_profile = HostingProfile::load_for_daemon(ingress_config, loopback_only)?;
 
         Ok(Self {
             listen_addresses,
+            listeners_explicit,
+            ingress_config,
+            run_as,
             limits,
             task_budget,
-            hosting_profile,
         })
     }
 }
@@ -1104,6 +1114,9 @@ mod tests {
 
         let config = DaemonConfig::parse(&args).unwrap();
         assert_eq!(config.listen_addresses, ["127.0.0.1:8443"]);
+        assert!(config.listeners_explicit);
+        assert_eq!(config.ingress_config, None);
+        assert_eq!(config.run_as, None);
         let expected = IngressLimits {
             active_connections: 200,
             pre_routing_connections: 100,
@@ -1139,6 +1152,36 @@ mod tests {
         };
         assert_eq!(config.limits, expected);
         assert_eq!(config.task_budget, Some(600));
+    }
+
+    #[test]
+    fn run_as_requires_explicit_listeners_and_is_parsed_once() {
+        let missing = ["--run-as", "daemon-user"].map(str::to_string);
+        assert!(
+            DaemonConfig::parse(&missing)
+                .unwrap_err()
+                .contains("requires at least one explicit --listen")
+        );
+
+        let args = ["--run-as", "daemon-user", "--listen", "0.0.0.0:443"].map(str::to_string);
+        let config = DaemonConfig::parse(&args).unwrap();
+        assert_eq!(config.run_as.as_deref(), Some("daemon-user"));
+        assert!(config.listeners_explicit);
+
+        let duplicate = [
+            "--run-as",
+            "daemon-user",
+            "--run-as",
+            "other-user",
+            "--listen",
+            "0.0.0.0:443",
+        ]
+        .map(str::to_string);
+        assert!(
+            DaemonConfig::parse(&duplicate)
+                .unwrap_err()
+                .contains("may be specified only once")
+        );
     }
 
     #[test]

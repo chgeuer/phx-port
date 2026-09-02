@@ -20,6 +20,7 @@ mod handoff_stream;
 mod ingress_config;
 mod ingress_limits;
 mod port_registry;
+mod privilege;
 mod production_paths;
 mod proxy;
 mod route_cache;
@@ -48,7 +49,7 @@ USAGE:
     phx-port delete <X> debug   Remove a specific port role
     phx-port running            Show which registered projects are currently running
     phx-port discover           Open a browser page to pick a running project
-    phx-port daemon [--listen ADDRESS]... [--ingress-config PATH] [CAPACITY OPTIONS]
+    phx-port daemon [--listen ADDRESS]... [--ingress-config PATH] [--run-as USER] [CAPACITY OPTIONS]
                                 Route TLS by SNI to live https/main workloads
     phx-port proxy status       Show live daemon state and counters
     phx-port proxy routes       Show persistently discovered TLS routes

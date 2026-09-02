@@ -5,12 +5,14 @@ use crate::{
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use toml_edit::DocumentMut;
 
 const INGRESS_CONFIG_ENV: &str = "PHX_PORT_INGRESS_CONFIG";
 pub(crate) const MAX_ROUTE_DECLARATIONS: usize = 1_000;
+const MAX_INGRESS_LISTENERS: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteDeclaration {
@@ -25,6 +27,7 @@ pub struct PublicIngressSnapshot {
     pub ingress_config: PathBuf,
     pub intent_owner: IntentOwner,
     pub generation: u64,
+    pub listeners: Option<Vec<SocketAddr>>,
     pub routes: BTreeMap<String, RouteDeclaration>,
 }
 
@@ -103,7 +106,7 @@ impl HostingProfile {
             .and_then(|item| item.as_table())
             .expect("the public mode was read from an ingress table");
         for (key, _) in ingress {
-            if !matches!(key, "mode" | "unknown_sni" | "hosts") {
+            if !matches!(key, "mode" | "unknown_sni" | "listen" | "hosts") {
                 return Err(format!(
                     "ingress config {} contains unknown [ingress] key {key:?}",
                     path.display()
@@ -118,6 +121,62 @@ impl HostingProfile {
                 path.display()
             ));
         }
+        let listeners = match ingress.get("listen") {
+            None => None,
+            Some(item) => {
+                let configured = item.as_array().ok_or_else(|| {
+                    format!(
+                        "ingress config {} [ingress] listen must be an array of socket addresses",
+                        path.display()
+                    )
+                })?;
+                if configured.is_empty() {
+                    return Err(format!(
+                        "ingress config {} [ingress] listen must contain at least one socket address",
+                        path.display()
+                    ));
+                }
+                if configured.len() > MAX_INGRESS_LISTENERS {
+                    return Err(format!(
+                        "ingress config {} [ingress] listen contains {} addresses, exceeding the limit of {MAX_INGRESS_LISTENERS}",
+                        path.display(),
+                        configured.len()
+                    ));
+                }
+                let mut parsed = Vec::with_capacity(configured.len());
+                for value in configured {
+                    let value = value.as_str().ok_or_else(|| {
+                        format!(
+                            "ingress config {} [ingress] listen entries must be strings",
+                            path.display()
+                        )
+                    })?;
+                    let address = value.parse::<SocketAddr>().map_err(|error| {
+                        format!(
+                            "ingress config {} has invalid listener address {value:?}: {error}",
+                            path.display()
+                        )
+                    })?;
+                    if address.port() == 0 {
+                        return Err(format!(
+                            "ingress config {} listener address {value:?} must use a nonzero port",
+                            path.display()
+                        ));
+                    }
+                    if parsed.iter().any(|existing: &SocketAddr| {
+                        existing == &address || existing.is_ipv4() == address.is_ipv4()
+                    }) {
+                        return Err(format!(
+                            "ingress config {} [ingress] listen may declare at most one unique IPv4 and one unique IPv6 address",
+                            path.display()
+                        ));
+                    }
+                    parsed.push(address);
+                }
+                parsed.sort_unstable();
+                Some(parsed)
+            }
+        };
 
         let hosts = ingress
             .get("hosts")
@@ -232,6 +291,7 @@ impl HostingProfile {
             ingress_config: path,
             intent_owner: owner,
             generation,
+            listeners,
             routes,
         })))
     }
@@ -252,10 +312,62 @@ impl HostingProfile {
         let Self::Public(candidate_snapshot) = &candidate else {
             unreachable!("loading an explicit public config returns a public snapshot");
         };
+        if candidate_snapshot.listeners != current.listeners {
+            return Err(
+                "public ingress listener declarations cannot change during reload".to_string(),
+            );
+        }
         if candidate_snapshot.routes == current.routes {
             return Ok(None);
         }
         Ok(Some(candidate))
+    }
+
+    pub fn validate_daemon_listeners(
+        &self,
+        configured_addresses: &[String],
+        require_declarations: bool,
+    ) -> Result<(), String> {
+        if matches!(self, Self::Development) {
+            return Ok(());
+        }
+        let configured = configured_addresses
+            .iter()
+            .map(|configured| {
+                configured.parse::<SocketAddr>().map_err(|error| {
+                    format!("invalid ingress listener address {configured:?}: {error}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.validate_bound_listeners(&configured, require_declarations)
+    }
+
+    pub fn validate_bound_listeners(
+        &self,
+        bound_addresses: &[SocketAddr],
+        require_declarations: bool,
+    ) -> Result<(), String> {
+        let Self::Public(snapshot) = self else {
+            return Ok(());
+        };
+        let Some(expected) = snapshot.listeners.as_ref() else {
+            if require_declarations {
+                return Err(
+                    "manual --run-as public startup requires [ingress] listen declarations"
+                        .to_string(),
+                );
+            }
+            return Ok(());
+        };
+
+        let mut actual = bound_addresses.to_vec();
+        actual.sort_unstable();
+        if actual != *expected {
+            return Err(format!(
+                "bound daemon listeners {actual:?} do not match public [ingress] listen declarations {expected:?}"
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -349,6 +461,7 @@ mod tests {
                 ingress_config: public.clone(),
                 intent_owner: IntentOwner::EffectiveUser,
                 generation: 1,
+                listeners: None,
                 routes,
             }))
         );
@@ -410,6 +523,69 @@ mod tests {
         assert_eq!(snapshot.routes.len(), 2);
         assert!(snapshot.routes["www.example.com"].required);
         assert!(!snapshot.routes["api.example.com"].required);
+    }
+
+    #[test]
+    fn public_listener_declarations_are_bounded_and_match_daemon_addresses_exactly() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("ingress.toml");
+        fs::write(
+            &config,
+            "[ingress]\nmode = \"public\"\n\
+             listen = [\"[::]:443\", \"0.0.0.0:443\"]\n\
+             [ingress.hosts.\"www.example.com\"]\n\
+             workload = \"contoso-web\"\nrole = \"https\"\n",
+        )
+        .unwrap();
+        let profile =
+            HostingProfile::load_with_env(Some(config.clone()), None, IntentOwner::EffectiveUser)
+                .unwrap();
+        profile
+            .validate_daemon_listeners(&["0.0.0.0:443".to_string(), "[::]:443".to_string()], true)
+            .unwrap();
+        let error = profile
+            .validate_daemon_listeners(&["127.0.0.1:443".to_string()], true)
+            .unwrap_err();
+        assert!(error.contains("do not match"), "{error}");
+
+        for listeners in [
+            "[]",
+            "[\"127.0.0.1:0\"]",
+            "[\"127.0.0.1:443\", \"0.0.0.0:443\"]",
+            "[\"127.0.0.1:443\", \"[::1]:443\", \"[::]:443\"]",
+        ] {
+            fs::write(
+                &config,
+                format!(
+                    "[ingress]\nmode = \"public\"\nlisten = {listeners}\n\
+                     [ingress.hosts.\"www.example.com\"]\n\
+                     workload = \"contoso-web\"\nrole = \"https\"\n"
+                ),
+            )
+            .unwrap();
+            assert!(
+                HostingProfile::load_with_env(
+                    Some(config.clone()),
+                    None,
+                    IntentOwner::EffectiveUser,
+                )
+                .is_err(),
+                "unsafe listener declarations were accepted: {listeners}"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_public_startup_requires_listener_declarations() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("ingress.toml");
+        write_public_config(&config, "www.example.com", "contoso-web");
+        let profile =
+            HostingProfile::load_with_env(Some(config), None, IntentOwner::EffectiveUser).unwrap();
+        let error = profile
+            .validate_daemon_listeners(&["127.0.0.1:443".to_string()], true)
+            .unwrap_err();
+        assert!(error.contains("requires [ingress] listen"), "{error}");
     }
 
     #[test]
@@ -540,6 +716,33 @@ mod tests {
         assert_eq!(snapshot.generation, 2);
         assert!(snapshot.routes.contains_key("api.example.com"));
         assert!(!snapshot.routes.contains_key("www.example.com"));
+    }
+
+    #[test]
+    fn reload_rejects_listener_changes() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("ingress.toml");
+        fs::write(
+            &config,
+            "[ingress]\nmode = \"public\"\nlisten = [\"127.0.0.1:443\"]\n\
+             [ingress.hosts.\"www.example.com\"]\n\
+             workload = \"contoso-web\"\nrole = \"https\"\n",
+        )
+        .unwrap();
+        let profile =
+            HostingProfile::load_with_env(Some(config.clone()), None, IntentOwner::EffectiveUser)
+                .unwrap();
+        fs::write(
+            &config,
+            "[ingress]\nmode = \"public\"\nlisten = [\"127.0.0.1:8443\"]\n\
+             [ingress.hosts.\"www.example.com\"]\n\
+             workload = \"contoso-web\"\nrole = \"https\"\n",
+        )
+        .unwrap();
+
+        let error = profile.reload().unwrap_err();
+        assert!(error.contains("cannot change during reload"), "{error}");
+        assert_eq!(profile.public_snapshot().unwrap().generation, 1);
     }
 
     #[test]

@@ -162,6 +162,9 @@ through 1,000 `[ingress.hosts."<hostname>"]` Route Declarations with unique
 normalized exact hostnames, a valid logical `workload`, a bounded lowercase
 `role`, and an optional boolean `required` that defaults to `false`;
 `unknown_sni`, when present, must be `"reject"`.
+An optional `[ingress] listen` array declares at most one IPv4 and one IPv6
+socket address. It is mandatory for `--run-as` startup and immutable across
+configuration reloads.
 `PHX_PORT_WORKLOAD_ID` is not a profile selector.
 
 Each declaration resolves only its exact logical Workload/role assignment from
@@ -207,7 +210,10 @@ service-owned `/var/lib/phx-port/ports.toml`, disposable
 and do not activate public mode. A non-loopback listener requires root-owned
 intent; effective-user-owned intent is limited to loopback-only exercises.
 Security-sensitive files, locks, runtime, handoff, and control paths use
-no-follow ownership and mode validation before listeners bind.
+no-follow ownership and mode validation before ordinary unprivileged listener
+acquisition. The explicit bind-then-drop path is the exception described
+below: it cannot read or create those paths until after the identity
+transition.
 
 The transitional threaded configuration defaults to 256 active connections,
 128 pre-routing connections, 128 relays, 64 handoff negotiations, 200 accepts
@@ -266,6 +272,17 @@ removes the unit, and reloads the user manager. This command remains the
 development-profile user service and does not silently install or activate the
 public system service.
 
+`sudo phx-port daemon --run-as USER --listen ...` supports deliberate manual
+privileged binding without a root data plane. It requires every listener on
+the command line, resolves the target account and group set before binding,
+then clears and installs supplementary groups, sets GID before UID, verifies
+the final real/effective IDs and inability to regain UID 0, and enables Linux
+`no_new_privs`. Public intent is loaded only after the drop and its
+`[ingress] listen` declarations must exactly match the bound descriptors.
+State/runtime/control initialization, signal handlers, workers, and public
+accepts all occur afterward. Bare root daemon startup is rejected; non-daemon
+root CLI behavior is unchanged.
+
 The public Hosting Profile ships a system service plus separately named IPv4
 and IPv6 socket units under `packaging/systemd/`. The sockets own
 `0.0.0.0:443` and `[::]:443` and pass `tls-ipv4` and `tls-ipv6` descriptors.
@@ -295,6 +312,18 @@ socket, persisted derived route state, the local control endpoint, a
 zero-capability non-root data-plane process, service restart, and routing after
 restart. It requires a system manager and noninteractive administrative access
 and removes only its own temporary unit and runtime paths.
+
+The macOS public profile ships
+`packaging/launchd/dev.phx-port.ingress.plist`. Its `tls-ipv4` and `tls-ipv6`
+entries are retrieved by name through `launch_activate_socket()`. Each must
+return exactly one listening TCP socket on its configured address; adopted
+descriptors become nonblocking and close-on-exec, and ingress never rebinds
+them. The LaunchDaemon selects the dedicated `phx-port` identity and explicit
+macOS state/runtime roots. Release archives include the plist. The ignored
+`real_launchd_job_adopts_named_socket_and_runs_as_owner` integration installs a
+uniquely named disposable job in the current user's real launchd domain and
+proves descriptor adoption, final peer UID, and runtime ownership without
+requiring port 443.
 
 HTTPS workloads use a conventional named role:
 
