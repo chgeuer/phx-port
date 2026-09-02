@@ -164,16 +164,26 @@ logical `workload`, a bounded lowercase `role`, and an optional boolean
 `PHX_PORT_WORKLOAD_ID` is not a profile selector.
 
 The declaration resolves only its exact logical Workload/role assignment from
-the private `PHX_PORT_CONFIG` Port Registry. On first use, ingress connects
-only to that registered loopback port and activates the route only after
-system-trusted TLS verification succeeds for the exact declared hostname.
-Undeclared SNI is rejected before registry lookup, route-cache lookup, or
-certificate probing. Public verified routes are kept in memory and periodically
-revalidated against the same declaration; they never modify the stable Port
-Registry. Delivery is encrypted loopback relay-only until production PHXP
-runtime paths complete their separate Linux and macOS gate. Multi-route
-reconciliation, required-route readiness, reload, and distinct derived state
-remain later milestones.
+the private `PHX_PORT_CONFIG` Port Registry. Ingress reconciles a matching
+Workload that registers and binds after daemon startup, connects only to that
+registered loopback port, and activates the route only after system-trusted TLS
+verification succeeds for the exact declared hostname. Undeclared SNI is
+rejected before registry lookup, route-cache lookup, or certificate probing.
+Public verified routes are kept in memory and periodically revalidated against
+the same declaration; they never modify the stable Port Registry.
+
+After verification, public delivery prefers PHXP at
+`/run/phx-port/handoff/<sha256(workload-id NUL role)>.sock`. The
+`PHX_PORT_RUNTIME_DIR` override selects a different runtime root for both
+ingress and Workload and is required for macOS production, where `/run` is not
+available. Workload adapters select logical PHXP identity explicitly rather
+than interpreting `PHX_PORT_WORKLOAD_ID` as a public-profile selector. The
+endpoint remains Workload-owned across ingress restart. Missing, incompatible,
+or safely pre-delivery-failing handoff falls back to encrypted loopback relay;
+every post-delivery failure closes without relay. Linux `SO_PEERCRED`, macOS
+`getpeereid`, and the existing descriptor ownership state machine remain
+authoritative. Multi-route reconciliation, required-route readiness, reload,
+and distinct derived state remain later milestones.
 
 The transitional threaded configuration defaults to 256 active connections,
 128 pre-routing connections, 128 relays, 64 handoff negotiations, 200 accepts

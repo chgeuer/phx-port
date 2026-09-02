@@ -168,16 +168,31 @@ Set `PHX_PORT_CONFIG` to the private logical Workload registry populated by
 `(Workload ID, role)` assignment and probes only that loopback listener. The
 route becomes active only after the listener presents a system-trusted
 certificate valid for the exact declared hostname. Undeclared SNI never reads
-the dynamic route cache or probes any registered Workload.
+the dynamic route cache or probes any registered Workload. A Workload that
+allocates and binds after ingress starts is reconciled in the background and
+becomes active only after the same reachability and certificate proof.
 
-Public delivery is encrypted loopback relay-only at this milestone; production
-PHXP endpoint activation remains a separate, cross-platform gate. Verified
-public routes stay in memory rather than modifying the stable Port Registry,
-and are revalidated against the same declaration and certificate. Multi-route
-reconciliation, readiness semantics for `required`, reload, and split derived
-state are later milestones, so this is not yet a production-ready ingress
-claim. `proxy status` reports the active `hosting_profile` and route/relay
-counters.
+A compatible production Workload explicitly gives its PHXP adapter the same
+logical ID as `PHX_PORT_WORKLOAD_ID` and the declared role, then listens at
+`/run/phx-port/handoff/<sha256(workload-id NUL role)>.sock`. The daemon prefers
+that original-descriptor PHXP handoff and falls back to encrypted loopback
+relay only when handoff is unavailable before descriptor delivery.
+`PHX_PORT_RUNTIME_DIR` overrides `/run/phx-port` for both peers in tests or
+nonstandard deployments; it is required for a macOS production root because
+macOS does not provide `/run`. `PHX_PORT_WORKLOAD_ID` alone remains only an
+allocator identity and does not change development PHXP derivation or activate
+public ingress. Ingress never creates, removes, or globally cleans
+Workload-owned endpoints, so they survive ingress restart. The handoff
+directory remains service-owned mode `0700`; same-UID peer authentication and
+the irreversible post-delivery no-relay boundary are unchanged on Linux and
+macOS.
+
+Verified public routes stay in memory rather than modifying the stable Port
+Registry, and are revalidated against the same declaration and certificate.
+Multi-route reconciliation, readiness semantics for `required`, reload, and
+split derived state are later milestones, so this is not yet a
+production-ready ingress claim. `proxy status` reports the active
+`hosting_profile` and distinct handoff, fallback, and relay counters.
 
 The threaded daemon has explicit startup capacity options:
 

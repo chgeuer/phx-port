@@ -8,23 +8,31 @@ defmodule PhxPortHandoff do
   @type broker :: reference()
   @type receipt :: reference()
   @type address_family :: :inet | :inet6
+  @type endpoint_identity :: Path.t() | {:workload, String.t()}
+  @production_runtime_root "/run/phx-port"
+  @workload_id_pattern ~r/\A[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?\z/
 
-  @spec endpoint_path(Path.t(), String.t()) :: Path.t()
-  def endpoint_path(project, role) do
-    hash =
-      :crypto.hash(:sha256, [Path.expand(project), <<0>>, role]) |> Base.encode16(case: :lower)
-
-    Path.join(runtime_handoff_directory(), hash <> ".sock")
+  @spec endpoint_path(endpoint_identity(), String.t()) :: Path.t()
+  def endpoint_path(identity, role) do
+    {path, _validate_runtime_root?} = derived_endpoint(identity, role)
+    path
   end
 
-  @spec listen(Path.t(), String.t()) :: {:ok, broker()} | {:error, term()}
-  def listen(project, role) do
-    Native.listen_derived(endpoint_path(project, role))
+  @spec listen(endpoint_identity(), String.t()) :: {:ok, broker()} | {:error, term()}
+  def listen(identity, role) do
+    {path, validate_runtime_root?} = derived_endpoint(identity, role)
+
+    if validate_runtime_root? do
+      Native.listen_derived(path)
+    else
+      Native.listen(path)
+    end
   end
 
-  @spec bandit_child_spec(module(), Path.t(), String.t(), keyword()) :: Supervisor.child_spec()
-  def bandit_child_spec(plug, project, role, tls_options) do
-    handoff_path = endpoint_path(project, role)
+  @spec bandit_child_spec(module(), endpoint_identity(), String.t(), keyword()) ::
+          Supervisor.child_spec()
+  def bandit_child_spec(plug, identity, role, tls_options) do
+    {handoff_path, validate_runtime_root?} = derived_endpoint(identity, role)
     thousand_island_options = Keyword.get(tls_options, :thousand_island_options, [])
     transport_options = Keyword.get(thousand_island_options, :transport_options, [])
 
@@ -33,7 +41,10 @@ defmodule PhxPortHandoff do
       |> Keyword.put(:transport_module, PhxPortHandoff.Transport)
       |> Keyword.put(
         :transport_options,
-        [handoff_path: handoff_path, derived_handoff_path: true] ++ transport_options
+        [
+          handoff_path: handoff_path,
+          derived_handoff_path: validate_runtime_root?
+        ] ++ transport_options
       )
       |> Keyword.put(:num_acceptors, 1)
 
@@ -49,7 +60,7 @@ defmodule PhxPortHandoff do
       )
 
     %{
-      id: {__MODULE__, Path.expand(project), role},
+      id: {__MODULE__, child_identity(identity), role},
       start: {Bandit, :start_link, [options]},
       type: :supervisor
     }
@@ -69,23 +80,48 @@ defmodule PhxPortHandoff do
     end
   end
 
-  defp runtime_handoff_directory do
-    case nonempty_env("PHX_PORT_RUNTIME_DIR") do
-      nil ->
-        case :os.type() do
-          {:unix, :linux} ->
-            Path.join([System.fetch_env!("XDG_RUNTIME_DIR"), "phx-port", "handoff"])
+  defp derived_endpoint({:workload, workload_id}, role) do
+    validate_workload_id!(workload_id)
+    hash = :crypto.hash(:sha256, [workload_id, <<0>>, role]) |> Base.encode16(case: :lower)
+    {Path.join(runtime_handoff_directory(:production), hash <> ".sock"), false}
+  end
 
-          {:unix, :darwin} ->
-            Path.join(["/tmp", "phx-port-#{Native.effective_uid()}", "handoff"])
+  defp derived_endpoint(project, role) when is_binary(project) do
+    project = Path.expand(project)
+    hash = :crypto.hash(:sha256, [project, <<0>>, role]) |> Base.encode16(case: :lower)
+    {Path.join(runtime_handoff_directory(:development), hash <> ".sock"), true}
+  end
 
-          platform ->
-            raise "socket handoff is unavailable on #{inspect(platform)}"
-        end
-
-      runtime ->
-        Path.join(runtime, "handoff")
+  defp validate_workload_id!(workload_id) do
+    unless is_binary(workload_id) and byte_size(workload_id) in 1..128 and
+             Regex.match?(@workload_id_pattern, workload_id) do
+      raise ArgumentError,
+            "logical Workload ID must contain 1 through 128 lowercase ASCII letters, digits, '.', '_', or '-', and start and end with a letter or digit"
     end
+  end
+
+  defp child_identity({:workload, workload_id}), do: {:workload, workload_id}
+  defp child_identity(project), do: Path.expand(project)
+
+  defp runtime_handoff_directory(profile) do
+    case nonempty_env("PHX_PORT_RUNTIME_DIR") do
+      nil -> default_runtime_handoff_directory(profile, :os.type())
+      runtime -> Path.join(runtime, "handoff")
+    end
+  end
+
+  defp default_runtime_handoff_directory(:production, {:unix, platform})
+       when platform in [:linux, :darwin],
+       do: Path.join(@production_runtime_root, "handoff")
+
+  defp default_runtime_handoff_directory(:development, {:unix, :linux}),
+    do: Path.join([System.fetch_env!("XDG_RUNTIME_DIR"), "phx-port", "handoff"])
+
+  defp default_runtime_handoff_directory(:development, {:unix, :darwin}),
+    do: Path.join(["/tmp", "phx-port-#{Native.effective_uid()}", "handoff"])
+
+  defp default_runtime_handoff_directory(_profile, platform) do
+    raise "socket handoff is unavailable on #{inspect(platform)}"
   end
 
   defp nonempty_env(name) do

@@ -48,7 +48,10 @@ handoff endpoint identity. The project defaults to the current directory and
 the role defaults to `https`. Linux derives the endpoint below
 `$XDG_RUNTIME_DIR/phx-port/handoff`; macOS uses
 `/tmp/phx-port-<euid>/handoff`. `PHX_PORT_RUNTIME_DIR` overrides the runtime
-root on either platform.
+root on either platform. A production application explicitly passes
+`{:workload, System.fetch_env!("PHX_PORT_WORKLOAD_ID")}` instead of the project
+path to `PhxPortHandoff.bandit_child_spec/4`; that logical identity defaults to
+`/run/phx-port/handoff/<hash>.sock`.
 
 Every response is `text/plain` and has this shape:
 

@@ -305,8 +305,10 @@ async fn run() -> Result<(), String> {
     let https_listener = TcpListener::bind(config.https)
         .await
         .map_err(|e| format!("cannot bind HTTPS {}: {e}", config.https))?;
-    let handoff =
-        handoff::HandoffListener::bind(&config.handoff_socket, config.handoff_socket_is_derived)?;
+    let handoff = handoff::HandoffListener::bind(
+        &config.handoff_socket,
+        config.validate_handoff_runtime_root,
+    )?;
 
     println!(
         "HTTP:  http://{}",
@@ -348,7 +350,7 @@ struct Config {
     project: String,
     role: String,
     handoff_socket: PathBuf,
-    handoff_socket_is_derived: bool,
+    validate_handoff_runtime_root: bool,
 }
 
 impl Config {
@@ -358,6 +360,7 @@ impl Config {
         let mut cert = env_value("PHXP_TLS_CERT");
         let mut key = env_value("PHXP_TLS_KEY");
         let mut project = env_value("PHXP_PROJECT");
+        let mut workload_id = env_value("PHXP_WORKLOAD_ID");
         let mut role = env_value("PHXP_ROLE").unwrap_or_else(|| "https".into());
         let mut handoff_socket = env_value("PHXP_HANDOFF_SOCKET").map(PathBuf::from);
 
@@ -374,6 +377,7 @@ impl Config {
                 "--cert" => cert = Some(value(&mut arguments)?),
                 "--key" => key = Some(value(&mut arguments)?),
                 "--project" => project = Some(value(&mut arguments)?),
+                "--workload-id" => workload_id = Some(value(&mut arguments)?),
                 "--role" => role = value(&mut arguments)?,
                 "--handoff-socket" => {
                     handoff_socket = Some(PathBuf::from(value(&mut arguments)?));
@@ -396,9 +400,21 @@ impl Config {
             .to_str()
             .ok_or_else(|| "project path is not valid UTF-8".to_string())?
             .to_string();
-        let (handoff_socket, handoff_socket_is_derived) = match handoff_socket {
+        if let Some(workload_id) = workload_id.as_deref() {
+            validate_workload_id(workload_id)?;
+        }
+        let (handoff_socket, validate_handoff_runtime_root) = match handoff_socket {
             Some(path) => (path, false),
-            None => (handoff::endpoint_path(&project, &role)?, true),
+            None => {
+                let identity = match workload_id.as_deref() {
+                    Some(workload_id) => handoff::HandoffIdentity::Production(workload_id),
+                    None => handoff::HandoffIdentity::Development(&project),
+                };
+                (
+                    handoff::endpoint_path(identity, &role)?,
+                    workload_id.is_none(),
+                )
+            }
         };
 
         Ok(Self {
@@ -413,9 +429,26 @@ impl Config {
             project,
             role,
             handoff_socket,
-            handoff_socket_is_derived,
+            validate_handoff_runtime_root,
         })
     }
+}
+
+fn validate_workload_id(workload_id: &str) -> Result<(), String> {
+    let bytes = workload_id.as_bytes();
+    if !(1..=128).contains(&bytes.len())
+        || !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+    {
+        return Err(
+            "PHXP_WORKLOAD_ID must contain 1 through 128 lowercase ASCII letters, digits, '.', '_', or '-', and start and end with a letter or digit"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -432,6 +465,7 @@ fn print_help() {
            --cert PATH             PEM certificate chain [env PHXP_TLS_CERT, required]\n\
            --key PATH              PEM private key [env PHXP_TLS_KEY, required]\n\
            --project PATH          Registered project path [env PHXP_PROJECT, default cwd]\n\
+           --workload-id ID        Explicit logical production Workload [env PHXP_WORKLOAD_ID]\n\
            --role NAME             Registered TLS role [env PHXP_ROLE, default https]\n\
            --handoff-socket PATH   Override derived PHXP endpoint [env PHXP_HANDOFF_SOCKET]\n\
            -h, --help              Show this help"
@@ -572,5 +606,16 @@ mod tests {
 
         let not_wrapped = WrapError(io::Error::from(io::ErrorKind::InvalidData));
         assert!(!is_expected_disconnect(&not_wrapped));
+    }
+
+    #[test]
+    fn logical_workload_id_validation_matches_the_allocator_contract() {
+        for workload_id in ["a", "contoso-web", "api.v2_worker"] {
+            assert!(validate_workload_id(workload_id).is_ok());
+        }
+        for workload_id in ["", "-contoso", "contoso-", "Contoso", "../contoso"] {
+            assert!(validate_workload_id(workload_id).is_err());
+        }
+        assert!(validate_workload_id(&"a".repeat(129)).is_err());
     }
 }

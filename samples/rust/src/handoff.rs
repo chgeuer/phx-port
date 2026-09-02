@@ -36,6 +36,7 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 const REJECT_INVALID_DESCRIPTOR: u16 = 1;
 const REJECT_DUPLICATE_ID: u16 = 2;
 const REJECT_ADOPTION_FAILED: u16 = 3;
+const PRODUCTION_RUNTIME_ROOT: &str = "/run/phx-port";
 
 #[cfg(target_os = "linux")]
 type Control = OwnedFd;
@@ -157,11 +158,37 @@ impl Drop for HandoffListener {
     }
 }
 
-pub(crate) fn endpoint_path(project: &str, role: &str) -> Result<PathBuf, String> {
-    let hash = endpoint_hash(project, role);
-    let path = match nonempty_env("PHX_PORT_RUNTIME_DIR") {
-        Some(runtime) => endpoint_path_in(Path::new(&runtime), false, &hash),
-        None => platform_default_endpoint(&hash)?,
+#[derive(Clone, Copy)]
+pub(crate) enum HandoffIdentity<'a> {
+    Development(&'a str),
+    Production(&'a str),
+}
+
+pub(crate) fn endpoint_path(identity: HandoffIdentity<'_>, role: &str) -> Result<PathBuf, String> {
+    let runtime_override = nonempty_env("PHX_PORT_RUNTIME_DIR").map(PathBuf::from);
+    endpoint_path_with_runtime(identity, role, runtime_override.as_deref())
+}
+
+fn endpoint_path_with_runtime(
+    identity: HandoffIdentity<'_>,
+    role: &str,
+    runtime_override: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let hash = endpoint_hash(
+        match identity {
+            HandoffIdentity::Development(project) => project,
+            HandoffIdentity::Production(workload) => workload,
+        },
+        role,
+    );
+    let path = match runtime_override {
+        Some(runtime) => endpoint_path_in(runtime, false, &hash),
+        None => match identity {
+            HandoffIdentity::Development(_) => platform_default_endpoint(&hash)?,
+            HandoffIdentity::Production(_) => {
+                endpoint_path_in(Path::new(PRODUCTION_RUNTIME_ROOT), false, &hash)
+            }
+        },
     };
     UnixAddr::new(&path).map_err(|error| {
         format!(
@@ -664,8 +691,9 @@ fn hex_id(id: &[u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        HandoffListener, create_private_directory, endpoint_hash, endpoint_path_in,
-        ensure_endpoint_directory, ensure_private_directory, remove_stale_endpoint,
+        HandoffIdentity, HandoffListener, create_private_directory, endpoint_hash,
+        endpoint_path_in, endpoint_path_with_runtime, ensure_endpoint_directory,
+        ensure_private_directory, remove_stale_endpoint,
     };
     use std::fs;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
@@ -687,6 +715,45 @@ mod tests {
         let expected = format!("/tmp/phx-port-501/handoff/{hash}.sock");
 
         assert_eq!(path.to_string_lossy(), expected);
+    }
+
+    #[test]
+    fn logical_workload_endpoint_matches_the_production_daemon() {
+        let hash = endpoint_hash("contoso-web", "https");
+        assert_eq!(
+            endpoint_path_with_runtime(HandoffIdentity::Production("contoso-web"), "https", None)
+                .unwrap(),
+            Path::new("/run/phx-port")
+                .join("handoff")
+                .join(format!("{hash}.sock"))
+        );
+        assert_eq!(
+            endpoint_path_with_runtime(
+                HandoffIdentity::Production("contoso-web"),
+                "https",
+                Some(Path::new("/tmp/public-runtime"))
+            )
+            .unwrap(),
+            Path::new("/tmp/public-runtime")
+                .join("handoff")
+                .join(format!("{hash}.sock"))
+        );
+    }
+
+    #[test]
+    fn development_endpoint_remains_path_derived() {
+        let hash = endpoint_hash("/srv/contoso", "https");
+        assert_eq!(
+            endpoint_path_with_runtime(
+                HandoffIdentity::Development("/srv/contoso"),
+                "https",
+                Some(Path::new("/tmp/development-runtime"))
+            )
+            .unwrap(),
+            Path::new("/tmp/development-runtime")
+                .join("handoff")
+                .join(format!("{hash}.sock"))
+        );
     }
 
     #[test]

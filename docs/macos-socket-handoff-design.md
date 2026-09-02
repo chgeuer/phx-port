@@ -487,7 +487,8 @@ transport already does.
 
 ### Requirements
 
-The endpoint must:
+For the development Hosting Profile described by this document, the endpoint
+must:
 
 - be deterministic from canonical project path and role;
 - be discoverable independently by daemon and backend;
@@ -537,6 +538,15 @@ runtime root from a directory merely named `handoff`.
 The short `/tmp` location is intentional. Typical macOS `$TMPDIR` paths under
 `/var/folders` can be long enough that adding a 64-character digest exceeds
 Darwin's Unix socket path limit.
+
+The public Hosting Profile extends the same transport with a logical Workload
+identity. It hashes `workload-id NUL role` and normally uses the accepted
+`/run/phx-port/handoff` production layout. Because macOS does not provide
+`/run`, production validation and a future launchd service must set
+`PHX_PORT_RUNTIME_DIR` to an operator-created short runtime root. Both ingress
+and the Workload receive the same override. The Workload selects logical PHXP
+identity explicitly; `PHX_PORT_WORKLOAD_ID` by itself does not change this
+document's development endpoint behavior.
 
 ### Directory hardening
 
@@ -712,6 +722,7 @@ style; the environment-level `PHX_PORT_RUNTIME_DIR` override is mandatory.
 The daemon, NIF integration, and samples must share test vectors for:
 
 - canonical project path;
+- logical production Workload ID;
 - role;
 - SHA-256 digest; and
 - final Linux and macOS paths.

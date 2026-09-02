@@ -448,10 +448,12 @@ https: [
 ]
 ```
 
-`PhxPortHandoff.bandit_child_spec/4` derives its handoff socket from the
-canonical project path and role, preserves the endpoint's existing nested
-Thousand Island TLS options, and installs the handoff transport. It does not
-accept certificate paths separately.
+`PhxPortHandoff.bandit_child_spec/4` derives its development handoff socket
+from the canonical project path and role. Public-hosting callers instead pass
+the explicit `{:workload, logical_id}` identity used by their Route
+Declaration. The helper preserves the endpoint's existing nested Thousand
+Island TLS options and installs the handoff transport. It does not accept
+certificate paths separately.
 
 For SNI-only configurations, the transport calls the configured `sni_fun` with
 the informational requested hostname to seed the base `certs_keys` required by
@@ -562,8 +564,8 @@ identifiers.
 
 ## Handoff endpoint discovery
 
-The daemon derives the handoff socket path from a hash of the canonical project
-path and port role:
+In the development Hosting Profile, the daemon derives the handoff socket path
+from a hash of the canonical project path and port role:
 
 ```text
 Linux: $XDG_RUNTIME_DIR/phx-port/handoff/<sha256(project-path NUL role)>.sock
@@ -572,6 +574,19 @@ macOS: /tmp/phx-port-<euid>/handoff/<sha256(project-path NUL role)>.sock
 
 `PHX_PORT_RUNTIME_DIR` overrides the runtime root on both platforms, producing
 `<runtime>/handoff/<hash>.sock`.
+
+In the public Hosting Profile, ingress and the Workload instead hash the
+explicit logical Workload ID and role. The production path is:
+
+```text
+/run/phx-port/handoff/<sha256(workload-id NUL role)>.sock
+```
+
+The Workload selects this identity explicitly; `PHX_PORT_WORKLOAD_ID` alone
+remains an allocator setting. A nonempty `PHX_PORT_RUNTIME_DIR` replaces
+`/run/phx-port` for both peers and is required for production use on macOS.
+Ingress only connects to this endpoint. The Workload owns creation, stale
+replacement, and removal, so ingress restart cannot remove live endpoints.
 
 The fixed-length hash prevents collisions between repositories with the same
 basename, avoids exposing project names, and remains within Unix socket path
@@ -852,7 +867,8 @@ rejection remain automation gaps.
   implemented two-server architecture; sharing them remains a possible hybrid
   transport refinement.
 - Support OTP 29 initially.
-- Derive the handoff socket path from the canonical project path and role.
+- Derive development handoff sockets from canonical project path and role, and
+  public-hosting sockets from explicit logical Workload ID and role.
 - Prefer handoff automatically when its endpoint is healthy.
 - Fall back to relay only before successful descriptor transfer.
 - Treat successful `sendmsg` as the ownership boundary.

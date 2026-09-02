@@ -1,18 +1,28 @@
 defmodule PhxPortHandoffTest do
-  use ExUnit.Case
+  use ExUnit.Case, async: false
 
   alias PhxPortHandoff.Native
 
-  test "endpoint path matches the PHXP project and role convention" do
-    runtime = Path.join(System.tmp_dir!(), "phxp-runtime")
-    previous = System.get_env("PHX_PORT_RUNTIME_DIR")
-    System.put_env("PHX_PORT_RUNTIME_DIR", runtime)
+  setup do
+    previous =
+      Map.new(["PHX_PORT_RUNTIME_DIR", "PHX_PORT_WORKLOAD_ID"], fn name ->
+        {name, System.get_env(name)}
+      end)
 
     on_exit(fn ->
-      if previous,
-        do: System.put_env("PHX_PORT_RUNTIME_DIR", previous),
-        else: System.delete_env("PHX_PORT_RUNTIME_DIR")
+      Enum.each(previous, fn
+        {name, nil} -> System.delete_env(name)
+        {name, value} -> System.put_env(name, value)
+      end)
     end)
+
+    :ok
+  end
+
+  test "endpoint path matches the PHXP project and role convention" do
+    runtime = Path.join(System.tmp_dir!(), "phxp-runtime")
+    System.put_env("PHX_PORT_RUNTIME_DIR", runtime)
+    System.delete_env("PHX_PORT_WORKLOAD_ID")
 
     project = Path.expand("/srv/contoso")
 
@@ -25,16 +35,56 @@ defmodule PhxPortHandoffTest do
 
   test "macOS default endpoint uses the effective UID" do
     if :os.type() == {:unix, :darwin} do
-      previous = System.get_env("PHX_PORT_RUNTIME_DIR")
       System.delete_env("PHX_PORT_RUNTIME_DIR")
-
-      on_exit(fn ->
-        if previous, do: System.put_env("PHX_PORT_RUNTIME_DIR", previous)
-      end)
+      System.delete_env("PHX_PORT_WORKLOAD_ID")
 
       path = PhxPortHandoff.endpoint_path("/srv/contoso", "https")
       assert String.starts_with?(path, "/tmp/phx-port-#{Native.effective_uid()}/handoff/")
     end
+  end
+
+  test "logical Workload endpoint defaults to the production runtime root" do
+    System.delete_env("PHX_PORT_RUNTIME_DIR")
+
+    expected_hash =
+      :crypto.hash(:sha256, ["contoso-web", <<0>>, "https"]) |> Base.encode16(case: :lower)
+
+    assert PhxPortHandoff.endpoint_path({:workload, "contoso-web"}, "https") ==
+             Path.join(["/run/phx-port", "handoff", expected_hash <> ".sock"])
+  end
+
+  test "logical Workload listener accepts a group-traversable production runtime root" do
+    root = Path.join("/tmp", "pp-#{:os.getpid()}-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    File.chmod!(root, 0o750)
+    on_exit(fn -> File.rm_rf!(root) end)
+    System.put_env("PHX_PORT_RUNTIME_DIR", root)
+
+    identity = {:workload, "contoso-web"}
+    path = PhxPortHandoff.endpoint_path(identity, "https")
+    assert {:ok, broker} = PhxPortHandoff.listen(identity, "https")
+    assert File.stat!(Path.dirname(path)).mode |> Bitwise.band(0o777) == 0o700
+    assert File.stat!(path).mode |> Bitwise.band(0o777) == 0o600
+    assert :ok = Native.close_listener(broker)
+  end
+
+  test "invalid logical Workload identity fails closed" do
+    assert_raise ArgumentError, ~r/logical Workload ID must contain/, fn ->
+      PhxPortHandoff.endpoint_path({:workload, "../contoso"}, "https")
+    end
+  end
+
+  test "allocator Workload identity alone does not change development handoff" do
+    runtime = Path.join(System.tmp_dir!(), "phxp-runtime")
+    System.put_env("PHX_PORT_RUNTIME_DIR", runtime)
+    System.put_env("PHX_PORT_WORKLOAD_ID", "contoso-web")
+    project = Path.expand("/srv/contoso")
+
+    expected_hash =
+      :crypto.hash(:sha256, [project, <<0>>, "https"]) |> Base.encode16(case: :lower)
+
+    assert PhxPortHandoff.endpoint_path(project, "https") ==
+             Path.join([runtime, "handoff", expected_hash <> ".sock"])
   end
 
   test "native broker creates a private endpoint" do

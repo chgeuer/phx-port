@@ -190,6 +190,13 @@ impl HostingProfile {
         }
     }
 
+    pub fn declared_route(&self) -> Option<&RouteDeclaration> {
+        match self {
+            Self::Public { route, .. } => Some(route),
+            Self::Development => None,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Self::Development => "development",

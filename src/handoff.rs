@@ -3,23 +3,33 @@ use std::env;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
+const PRODUCTION_RUNTIME_ROOT: &str = "/run/phx-port";
+
 pub enum Outcome {
     Unavailable(TcpStream),
     Transferred,
     Delivered(String),
 }
 
+#[derive(Clone, Copy)]
+pub enum EndpointIdentity<'a> {
+    Development(&'a str),
+    Production(&'a str),
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 pub fn try_transfer(
     client: TcpStream,
-    project: &str,
+    identity: EndpointIdentity<'_>,
     role: &str,
+    runtime_override: Option<&Path>,
     hostname: &str,
     peeked_length: usize,
     connection_id: [u8; 16],
     accepted_at_ns: u64,
 ) -> Outcome {
-    let path = match endpoint_path(project, role) {
+    let path = match endpoint_path(identity, role, runtime_override) {
         Ok(path) => path,
         Err(_) => return Outcome::Unavailable(client),
     };
@@ -36,8 +46,9 @@ pub fn try_transfer(
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn try_transfer(
     client: TcpStream,
-    _project: &str,
+    _identity: EndpointIdentity<'_>,
     _role: &str,
+    _runtime_override: Option<&Path>,
     _hostname: &str,
     _peeked_length: usize,
     _connection_id: [u8; 16],
@@ -47,11 +58,26 @@ pub fn try_transfer(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn endpoint_path(project: &str, role: &str) -> Result<PathBuf, String> {
-    let hash = endpoint_hash(project, role);
-    let path = match nonempty_env("PHX_PORT_RUNTIME_DIR") {
-        Some(runtime) => endpoint_path_in(Path::new(&runtime), false, &hash),
-        None => platform_default_endpoint(&hash)?,
+pub(crate) fn endpoint_path(
+    identity: EndpointIdentity<'_>,
+    role: &str,
+    runtime_override: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let hash = endpoint_hash(
+        match identity {
+            EndpointIdentity::Development(project) => project,
+            EndpointIdentity::Production(workload) => workload,
+        },
+        role,
+    );
+    let path = match runtime_override {
+        Some(runtime) => endpoint_path_in(runtime, false, &hash),
+        None => match identity {
+            EndpointIdentity::Development(_) => platform_default_endpoint(&hash)?,
+            EndpointIdentity::Production(_) => {
+                endpoint_path_in(Path::new(PRODUCTION_RUNTIME_ROOT), false, &hash)
+            }
+        },
     };
     nix::sys::socket::UnixAddr::new(&path).map_err(|error| {
         format!(
@@ -62,9 +88,12 @@ fn endpoint_path(project: &str, role: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn nonempty_env(name: &str) -> Option<std::ffi::OsString> {
     env::var_os(name).filter(|value| !value.is_empty())
+}
+
+pub fn runtime_override() -> Option<PathBuf> {
+    nonempty_env("PHX_PORT_RUNTIME_DIR").map(PathBuf::from)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -101,6 +130,50 @@ fn platform_default_endpoint(hash: &str) -> Result<PathBuf, String> {
 fn platform_default_endpoint(hash: &str) -> Result<PathBuf, String> {
     let runtime = PathBuf::from(format!("/tmp/phx-port-{}", nix::unistd::geteuid().as_raw()));
     Ok(endpoint_path_in(&runtime, false, hash))
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod endpoint_tests {
+    use super::{EndpointIdentity, endpoint_hash, endpoint_path};
+    use std::path::Path;
+
+    #[test]
+    fn production_endpoint_hashes_logical_identity_under_run_root() {
+        let hash = endpoint_hash("contoso-web", "https");
+        assert_eq!(
+            endpoint_path(EndpointIdentity::Production("contoso-web"), "https", None).unwrap(),
+            Path::new("/run/phx-port")
+                .join("handoff")
+                .join(format!("{hash}.sock"))
+        );
+        assert_eq!(
+            endpoint_path(
+                EndpointIdentity::Production("contoso-web"),
+                "https",
+                Some(Path::new("/tmp/public-runtime"))
+            )
+            .unwrap(),
+            Path::new("/tmp/public-runtime")
+                .join("handoff")
+                .join(format!("{hash}.sock"))
+        );
+    }
+
+    #[test]
+    fn development_endpoint_keeps_the_canonical_path_convention() {
+        let hash = endpoint_hash("/srv/contoso", "https");
+        assert_eq!(
+            endpoint_path(
+                EndpointIdentity::Development("/srv/contoso"),
+                "https",
+                Some(Path::new("/tmp/development-runtime"))
+            )
+            .unwrap(),
+            Path::new("/tmp/development-runtime")
+                .join("handoff")
+                .join(format!("{hash}.sock"))
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -242,13 +315,16 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
-        use super::{Outcome, try_transfer_to_endpoint};
-        use crate::handoff::{endpoint_hash, endpoint_path_in};
+        use super::Outcome;
+        use crate::handoff::{
+            EndpointIdentity, endpoint_hash, endpoint_path, endpoint_path_in, try_transfer,
+        };
         use crate::handoff_protocol::{MAX_PACKET_LENGTH, Message, decode, encode};
         use nix::sys::socket::{
             AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr,
             accept, bind, listen, recv, recvmsg, send, socket,
         };
+        use std::fs;
         use std::io::{IoSliceMut, Read, Write};
         use std::net::{TcpListener, TcpStream};
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -267,7 +343,13 @@ mod platform {
         #[test]
         fn transfers_one_untouched_connected_stream_descriptor() {
             let directory = tempdir().unwrap();
-            let endpoint = directory.path().join("handoff.sock");
+            fs::create_dir(directory.path().join("handoff")).unwrap();
+            let endpoint = endpoint_path(
+                EndpointIdentity::Production("contoso-web"),
+                "https",
+                Some(directory.path()),
+            )
+            .unwrap();
             let listener = socket(
                 AddressFamily::Unix,
                 SockType::SeqPacket,
@@ -348,9 +430,11 @@ mod platform {
             client.write_all(b"client hello").unwrap();
 
             assert!(matches!(
-                try_transfer_to_endpoint(
+                try_transfer(
                     accepted,
-                    &endpoint,
+                    EndpointIdentity::Production("contoso-web"),
+                    "https",
+                    Some(directory.path()),
                     "www.contoso.com",
                     12,
                     connection_id,
@@ -359,6 +443,7 @@ mod platform {
                 Outcome::Transferred
             ));
             backend.join().unwrap();
+            assert!(endpoint.exists());
         }
     }
 }
@@ -544,7 +629,9 @@ mod platform {
         use super::{
             Outcome, classify_initial_send, set_cloexec, set_no_sigpipe, try_transfer_to_endpoint,
         };
-        use crate::handoff::{endpoint_hash, endpoint_path_in};
+        use crate::handoff::{
+            EndpointIdentity, endpoint_hash, endpoint_path, endpoint_path_in, try_transfer,
+        };
         use crate::handoff_protocol::{MAX_PACKET_LENGTH, Message, decode, encode};
         use crate::handoff_stream::{complete_frame, read_frame};
         use nix::fcntl::{FcntlArg, FdFlag, fcntl};
@@ -582,7 +669,13 @@ mod platform {
         #[test]
         fn transfers_one_untouched_connected_stream_descriptor() {
             let directory = tempdir_in("/tmp").unwrap();
-            let endpoint = directory.path().join("handoff.sock");
+            std::fs::create_dir(directory.path().join("handoff")).unwrap();
+            let endpoint = endpoint_path(
+                EndpointIdentity::Production("contoso-web"),
+                "https",
+                Some(directory.path()),
+            )
+            .unwrap();
             let listener = socket(
                 AddressFamily::Unix,
                 SockType::Stream,
@@ -677,9 +770,11 @@ mod platform {
             });
 
             assert!(matches!(
-                try_transfer_to_endpoint(
+                try_transfer(
                     accepted,
-                    &endpoint,
+                    EndpointIdentity::Production("contoso-web"),
+                    "https",
+                    Some(directory.path()),
                     "www.contoso.com",
                     12,
                     connection_id,
@@ -691,6 +786,7 @@ mod platform {
             client.read_exact(&mut response).unwrap();
             assert_eq!(&response, b"server reply");
             backend.join().unwrap();
+            assert!(endpoint.exists());
         }
 
         #[test]

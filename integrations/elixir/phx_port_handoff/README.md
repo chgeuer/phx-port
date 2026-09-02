@@ -48,8 +48,8 @@ end
 ```
 
 The ordinary endpoint still listens on its assigned phx-port HTTPS port for
-certificate discovery, health checks, and direct access. The additional child
-listens only on the convention-derived Unix socket:
+certificate verification, health checks, and direct access. The additional
+child listens only on the convention-derived Unix socket. Development uses:
 
 ```text
 Linux: $XDG_RUNTIME_DIR/phx-port/handoff/<hash>.sock
@@ -64,6 +64,35 @@ Use the same canonical project path and role that the workload registered with
 phx-port. The helper uses public port `443` in Bandit's connection metadata and
 does not bind TCP port 443 itself. It configures one Thousand Island acceptor
 because the current native receive path is deliberately serialized.
+
+In the explicit production Hosting Profile, set the same logical
+`PHX_PORT_WORKLOAD_ID` used by the Port Registry and pass it as an explicit
+Workload identity:
+
+```elixir
+identity = {:workload, System.fetch_env!("PHX_PORT_WORKLOAD_ID")}
+
+PhxPortHandoff.bandit_child_spec(
+  MyAppWeb.Endpoint,
+  identity,
+  "https",
+  https
+)
+```
+
+The helper hashes `workload-id NUL role` without expanding it as a path and
+defaults to:
+
+```text
+/run/phx-port/handoff/<hash>.sock
+```
+
+`PHX_PORT_RUNTIME_DIR` overrides `/run/phx-port` for both the Workload and
+ingress and is required for a macOS production runtime root. The production
+runtime root may be mode `0750`; its service-owned `handoff` child remains mode
+`0700`. The Workload owns its endpoint lifecycle, so ingress restart does not
+remove it. Merely setting `PHX_PORT_WORKLOAD_ID` does not change the existing
+development path-based PHXP behavior.
 
 ## Security and ownership
 

@@ -86,10 +86,11 @@ All settings have CLI and environment forms:
 | `--cert PATH` | `PHXP_TLS_CERT` | required |
 | `--key PATH` | `PHXP_TLS_KEY` | required |
 | `--project PATH` | `PHXP_PROJECT` | current directory |
+| `--workload-id ID` | `PHXP_WORKLOAD_ID` | unset |
 | `--role NAME` | `PHXP_ROLE` | `https` |
 | `--handoff-socket PATH` | `PHXP_HANDOFF_SOCKET` | PHXP-derived path |
 
-The derived endpoint is
+Without `PHXP_WORKLOAD_ID`, the derived development endpoint is
 `$XDG_RUNTIME_DIR/phx-port/handoff/<hash>.sock` on Linux and
 `/tmp/phx-port-<euid>/handoff/<hash>.sock` on macOS. Set
 `PHX_PORT_RUNTIME_DIR` to use `<runtime>/handoff/<hash>.sock`, or use
@@ -98,6 +99,15 @@ both the runtime root and its `handoff` child as private directories. A
 complete path override validates only its immediate parent, so it may live
 beneath a normally accessible project directory as long as the socket
 directory itself is owned by the current user with mode `0700`.
+
+Set `PHXP_WORKLOAD_ID` explicitly to the same value as the allocator's
+`PHX_PORT_WORKLOAD_ID` when using a public Route Declaration. The hash then
+uses that validated logical Workload ID and role instead of the project path.
+This production endpoint defaults to
+`/run/phx-port/handoff/<hash>.sock`; `PHX_PORT_RUNTIME_DIR` may override
+`/run/phx-port` for a nonstandard deployment, macOS host, or test. The
+production runtime root may be group-traversable, but its `handoff` child
+remains owned by the service identity with mode `0700`.
 
 ## Scope and limitations
 

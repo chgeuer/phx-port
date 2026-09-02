@@ -204,6 +204,7 @@ impl std::fmt::Display for OverloadEvent {
 struct ProxyState {
     config: PathBuf,
     hosting_profile: HostingProfile,
+    handoff_runtime: Option<PathBuf>,
     limits: ValidatedIngressLimits,
     admission: AdmissionController,
     listeners: RwLock<Vec<SocketAddr>>,
@@ -240,6 +241,7 @@ impl ProxyState {
     fn with_limits(
         config: PathBuf,
         hosting_profile: HostingProfile,
+        handoff_runtime: Option<PathBuf>,
         limits: ValidatedIngressLimits,
         probe_connector_override: Option<TlsConnector>,
     ) -> Self {
@@ -247,6 +249,7 @@ impl ProxyState {
         Self {
             config,
             hosting_profile,
+            handoff_runtime,
             limits,
             admission,
             listeners: RwLock::new(Vec::new()),
@@ -296,7 +299,7 @@ impl ProxyState {
                 2,
             )
             .unwrap();
-        Self::with_limits(config, hosting_profile, limits, None)
+        Self::with_limits(config, hosting_profile, None, limits, None)
     }
 
     #[cfg(test)]
@@ -314,7 +317,32 @@ impl ProxyState {
                 2,
             )
             .unwrap();
-        Self::with_limits(config, hosting_profile, limits, Some(tls_connector))
+        Self::with_limits(config, hosting_profile, None, limits, Some(tls_connector))
+    }
+
+    #[cfg(test)]
+    fn new_with_profile_connector_and_runtime(
+        config: PathBuf,
+        hosting_profile: HostingProfile,
+        tls_connector: TlsConnector,
+        handoff_runtime: PathBuf,
+    ) -> Self {
+        let limits = IngressLimits::default()
+            .validate(
+                SystemCapacity {
+                    file_descriptors: None,
+                    tasks: None,
+                },
+                2,
+            )
+            .unwrap();
+        Self::with_limits(
+            config,
+            hosting_profile,
+            Some(handoff_runtime),
+            limits,
+            Some(tls_connector),
+        )
     }
 
     fn discover_once(
@@ -437,6 +465,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     let state = Arc::new(ProxyState::with_limits(
         config_path(),
         hosting_profile,
+        handoff::runtime_override(),
         limits,
         None,
     ));
@@ -863,52 +892,56 @@ fn handle_connection(
         resolve_backend(&hostname, &state)?
     };
 
-    if !state.hosting_profile.is_public() {
-        match state.admission.try_acquire_handoff() {
-            Ok(_handoff_permit) => {
-                let mut connection_id = [0_u8; 16];
-                match getrandom::fill(&mut connection_id) {
-                    Ok(()) => {
-                        state.handoff_attempts.fetch_add(1, Ordering::Relaxed);
-                        match handoff::try_transfer(
-                            client,
-                            &backend.project,
-                            &backend.role,
-                            &hostname,
-                            peeked_length,
-                            connection_id,
-                            accepted_at_ns,
-                        ) {
-                            handoff::Outcome::Transferred => {
-                                state.successful_handoffs.fetch_add(1, Ordering::Relaxed);
-                                eprintln!(
-                                    "Handed off {hostname} to {} ({})",
-                                    backend.project, backend.role
-                                );
-                                return Ok(());
-                            }
-                            handoff::Outcome::Delivered(error) => {
-                                state
-                                    .delivered_handoff_failures
-                                    .fetch_add(1, Ordering::Relaxed);
-                                return Err(error);
-                            }
-                            handoff::Outcome::Unavailable(returned) => {
-                                state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
-                                client = returned;
-                            }
+    match state.admission.try_acquire_handoff() {
+        Ok(_handoff_permit) => {
+            let mut connection_id = [0_u8; 16];
+            match getrandom::fill(&mut connection_id) {
+                Ok(()) => {
+                    let identity = if state.hosting_profile.is_public() {
+                        handoff::EndpointIdentity::Production(&backend.project)
+                    } else {
+                        handoff::EndpointIdentity::Development(&backend.project)
+                    };
+                    state.handoff_attempts.fetch_add(1, Ordering::Relaxed);
+                    match handoff::try_transfer(
+                        client,
+                        identity,
+                        &backend.role,
+                        state.handoff_runtime.as_deref(),
+                        &hostname,
+                        peeked_length,
+                        connection_id,
+                        accepted_at_ns,
+                    ) {
+                        handoff::Outcome::Transferred => {
+                            state.successful_handoffs.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "Handed off {hostname} to {} ({})",
+                                backend.project, backend.role
+                            );
+                            return Ok(());
+                        }
+                        handoff::Outcome::Delivered(error) => {
+                            state
+                                .delivered_handoff_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Err(error);
+                        }
+                        handoff::Outcome::Unavailable(returned) => {
+                            state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
+                            client = returned;
                         }
                     }
-                    Err(error) => {
-                        state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
-                        eprintln!(
-                            "TLS socket handoff unavailable: cannot create connection ID: {error}"
-                        );
-                    }
+                }
+                Err(error) => {
+                    state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "TLS socket handoff unavailable: cannot create connection ID: {error}"
+                    );
                 }
             }
-            Err(rejection) => state.record_admission_rejection(rejection),
         }
+        Err(rejection) => state.record_admission_rejection(rejection),
     }
 
     let relay_permit = match acquire_relay_capacity(&state) {
@@ -1153,7 +1186,32 @@ fn observe_workloads(state: &ProxyState, candidates: &[Backend]) -> Vec<Backend>
 }
 
 fn reconcile_workloads(state: &ProxyState) {
-    if state.hosting_profile.is_public() {
+    if let Some(declaration) = state.hosting_profile.declared_route().cloned() {
+        let inactive = match state.routes.read() {
+            Ok(routes) => !routes.contains_key(&declaration.hostname),
+            Err(_) => return,
+        };
+        if !inactive {
+            return;
+        }
+        let retry_suppressed = match state.negative.lock() {
+            Ok(mut negative) => {
+                let now = Instant::now();
+                negative.retain(|_, expires_at| *expires_at > now);
+                negative.contains_key(&declaration.hostname)
+            }
+            Err(_) => return,
+        };
+        if retry_suppressed {
+            return;
+        }
+        if let Err(error) = resolve_backend(&declaration.hostname, state) {
+            eprintln!(
+                "Declared route {} remains inactive: {error}",
+                declaration.hostname
+            );
+            cache_negative(state, &declaration.hostname);
+        }
         return;
     }
     let candidates = candidate_backends(&state.config, None);
@@ -1700,11 +1758,25 @@ mod tests {
         ingress_config::{HostingProfile, RouteDeclaration},
         route_cache, update_config,
     };
+    #[cfg(target_os = "linux")]
+    use crate::{
+        handoff::{self, EndpointIdentity},
+        handoff_protocol::{Message, decode, encode},
+    };
     use native_tls::{Certificate, Identity, TlsAcceptor, TlsConnector};
+    #[cfg(target_os = "linux")]
+    use nix::sys::socket::{
+        AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr,
+        accept, bind, listen, recv, recvmsg, send, socket,
+    };
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::io::IoSliceMut;
     use std::io::{self, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
+    #[cfg(target_os = "linux")]
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -1858,6 +1930,177 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn late_public_workload_activates_only_after_registration_and_certificate_proof() {
+        const HOSTNAME: &str = "late.example.test";
+
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = directory.path().join("ports.toml");
+        let certificate = TestCertificate::for_hostname(HOSTNAME);
+        let backend = TestTlsBackend::start(&certificate, b"late");
+        let state = ProxyState::new_with_profile_and_connector(
+            registry.clone(),
+            public_profile(HOSTNAME, "late-web"),
+            certificate.connector(),
+        );
+
+        assert!(state.routes.read().unwrap().is_empty());
+        assert_eq!(backend.accepted(), 0);
+
+        write_logical_registry(directory.path(), &[("late-web", backend.port())]);
+        reconcile_workloads(&state);
+
+        let routes = state.routes.read().unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes[HOSTNAME].backend,
+            Backend {
+                project: "late-web".to_string(),
+                role: "https".to_string(),
+                port: backend.port(),
+            }
+        );
+        assert_eq!(backend.accepted(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn public_route_hands_the_original_descriptor_to_its_logical_workload_endpoint() {
+        const HOSTNAME: &str = "handoff.example.test";
+        const WORKLOAD: &str = "handoff-web";
+
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = directory.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(runtime.join("handoff")).unwrap();
+        let endpoint = handoff::endpoint_path(
+            EndpointIdentity::Production(WORKLOAD),
+            "https",
+            Some(&runtime),
+        )
+        .unwrap();
+        let handoff_listener = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        bind(
+            handoff_listener.as_raw_fd(),
+            &UnixAddr::new(endpoint.as_path()).unwrap(),
+        )
+        .unwrap();
+        listen(&handoff_listener, Backlog::new(1).unwrap()).unwrap();
+
+        let certificate = TestCertificate::for_hostname(HOSTNAME);
+        let ordinary_backend = TestTlsBackend::start(&certificate, b"relay");
+        let registry =
+            write_logical_registry(directory.path(), &[(WORKLOAD, ordinary_backend.port())]);
+        let state = Arc::new(ProxyState::new_with_profile_connector_and_runtime(
+            registry,
+            public_profile(HOSTNAME, WORKLOAD),
+            certificate.connector(),
+            runtime,
+        ));
+        reconcile_workloads(&state);
+        assert_eq!(ordinary_backend.accepted(), 1);
+
+        let identity = Identity::from_pkcs8(
+            certificate.certificate_pem.as_bytes(),
+            certificate.private_key_pem.as_bytes(),
+        )
+        .unwrap();
+        let tls_acceptor = TlsAcceptor::new(identity).unwrap();
+        let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let frontend_address = frontend.local_addr().unwrap();
+        let receiver = thread::spawn(move || {
+            let control = accept(handoff_listener.as_raw_fd()).unwrap();
+            let control = unsafe { OwnedFd::from_raw_fd(control) };
+            let mut packet = [0_u8; crate::handoff_protocol::MAX_PACKET_LENGTH + 1];
+
+            let length = recv(control.as_raw_fd(), &mut packet, MsgFlags::empty()).unwrap();
+            assert_eq!(decode(&packet[..length]).unwrap(), Message::Hello);
+            send(
+                control.as_raw_fd(),
+                &encode(&Message::Ready).unwrap(),
+                MsgFlags::empty(),
+            )
+            .unwrap();
+
+            let (packet_length, descriptors) = {
+                let mut ancillary = nix::cmsg_space!([i32; 2]);
+                let mut iov = [IoSliceMut::new(&mut packet)];
+                let message = recvmsg::<UnixAddr>(
+                    control.as_raw_fd(),
+                    &mut iov,
+                    Some(&mut ancillary),
+                    MsgFlags::MSG_CMSG_CLOEXEC,
+                )
+                .unwrap();
+                let descriptors = message
+                    .cmsgs()
+                    .unwrap()
+                    .flat_map(|message| match message {
+                        ControlMessageOwned::ScmRights(descriptors) => descriptors,
+                        _ => Vec::new(),
+                    })
+                    .map(|descriptor| unsafe { OwnedFd::from_raw_fd(descriptor) })
+                    .collect::<Vec<_>>();
+                (message.bytes, descriptors)
+            };
+            assert_eq!(descriptors.len(), 1);
+            let request = decode(&packet[..packet_length]).unwrap();
+            let connection_id = match request {
+                Message::Handoff(request) if request.requested_sni == HOSTNAME => {
+                    request.connection_id
+                }
+                request => panic!("unexpected PHXP request: {request:?}"),
+            };
+            let handed_off = TcpStream::from(descriptors.into_iter().next().unwrap());
+            assert_eq!(handed_off.local_addr().unwrap(), frontend_address);
+            send(
+                control.as_raw_fd(),
+                &encode(&Message::Adopted { connection_id }).unwrap(),
+                MsgFlags::empty(),
+            )
+            .unwrap();
+
+            let mut tls = tls_acceptor.accept(handed_off).unwrap();
+            let mut request = [0_u8; 7];
+            tls.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"request");
+            tls.write_all(b"handoff").unwrap();
+            tls.flush().unwrap();
+        });
+
+        let client_connector = certificate.connector();
+        let client = thread::spawn(move || {
+            let stream = TcpStream::connect(frontend_address).unwrap();
+            let mut tls = client_connector.connect(HOSTNAME, stream).unwrap();
+            tls.write_all(b"request").unwrap();
+            let mut response = [0_u8; 7];
+            tls.read_exact(&mut response).unwrap();
+            response
+        });
+        let (accepted, peer) = frontend.accept().unwrap();
+        let admission = state.admission.try_admit(peer.ip()).unwrap();
+        handle_connection(accepted, Instant::now(), Arc::clone(&state), admission).unwrap();
+
+        assert_eq!(&client.join().unwrap(), b"handoff");
+        receiver.join().unwrap();
+        assert_eq!(ordinary_backend.accepted(), 1);
+        assert_eq!(state.handoff_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(state.successful_handoffs.load(Ordering::Relaxed), 1);
+        assert_eq!(state.handoff_fallbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(state.relayed_connections.load(Ordering::Relaxed), 0);
+        assert!(endpoint.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn public_route_requires_exact_declaration_and_certificate_before_relay() {
         const HOSTNAME: &str = "declared.example.test";
 
@@ -1872,10 +2115,11 @@ mod tests {
                 ("decoy-web", decoy_backend.port()),
             ],
         );
-        let state = Arc::new(ProxyState::new_with_profile_and_connector(
+        let state = Arc::new(ProxyState::new_with_profile_connector_and_runtime(
             registry.clone(),
             public_profile(HOSTNAME, "contoso-web"),
             valid_certificate.connector(),
+            directory.path().join("missing-handoff-runtime"),
         ));
 
         let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1918,7 +2162,9 @@ mod tests {
                 .contains("discovered_routes")
         );
         assert_eq!(state.relayed_connections.load(Ordering::Relaxed), 1);
-        assert_eq!(state.handoff_attempts.load(Ordering::Relaxed), 0);
+        assert_eq!(state.handoff_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(state.successful_handoffs.load(Ordering::Relaxed), 0);
+        assert_eq!(state.handoff_fallbacks.load(Ordering::Relaxed), 1);
 
         let undeclared_frontend = TcpListener::bind("127.0.0.1:0").unwrap();
         let undeclared_address = undeclared_frontend.local_addr().unwrap();
