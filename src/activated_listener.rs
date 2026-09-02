@@ -469,12 +469,13 @@ fn validate_activated_listener(
     if socket_option(fd, nix::libc::SOL_SOCKET, nix::libc::SO_PROTOCOL)? != nix::libc::IPPROTO_TCP {
         return Err("descriptor does not use the TCP protocol".to_string());
     }
+    #[cfg(target_os = "linux")]
     if socket_option(fd, nix::libc::SOL_SOCKET, nix::libc::SO_ACCEPTCONN)? != 1 {
         return Err("descriptor is not a listening socket".to_string());
     }
+    #[cfg(target_os = "macos")]
+    validate_darwin_tcp_listener(fd, expected.address)?;
 
-    // Darwin has no portable SO_PROTOCOL query. An AF_INET/AF_INET6 listening
-    // SOCK_STREAM is TCP on the supported macOS kernel.
     let actual = listener
         .local_addr()
         .map_err(|error| format!("cannot read listener address: {error}"))?;
@@ -494,6 +495,40 @@ fn validate_activated_listener(
         .set_nonblocking(true)
         .map_err(|error| format!("cannot enable nonblocking mode: {error}"))?;
     set_close_on_exec(fd)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_darwin_tcp_listener(fd: RawFd, expected: SocketAddr) -> Result<(), String> {
+    use libproc::libproc::{
+        file_info::pidfdinfo,
+        net_info::{SocketFDInfo, SocketInfoKind, TcpSIState},
+    };
+
+    let pid = i32::try_from(std::process::id())
+        .map_err(|_| "process ID does not fit the Darwin libproc API".to_string())?;
+    let info = pidfdinfo::<SocketFDInfo>(pid, fd)
+        .map_err(|error| format!("cannot inspect descriptor TCP state: {error}"))?;
+    if !matches!(SocketInfoKind::from(info.psi.soi_kind), SocketInfoKind::Tcp)
+        || info.psi.soi_protocol != nix::libc::IPPROTO_TCP
+    {
+        return Err("descriptor does not use the TCP protocol".to_string());
+    }
+    let expected_family = if expected.is_ipv4() {
+        nix::libc::AF_INET
+    } else {
+        nix::libc::AF_INET6
+    };
+    if info.psi.soi_family != expected_family {
+        return Err(format!(
+            "descriptor uses address family {}, expected {expected_family}",
+            info.psi.soi_family
+        ));
+    }
+    let tcp = unsafe { info.psi.soi_proto.pri_tcp };
+    if !matches!(TcpSIState::from(tcp.tcpsi_state), TcpSIState::Listen) {
+        return Err("descriptor is not a listening socket".to_string());
+    }
     Ok(())
 }
 
