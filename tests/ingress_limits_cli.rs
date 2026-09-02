@@ -328,6 +328,35 @@ mod unix {
     }
 
     #[test]
+    fn clean_shutdown_emits_one_bounded_drain_event() {
+        let daemon = Daemon::start(reserve_address());
+        let stderr = daemon.stop_and_stderr();
+        let drain_events = stderr
+            .lines()
+            .filter(|line| line.starts_with("event=ingress_shutdown "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            drain_events.len(),
+            1,
+            "shutdown must emit exactly one bounded result event:\n{stderr}"
+        );
+        let event = drain_events[0];
+        assert!(event.contains(" result=complete "), "{event}");
+        assert!(event.contains(" forced_connections=0 "), "{event}");
+        assert!(event.ends_with(" active_connections=0"), "{event}");
+        let duration_ms = event
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("duration_ms="))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(
+            duration_ms < 3_000,
+            "clean shutdown took an unexpected {duration_ms}ms"
+        );
+    }
+
+    #[test]
     fn source_pre_routing_limit_rejects_before_worker_and_recovers() {
         let address = reserve_address();
         let daemon = Daemon::start_with_limits(address, 32, 32);

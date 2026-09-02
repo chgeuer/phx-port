@@ -4,8 +4,11 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::{TempDir, tempdir_in};
@@ -314,5 +317,73 @@ fn unavailable_metrics_listener_does_not_stop_the_data_plane() {
             .lines()
             .any(|line| line == "event=metrics_listener result=unavailable reason=bind_failed"),
         "missing bounded metrics failure event:\n{stderr}"
+    );
+}
+
+#[test]
+fn partial_local_requests_cannot_outlive_daemon_shutdown() {
+    let metrics_address = reserve_address();
+    let mut daemon = Daemon::start(Some(metrics_address), None);
+    let metrics_deadline = Instant::now() + Duration::from_secs(5);
+    let metrics = loop {
+        match TcpStream::connect(metrics_address) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < metrics_deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("metrics listener did not become reachable: {error}"),
+        }
+    };
+    let control = UnixStream::connect(daemon.control_path()).unwrap();
+    let trickling = Arc::new(AtomicBool::new(true));
+    let metrics_trickling = Arc::clone(&trickling);
+    let metrics_writer = thread::spawn(move || {
+        let mut metrics = metrics;
+        while metrics_trickling.load(Ordering::Acquire) {
+            if metrics.write_all(b"G").is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    });
+    let control_trickling = Arc::clone(&trickling);
+    let control_writer = thread::spawn(move || {
+        let mut control = control;
+        while control_trickling.load(Ordering::Acquire) {
+            if control.write_all(b"S").is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    });
+    thread::sleep(Duration::from_millis(100));
+
+    let child = daemon.child.as_mut().unwrap();
+    let result = unsafe { nix::libc::kill(child.id() as nix::libc::pid_t, nix::libc::SIGINT) };
+    assert_eq!(result, 0, "cannot terminate test daemon");
+    let exit_deadline = Instant::now() + Duration::from_secs(1);
+    let exited_promptly = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if Instant::now() >= exit_deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    trickling.store(false, Ordering::Release);
+    metrics_writer.join().unwrap();
+    control_writer.join().unwrap();
+    let output = daemon.child.take().unwrap().wait_with_output().unwrap();
+    assert!(
+        exited_promptly,
+        "partial local requests blocked controlled shutdown:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "daemon shutdown failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

@@ -2,7 +2,9 @@
 use crate::ingress_limits::{IngressLimits, SystemCapacity};
 use crate::{
     activated_listener::{self, ListenerOrigin},
-    admission::{AdmissionController, AdmissionRejection, PreRoutingAdmission, RelayPermit},
+    admission::{
+        AdmissionController, AdmissionRejection, PreRoutingAdmission, RelayAdmission, RelayPermit,
+    },
     config_path, handoff,
     ingress_config::{
         DEFAULT_RELAY_IDLE_TIMEOUT, HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot,
@@ -22,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as FmtWrite;
+use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -30,7 +33,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -54,17 +57,130 @@ const TLS_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 const TCP_FAILURE_THRESHOLD: u8 = 3;
 const DEVELOPMENT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const PUBLIC_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+const PHXP_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const ROUTE_SELECTION_QUEUE_CAPACITY: usize = MAX_WAITING_CLIENTS - ROUTE_SELECTION_WORKERS;
-const ASYNC_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const OVERLOAD_EVENT_INTERVAL: Duration = Duration::from_secs(10);
 const DELIVERY_EVENT_INTERVAL: Duration = Duration::from_secs(10);
 const SOURCE_DIAGNOSTIC_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTROL_IO_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CONTROL_REQUEST_LIMIT: u64 = 1024;
 const CONTROL_RESPONSE_LIMIT: u64 = 64 * 1024;
 const CONTROL_SCHEMA_VERSION: u32 = 1;
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+#[derive(Clone)]
+struct IngressShutdown {
+    requested: Arc<AtomicBool>,
+    exiting: Arc<AtomicBool>,
+    requested_tx: watch::Sender<bool>,
+    drain_window: Arc<OnceLock<DrainWindow>>,
+    transition: Arc<Mutex<()>>,
+    drain_timeout: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct DrainWindow {
+    started_at: Instant,
+    deadline: Instant,
+}
+
+impl IngressShutdown {
+    fn new(drain_timeout: Duration) -> Self {
+        let (requested_tx, _) = watch::channel(false);
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+            exiting: Arc::new(AtomicBool::new(false)),
+            requested_tx,
+            drain_window: Arc::new(OnceLock::new()),
+            transition: Arc::new(Mutex::new(())),
+            drain_timeout,
+        }
+    }
+
+    fn request(&self) {
+        let _transition = self
+            .transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.drain_window.get_or_init(|| {
+            let started_at = Instant::now();
+            let deadline = started_at
+                .checked_add(self.drain_timeout)
+                .unwrap_or(started_at);
+            DrainWindow {
+                started_at,
+                deadline,
+            }
+        });
+        self.requested.store(true, Ordering::Release);
+        self.requested_tx.send_replace(true);
+    }
+
+    fn commit_if_running(&self, commit: impl FnOnce()) -> bool {
+        let _transition = self
+            .transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_requested() {
+            return false;
+        }
+        commit();
+        true
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    fn finish(&self) {
+        self.exiting.store(true, Ordering::Release);
+    }
+
+    fn is_exiting(&self) -> bool {
+        self.exiting.load(Ordering::Acquire)
+    }
+
+    fn requested_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.requested)
+    }
+
+    fn drain_deadline(&self) -> Instant {
+        self.drain_window().deadline
+    }
+
+    fn drain_elapsed(&self) -> Duration {
+        Instant::now().saturating_duration_since(self.drain_window().started_at)
+    }
+
+    fn drain_window(&self) -> DrainWindow {
+        *self.drain_window.get_or_init(|| {
+            let started_at = Instant::now();
+            let deadline = started_at
+                .checked_add(self.drain_timeout)
+                .unwrap_or(started_at);
+            DrainWindow {
+                started_at,
+                deadline,
+            }
+        })
+    }
+
+    async fn wait_requested(&self) {
+        let mut requested = self.requested_tx.subscribe();
+        while !*requested.borrow_and_update() {
+            if requested.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.requested_tx.receiver_count()
+    }
+}
 
 fn saturating_atomic_add(counter: &AtomicU64, value: u64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -872,8 +988,18 @@ struct RouteSelectionJob {
 #[derive(Clone)]
 struct TokioIngress {
     state: Arc<ProxyState>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: IngressShutdown,
     route_sender: mpsc::SyncSender<RouteSelectionJob>,
+}
+
+struct ListenerDrainReport {
+    forced_connections: usize,
+    failure: Option<String>,
+}
+
+struct IngressDrainReport {
+    forced_connections: usize,
+    failure: Option<String>,
 }
 
 struct HandoffJob {
@@ -893,6 +1019,13 @@ struct RelayJob {
     hostname: String,
     backend: Backend,
     cached: bool,
+    idle_timeout: Option<Duration>,
+}
+
+struct EstablishedRelay {
+    client: TokioTcpStream,
+    upstream: TokioTcpStream,
+    _admission: RelayAdmission,
     idle_timeout: Option<Duration>,
 }
 
@@ -1147,7 +1280,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         limits,
         None,
     ));
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown = IngressShutdown::new(shutdown_drain_timeout);
     let mut listeners = Vec::with_capacity(acquired_listeners.len());
 
     for acquired in acquired_listeners {
@@ -1176,8 +1309,8 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         .filter_map(|listener| listener.local_addr().ok())
         .collect();
 
-    let signal = Arc::clone(&shutdown);
-    ctrlc::set_handler(move || signal.store(true, Ordering::Release))
+    let signal = shutdown.clone();
+    ctrlc::set_handler(move || signal.request())
         .map_err(|error| format!("cannot install shutdown signal handler: {error}"))?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1201,7 +1334,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
 
     #[cfg(unix)]
     let (control_path, control_thread) =
-        match start_control_server(Arc::clone(&state), Arc::clone(&shutdown)) {
+        match start_control_server(Arc::clone(&state), shutdown.clone()) {
             Ok(control) => control,
             Err(error) => {
                 route_workers.close();
@@ -1209,14 +1342,17 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
                 return Err(error);
             }
         };
-    let metrics_thread = start_metrics_server(Arc::clone(&state), Arc::clone(&shutdown));
+    let metrics_thread = start_metrics_server(Arc::clone(&state), shutdown.clone());
 
     let reconciler_thread = {
         let state = Arc::clone(&state);
-        let shutdown = Arc::clone(&shutdown);
+        let shutdown = shutdown.requested_flag();
         thread::spawn(move || {
             while !shutdown.load(Ordering::Acquire) {
                 thread::sleep(LIVENESS_INTERVAL);
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
                 reload_public_profile(&state);
                 reconcile_workloads(&state);
                 reconcile_routes(&state);
@@ -1224,31 +1360,53 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         })
     };
 
-    let ingress_result = runtime.block_on(serve_tokio_ingress(
+    let ingress_report = runtime.block_on(serve_tokio_ingress(
         listeners,
         Arc::clone(&state),
-        Arc::clone(&shutdown),
+        shutdown.clone(),
         route_workers.sender(),
     ));
-    shutdown.store(true, Ordering::Release);
-    let drain_deadline = Instant::now() + shutdown_drain_timeout;
-    runtime.shutdown_timeout(shutdown_drain_timeout);
+    shutdown.request();
+    let drain_deadline = shutdown.drain_deadline();
+    let handoffs_pending = state.admission.snapshot().handoff.in_use > 0;
+    let blocking_grace = if handoffs_pending {
+        PHXP_SHUTDOWN_GRACE
+    } else {
+        Duration::ZERO
+    };
+    runtime.shutdown_timeout(
+        drain_deadline
+            .saturating_duration_since(Instant::now())
+            .max(blocking_grace),
+    );
 
     route_workers.close();
     let route_join_error = route_workers.join().err();
+    let _ = reconciler_thread.join();
+
+    let remaining = state.admission.snapshot().global.in_use;
+    let drain_result = if ingress_report.failure.is_some() || route_join_error.is_some() {
+        "failed"
+    } else if ingress_report.forced_connections > 0 || remaining > 0 {
+        "drain_timeout"
+    } else {
+        "complete"
+    };
+    let duration_ms = shutdown
+        .drain_elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX));
+    eprintln!(
+        "event=ingress_shutdown result={drain_result} duration_ms={duration_ms} \
+         forced_connections={} active_connections={remaining}",
+        ingress_report.forced_connections
+    );
+
+    shutdown.finish();
     #[cfg(unix)]
     let _ = control_thread.join();
-    let _ = reconciler_thread.join();
     if let Some(metrics_thread) = metrics_thread {
         let _ = metrics_thread.join();
-    }
-
-    while state.admission.snapshot().global.in_use > 0 && Instant::now() < drain_deadline {
-        thread::sleep(Duration::from_millis(50));
-    }
-    let remaining = state.admission.snapshot().global.in_use;
-    if remaining > 0 {
-        eprintln!("TLS proxy shutdown drain timed out with {remaining} connection(s) still active");
     }
 
     #[cfg(unix)]
@@ -1260,7 +1418,9 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     if let Some(error) = route_join_error {
         return Err(error);
     }
-    ingress_result?;
+    if let Some(error) = ingress_report.failure {
+        return Err(error);
+    }
     eprintln!("TLS proxy stopped");
     Ok(())
 }
@@ -1268,51 +1428,70 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
 async fn serve_tokio_ingress(
     listeners: Vec<std::net::TcpListener>,
     state: Arc<ProxyState>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: IngressShutdown,
     route_sender: mpsc::SyncSender<RouteSelectionJob>,
-) -> Result<(), String> {
+) -> IngressDrainReport {
     let mut listener_tasks = JoinSet::new();
+    let mut failure = None;
+    let mut forced_connections = 0;
     for listener in listeners {
-        let listener = TokioTcpListener::from_std(listener)
-            .map_err(|error| format!("cannot adopt listener into Tokio: {error}"))?;
+        let listener = match TokioTcpListener::from_std(listener) {
+            Ok(listener) => listener,
+            Err(error) => {
+                failure = Some(format!("cannot adopt listener into Tokio: {error}"));
+                shutdown.request();
+                break;
+            }
+        };
         let ingress = TokioIngress {
             state: Arc::clone(&state),
-            shutdown: Arc::clone(&shutdown),
+            shutdown: shutdown.clone(),
             route_sender: route_sender.clone(),
         };
         listener_tasks.spawn(async move { accept_tokio_connections(listener, ingress).await });
     }
     drop(route_sender);
 
-    let mut failure = None;
-    while !shutdown.load(Ordering::Acquire) && !listener_tasks.is_empty() {
+    while !listener_tasks.is_empty() {
         tokio::select! {
+            biased;
+            _ = shutdown.wait_requested() => break,
             Some(joined) = listener_tasks.join_next() => {
                 match joined {
-                    Ok(Ok(())) if shutdown.load(Ordering::Acquire) => {}
-                    Ok(Ok(())) => {
-                        failure = Some("Tokio ingress listener stopped unexpectedly".to_string());
-                        shutdown.store(true, Ordering::Release);
-                    }
-                    Ok(Err(error)) => {
-                        failure = Some(error);
-                        shutdown.store(true, Ordering::Release);
+                    Ok(report) => {
+                        forced_connections += report.forced_connections;
+                        if failure.is_none() {
+                            failure = report.failure;
+                        }
+                        if !shutdown.is_requested() {
+                            failure =
+                                Some("Tokio ingress listener stopped unexpectedly".to_string());
+                            shutdown.request();
+                        }
                     }
                     Err(error) => {
                         failure = Some(format!("Tokio ingress listener task failed: {error}"));
-                        shutdown.store(true, Ordering::Release);
+                        shutdown.request();
                     }
                 }
             }
-            _ = tokio::time::sleep(ASYNC_SHUTDOWN_POLL_INTERVAL) => {}
         }
     }
 
-    shutdown.store(true, Ordering::Release);
+    shutdown.request();
+    state
+        .listeners
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
     while let Some(joined) = listener_tasks.join_next().await {
         match joined {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) if failure.is_none() => failure = Some(error),
+            Ok(report) => {
+                forced_connections += report.forced_connections;
+                if failure.is_none() {
+                    failure = report.failure;
+                }
+            }
             Err(error) if failure.is_none() => {
                 failure = Some(format!("Tokio ingress listener task failed: {error}"));
             }
@@ -1320,13 +1499,16 @@ async fn serve_tokio_ingress(
         }
     }
 
-    failure.map_or(Ok(()), Err)
+    IngressDrainReport {
+        forced_connections,
+        failure,
+    }
 }
 
 async fn accept_tokio_connections(
     listener: TokioTcpListener,
     ingress: TokioIngress,
-) -> Result<(), String> {
+) -> ListenerDrainReport {
     let TokioIngress {
         state,
         shutdown,
@@ -1336,17 +1518,19 @@ async fn accept_tokio_connections(
     let mut failure = None;
     let mut accept_error_reported = false;
 
-    while !shutdown.load(Ordering::Acquire) {
+    loop {
         reap_ready_connection_tasks(&mut connections, &state, &mut failure);
         if failure.is_some() {
-            shutdown.store(true, Ordering::Release);
+            shutdown.request();
             break;
         }
         tokio::select! {
+            biased;
+            _ = shutdown.wait_requested() => break,
             Some(joined) = connections.join_next(), if !connections.is_empty() => {
                 record_connection_completion(joined, &state, &mut failure);
                 if failure.is_some() {
-                    shutdown.store(true, Ordering::Release);
+                    shutdown.request();
                     break;
                 }
             }
@@ -1354,7 +1538,7 @@ async fn accept_tokio_connections(
                 match accepted {
                     Ok((stream, peer)) => {
                         accept_error_reported = false;
-                        if shutdown.load(Ordering::Acquire) {
+                        if shutdown.is_requested() {
                             break;
                         }
                         let accepted_at = Instant::now();
@@ -1369,7 +1553,7 @@ async fn accept_tokio_connections(
                         };
                         let ingress = TokioIngress {
                             state: Arc::clone(&state),
-                            shutdown: Arc::clone(&shutdown),
+                            shutdown: shutdown.clone(),
                             route_sender: route_sender.clone(),
                         };
                         connections.spawn(async move {
@@ -1392,16 +1576,51 @@ async fn accept_tokio_connections(
                     }
                 }
             }
-            _ = tokio::time::sleep(ASYNC_SHUTDOWN_POLL_INTERVAL) => {}
+        }
+    }
+
+    drop(listener);
+    let forced_connections = drain_connection_tasks(
+        &mut connections,
+        &state,
+        &mut failure,
+        shutdown.drain_deadline(),
+    )
+    .await;
+
+    ListenerDrainReport {
+        forced_connections,
+        failure,
+    }
+}
+
+async fn drain_connection_tasks(
+    connections: &mut JoinSet<Result<(), String>>,
+    state: &ProxyState,
+    failure: &mut Option<String>,
+    drain_deadline: Instant,
+) -> usize {
+    let drain_deadline = tokio::time::Instant::from_std(drain_deadline);
+    while !connections.is_empty() {
+        tokio::select! {
+            joined = connections.join_next() => {
+                if let Some(joined) = joined {
+                    record_connection_completion(joined, state, failure);
+                }
+            }
+            _ = tokio::time::sleep_until(drain_deadline) => break,
         }
     }
 
     connections.abort_all();
+    let mut forced_connections = 0;
     while let Some(joined) = connections.join_next().await {
-        record_connection_completion(joined, &state, &mut failure);
+        if matches!(&joined, Err(error) if error.is_cancelled()) {
+            forced_connections += 1;
+        }
+        record_connection_completion(joined, state, failure);
     }
-
-    failure.map_or(Ok(()), Err)
+    forced_connections
 }
 
 fn reap_ready_connection_tasks(
@@ -1442,6 +1661,29 @@ async fn route_tokio_connection(
     admission: PreRoutingAdmission,
     ingress: TokioIngress,
 ) -> Result<(), String> {
+    let handoff = tokio::select! {
+        biased;
+        _ = ingress.shutdown.wait_requested() => return Ok(()),
+        result = prepare_tokio_handoff(client, source, accepted_at, admission, &ingress) => result?,
+    };
+    if ingress.shutdown.is_requested() {
+        return Ok(());
+    }
+
+    match prepare_handoff(handoff, Arc::clone(&ingress.state)).await? {
+        None => Ok(()),
+        Some(_) if ingress.shutdown.is_requested() => Ok(()),
+        Some(job) => relay_tokio_connection(job, &ingress).await,
+    }
+}
+
+async fn prepare_tokio_handoff(
+    client: TokioTcpStream,
+    source: IpAddr,
+    accepted_at: Instant,
+    admission: PreRoutingAdmission,
+    ingress: &TokioIngress,
+) -> Result<HandoffJob, String> {
     let state = &ingress.state;
     let client_hello_deadline = accepted_at
         .checked_add(state.limits.client_hello_timeout())
@@ -1454,12 +1696,12 @@ async fn route_tokio_connection(
     .map_err(|error| error.to_string())?;
     state.record_source_diagnostic(source, &hostname);
 
-    let (backend, cached) = select_tokio_route(&hostname, &ingress).await?;
+    let (backend, cached) = select_tokio_route(&hostname, ingress).await?;
     let relay_idle_timeout = state.relay_idle_timeout(&hostname);
     let client = client
         .into_std()
         .map_err(|error| format!("cannot release accepted socket from Tokio: {error}"))?;
-    let handoff = HandoffJob {
+    Ok(HandoffJob {
         client,
         accepted_at,
         admission,
@@ -1468,12 +1710,7 @@ async fn route_tokio_connection(
         backend,
         cached,
         relay_idle_timeout,
-    };
-
-    match prepare_handoff(handoff, Arc::clone(&ingress.state)).await? {
-        None => Ok(()),
-        Some(job) => relay_tokio_connection(job, &ingress).await,
-    }
+    })
 }
 
 async fn select_tokio_route(
@@ -1510,9 +1747,10 @@ async fn select_tokio_route(
             return Err("route-selection queue capacity exhausted".to_string());
         }
         Err(mpsc::TrySendError::Disconnected(_)) => {
-            if !ingress.shutdown.swap(true, Ordering::AcqRel) {
+            if !ingress.shutdown.is_requested() {
                 eprintln!("TLS proxy route-selection worker pool stopped");
             }
+            ingress.shutdown.request();
             return Err("route-selection worker pool stopped".to_string());
         }
     }
@@ -1557,12 +1795,13 @@ fn handle_route_selection(job: RouteSelectionJob, state: &ProxyState) {
 
 fn start_metrics_server(
     state: Arc<ProxyState>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: IngressShutdown,
 ) -> Option<thread::JoinHandle<()>> {
     let metrics = state.public_snapshot()?.metrics?;
     let render_state = Arc::clone(&state);
-    match observability::start_metrics_server(metrics.listen, shutdown, move || {
-        render_prometheus_metrics(&render_state)
+    let exiting = Arc::clone(&shutdown.exiting);
+    match observability::start_metrics_server(metrics.listen, exiting, move || {
+        render_prometheus_metrics(&render_state, &shutdown)
     }) {
         Ok(metrics_thread) => {
             eprintln!(
@@ -1972,9 +2211,93 @@ fn remove_staged_control_socket(path: &Path, directory: &Path) {
 }
 
 #[cfg(unix)]
+enum ControlRequestError {
+    TooLarge,
+    Cancelled,
+    Io(io::Error),
+}
+
+#[cfg(unix)]
+fn read_control_request(
+    stream: &mut UnixStream,
+    shutdown: &IngressShutdown,
+    deadline: Instant,
+) -> Result<Vec<u8>, ControlRequestError> {
+    let mut request = Vec::with_capacity(CONTROL_REQUEST_LIMIT as usize);
+    loop {
+        if shutdown.is_exiting() {
+            return Err(ControlRequestError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(ControlRequestError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control request exceeded its absolute deadline",
+            )));
+        }
+        let mut chunk = [0_u8; 256];
+        match stream.read(&mut chunk) {
+            Ok(0) => return Ok(request),
+            Ok(read) if request.len().saturating_add(read) > CONTROL_REQUEST_LIMIT as usize => {
+                return Err(ControlRequestError::TooLarge);
+            }
+            Ok(read) => request.extend_from_slice(&chunk[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(ControlRequestError::Io(error)),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_control_response(
+    stream: &mut UnixStream,
+    mut response: &[u8],
+    shutdown: &IngressShutdown,
+    deadline: Instant,
+) -> io::Result<()> {
+    while !response.is_empty() {
+        if shutdown.is_exiting() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "control response cancelled during shutdown",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control request exceeded its absolute deadline",
+            ));
+        }
+        match stream.write(response) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "control response socket stopped accepting bytes",
+                ));
+            }
+            Ok(written) => response = &response[written..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn start_control_server(
     state: Arc<ProxyState>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: IngressShutdown,
 ) -> Result<(PathBuf, thread::JoinHandle<()>), String> {
     let path = state.control_socket_path();
     let directory = path
@@ -2030,18 +2353,21 @@ fn start_control_server(
         .map_err(|error| format!("cannot configure control socket: {error}"))?;
 
     let thread = thread::spawn(move || {
-        while !shutdown.load(Ordering::Acquire) {
+        while !shutdown.is_exiting() {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    if let Err(error) = stream.set_read_timeout(Some(CONTROL_IO_TIMEOUT)) {
+                    if let Err(error) = stream.set_read_timeout(Some(CONTROL_IO_POLL_INTERVAL)) {
                         let _ = writeln!(stream, "ERROR cannot configure request timeout: {error}");
                         continue;
                     }
-                    if let Err(error) = stream.set_write_timeout(Some(CONTROL_IO_TIMEOUT)) {
+                    if let Err(error) = stream.set_write_timeout(Some(CONTROL_IO_POLL_INTERVAL)) {
                         let _ =
                             writeln!(stream, "ERROR cannot configure response timeout: {error}");
                         continue;
                     }
+                    let deadline = Instant::now()
+                        .checked_add(CONTROL_IO_TIMEOUT)
+                        .unwrap_or_else(Instant::now);
                     let peer = match control_peer(&stream) {
                         Ok(peer) => peer,
                         Err(_) => {
@@ -2049,15 +2375,15 @@ fn start_control_server(
                             continue;
                         }
                     };
-                    let mut request = Vec::new();
-                    let response = match (&mut stream)
-                        .take(CONTROL_REQUEST_LIMIT + 1)
-                        .read_to_end(&mut request)
-                    {
-                        Ok(_) if request.len() as u64 > CONTROL_REQUEST_LIMIT => format!(
+                    let response = match read_control_request(&mut stream, &shutdown, deadline) {
+                        Err(ControlRequestError::TooLarge) => format!(
                             "ERROR request exceeds the {CONTROL_REQUEST_LIMIT} byte limit\n"
                         ),
-                        Ok(_) => match String::from_utf8(request) {
+                        Err(ControlRequestError::Cancelled) => continue,
+                        Err(ControlRequestError::Io(error)) => {
+                            format!("ERROR cannot read request: {error}\n")
+                        }
+                        Ok(request) => match String::from_utf8(request) {
                             Ok(request) => {
                                 let request = request.trim();
                                 match control_command_access(request) {
@@ -2072,9 +2398,13 @@ fn start_control_server(
                             }
                             Err(_) => "ERROR request is not valid UTF-8\n".to_string(),
                         },
-                        Err(error) => format!("ERROR cannot read request: {error}\n"),
                     };
-                    let _ = stream.write_all(response.as_bytes());
+                    let _ = write_control_response(
+                        &mut stream,
+                        response.as_bytes(),
+                        &shutdown,
+                        deadline,
+                    );
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));
@@ -2251,6 +2581,7 @@ struct ControlCounterStatus {
 struct ControlJsonStatus {
     schema_version: u32,
     live: bool,
+    draining: bool,
     ready: bool,
     hosting_profile: &'static str,
     generation: u64,
@@ -2327,7 +2658,7 @@ fn degraded_route_statuses(
         .collect()
 }
 
-fn render_json_control_status(state: &ProxyState) -> String {
+fn render_json_control_status(state: &ProxyState, shutdown: &IngressShutdown) -> String {
     let profile = state.hosting_profile();
     let route_summary = route_summary_for_profile(state, &profile);
     let degraded_routes = degraded_route_statuses(state, &profile);
@@ -2361,7 +2692,8 @@ fn render_json_control_status(state: &ProxyState) -> String {
     let status = ControlJsonStatus {
         schema_version: CONTROL_SCHEMA_VERSION,
         live: true,
-        ready: route_summary.ready,
+        draining: shutdown.is_requested(),
+        ready: route_summary.ready && !shutdown.is_requested(),
         hosting_profile: route_summary.hosting_profile,
         generation: route_summary.config_generation,
         listeners,
@@ -2472,7 +2804,7 @@ fn render_json_control_status(state: &ProxyState) -> String {
     rendered
 }
 
-fn render_prometheus_metrics(state: &ProxyState) -> String {
+fn render_prometheus_metrics(state: &ProxyState, shutdown: &IngressShutdown) -> String {
     let profile = state.hosting_profile();
     let summary = route_summary_for_profile(state, &profile);
     let admission = state.admission.snapshot();
@@ -2496,7 +2828,11 @@ fn render_prometheus_metrics(state: &ProxyState) -> String {
         "phx_port_build_info{{version=\"{}\"}} 1",
         prometheus_label(env!("CARGO_PKG_VERSION"))
     );
-    metric!("phx_port_ready {}", usize::from(summary.ready));
+    metric!(
+        "phx_port_ready {}",
+        usize::from(summary.ready && !shutdown.is_requested())
+    );
+    metric!("phx_port_draining {}", usize::from(shutdown.is_requested()));
     metric!("phx_port_config_generation {}", summary.config_generation);
     for (route_state, value) in [
         ("declared", summary.declared_routes),
@@ -2738,11 +3074,17 @@ fn prometheus_label(value: &str) -> String {
     escaped
 }
 
-fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &str) -> String {
+fn render_control_response(
+    state: &ProxyState,
+    shutdown: &IngressShutdown,
+    request: &str,
+) -> String {
     match request {
         "STATUS" => {
             let admission = state.admission.snapshot();
             let route_summary = route_summary(state);
+            let draining = shutdown.is_requested();
+            let lifecycle = if draining { "draining" } else { "running" };
             let listeners = state
                 .listeners
                 .read()
@@ -2776,7 +3118,8 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
             let last_rejected_config_generation =
                 reload_status.last_rejected_generation.unwrap_or(0);
             format!(
-                "running\nhosting_profile={hosting_profile}\nconfig_generation={config_generation}\ndeclared_routes={declared_routes}\nrequired_routes={required_routes}\noptional_routes={optional_routes}\nactive_routes={active_routes}\ndegraded_routes={degraded_routes}\nready={ready}\nregistry_valid={registry_valid}\nundeclared_registrations={undeclared_registrations}\nrejected_registry_snapshots={rejected_registry_snapshots}\naccepted_config_reloads={accepted_config_reloads}\nrejected_config_reloads={rejected_config_reloads}\nlast_rejected_config_generation={last_rejected_config_generation}\nlast_reload_error={last_reload_error}\nlisteners={listeners}\nconflicts={conflicts}\nconflict_capacity_drops={conflict_capacity_drops}\nroute_capacity_rejections={route_capacity_rejections}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nsource_entries={source_entries}\nsource_entry_limit={source_entry_limit}\nsource_accepts_per_second_limit={source_accepts_per_second_limit}\nsource_accept_burst_limit={source_accept_burst_limit}\nsource_pre_routing_limit={source_pre_routing_limit}\nsource_ipv6_prefix={source_ipv6_prefix}\nsource_entry_ttl_seconds={source_entry_ttl_seconds}\nsource_policy_overrides={source_policy_overrides}\nqueued_route_selections={queued_route_selections}\nroute_selection_queue_limit={ROUTE_SELECTION_QUEUE_CAPACITY}\nroute_selection_workers={ROUTE_SELECTION_WORKERS}\nqueued_connections={queued_connections}\nconnection_queue_limit={connection_queue_limit}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\ncompleted_relays={completed_relays}\nfailed_relays={failed_relays}\nrelay_idle_timeouts={relay_idle_timeouts}\nrelay_backend_connect_failures={relay_backend_connect_failures}\nrelay_client_to_workload_bytes={relay_client_to_workload_bytes}\nrelay_workload_to_client_bytes={relay_workload_to_client_bytes}\nrelay_duration_nanoseconds={relay_duration_nanoseconds}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_source_rate={rejected_source_rate}\nrejected_source_concurrency={rejected_source_concurrency}\nrejected_source_state_capacity={rejected_source_state_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_routing_queue={rejected_routing_queue}\nrejected_routing_timeout={rejected_routing_timeout}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
+                "{lifecycle}\nhosting_profile={hosting_profile}\nconfig_generation={config_generation}\ndeclared_routes={declared_routes}\nrequired_routes={required_routes}\noptional_routes={optional_routes}\nactive_routes={active_routes}\ndegraded_routes={degraded_routes}\ndraining={draining}\nready={ready}\nregistry_valid={registry_valid}\nundeclared_registrations={undeclared_registrations}\nrejected_registry_snapshots={rejected_registry_snapshots}\naccepted_config_reloads={accepted_config_reloads}\nrejected_config_reloads={rejected_config_reloads}\nlast_rejected_config_generation={last_rejected_config_generation}\nlast_reload_error={last_reload_error}\nlisteners={listeners}\nconflicts={conflicts}\nconflict_capacity_drops={conflict_capacity_drops}\nroute_capacity_rejections={route_capacity_rejections}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nsource_entries={source_entries}\nsource_entry_limit={source_entry_limit}\nsource_accepts_per_second_limit={source_accepts_per_second_limit}\nsource_accept_burst_limit={source_accept_burst_limit}\nsource_pre_routing_limit={source_pre_routing_limit}\nsource_ipv6_prefix={source_ipv6_prefix}\nsource_entry_ttl_seconds={source_entry_ttl_seconds}\nsource_policy_overrides={source_policy_overrides}\nqueued_route_selections={queued_route_selections}\nroute_selection_queue_limit={ROUTE_SELECTION_QUEUE_CAPACITY}\nroute_selection_workers={ROUTE_SELECTION_WORKERS}\nqueued_connections={queued_connections}\nconnection_queue_limit={connection_queue_limit}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\ncompleted_relays={completed_relays}\nfailed_relays={failed_relays}\nrelay_idle_timeouts={relay_idle_timeouts}\nrelay_backend_connect_failures={relay_backend_connect_failures}\nrelay_client_to_workload_bytes={relay_client_to_workload_bytes}\nrelay_workload_to_client_bytes={relay_workload_to_client_bytes}\nrelay_duration_nanoseconds={relay_duration_nanoseconds}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_source_rate={rejected_source_rate}\nrejected_source_concurrency={rejected_source_concurrency}\nrejected_source_state_capacity={rejected_source_state_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_routing_queue={rejected_routing_queue}\nrejected_routing_timeout={rejected_routing_timeout}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
+                lifecycle = lifecycle,
                 hosting_profile = route_summary.hosting_profile,
                 config_generation = route_summary.config_generation,
                 declared_routes = route_summary.declared_routes,
@@ -2784,7 +3127,8 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 optional_routes = route_summary.optional_routes,
                 active_routes = route_summary.active_routes,
                 degraded_routes = route_summary.degraded_routes,
-                ready = route_summary.ready,
+                draining = draining,
+                ready = route_summary.ready && !draining,
                 registry_valid = state.registry_valid.load(Ordering::Acquire),
                 undeclared_registrations = state.undeclared_registrations.load(Ordering::Acquire),
                 rejected_registry_snapshots =
@@ -2852,7 +3196,7 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                     state.delivered_handoff_failures.load(Ordering::Relaxed),
             )
         }
-        "STATUS JSON" | "CHECK LIVE" | "CHECK READY" => render_json_control_status(state),
+        "STATUS JSON" | "CHECK LIVE" | "CHECK READY" => render_json_control_status(state, shutdown),
         "ROUTES" => {
             let profile = state.hosting_profile();
             let public_snapshot = profile.public_snapshot();
@@ -2930,6 +3274,9 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 format!("{}\n", lines.join("\n"))
             }
         }
+        "RELOAD" if shutdown.is_requested() => {
+            "ERROR reload is unavailable while ingress is draining\n".to_string()
+        }
         "RELOAD" => match reload_public_profile(state) {
             ConfigReloadOutcome::NotPublic => {
                 "ERROR reload requires the public Hosting Profile\n".to_string()
@@ -2948,7 +3295,7 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
             }
         },
         "STOP" => {
-            shutdown.store(true, Ordering::Release);
+            shutdown.request();
             "stopping\n".to_string()
         }
         _ => "ERROR unknown command\n".to_string(),
@@ -3019,7 +3366,7 @@ fn handle_connection(
             let (route_sender, _route_receiver) = mpsc::sync_channel(1);
             let ingress = TokioIngress {
                 state,
-                shutdown: Arc::new(AtomicBool::new(false)),
+                shutdown: IngressShutdown::new(DEVELOPMENT_SHUTDOWN_DRAIN_TIMEOUT),
                 route_sender,
             };
             runtime.block_on(relay_tokio_connection(job, &ingress))
@@ -3145,6 +3492,76 @@ impl HandoffJob {
 }
 
 async fn relay_tokio_connection(job: RelayJob, ingress: &TokioIngress) -> Result<(), String> {
+    relay_tokio_connection_with_connector(job, ingress, |backend| async move {
+        connect_tokio_backend(&backend).await
+    })
+    .await
+}
+
+async fn relay_tokio_connection_with_connector<Connect, Connecting>(
+    job: RelayJob,
+    ingress: &TokioIngress,
+    connect_backend: Connect,
+) -> Result<(), String>
+where
+    Connect: FnMut(Backend) -> Connecting,
+    Connecting: Future<Output = io::Result<TokioTcpStream>>,
+{
+    let established = tokio::select! {
+        biased;
+        _ = ingress.shutdown.wait_requested() => return Ok(()),
+        established = establish_relay(job, ingress, connect_backend) => established?,
+    };
+    let Some(mut established) = established else {
+        return Ok(());
+    };
+    if !commit_relay_start(&ingress.state, &ingress.shutdown) {
+        return Ok(());
+    }
+
+    let report = relay::copy_bidirectional(
+        &mut established.client,
+        &mut established.upstream,
+        established.idle_timeout,
+    )
+    .await;
+    ingress.state.record_relay_report(&report);
+    match report.error {
+        None => {
+            ingress
+                .state
+                .completed_relays
+                .fetch_add(1, Ordering::Relaxed);
+            ingress
+                .state
+                .record_delivery_outcome(DeliveryOutcome::RelayCompleted);
+            Ok(())
+        }
+        Some(error) => {
+            if error.kind() == io::ErrorKind::TimedOut {
+                ingress
+                    .state
+                    .relay_idle_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ingress.state.failed_relays.fetch_add(1, Ordering::Relaxed);
+            ingress
+                .state
+                .record_delivery_outcome(DeliveryOutcome::RelayFailed);
+            Err(format!("relay failed: {error}"))
+        }
+    }
+}
+
+async fn establish_relay<Connect, Connecting>(
+    job: RelayJob,
+    ingress: &TokioIngress,
+    mut connect_backend: Connect,
+) -> Result<Option<EstablishedRelay>, String>
+where
+    Connect: FnMut(Backend) -> Connecting,
+    Connecting: Future<Output = io::Result<TokioTcpStream>>,
+{
     let RelayJob {
         client,
         admission,
@@ -3156,16 +3573,16 @@ async fn relay_tokio_connection(job: RelayJob, ingress: &TokioIngress) -> Result
     let state = &ingress.state;
     let relay_permit = match acquire_relay_capacity(state) {
         Some(permit) => permit,
-        None => return Ok(()),
+        None => return Ok(None),
     };
     let _relay_admission = admission.into_relay(relay_permit);
 
     client
         .set_nonblocking(true)
         .map_err(|error| format!("cannot return accepted socket to Tokio: {error}"))?;
-    let mut client = TokioTcpStream::from_std(client)
+    let client = TokioTcpStream::from_std(client)
         .map_err(|error| format!("cannot adopt accepted socket into Tokio: {error}"))?;
-    let mut upstream = match connect_tokio_backend(&backend).await {
+    let upstream = match connect_backend(backend.clone()).await {
         Ok(stream) => stream,
         Err(_) if cached => {
             state
@@ -3177,7 +3594,7 @@ async fn relay_tokio_connection(job: RelayJob, ingress: &TokioIngress) -> Result
                 .map_err(|_| "route table lock poisoned".to_string())?
                 .remove(&hostname);
             backend = select_tokio_route(&hostname, ingress).await?.0;
-            connect_tokio_backend(&backend).await.map_err(|error| {
+            connect_backend(backend).await.map_err(|error| {
                 state
                     .relay_backend_connect_failures
                     .fetch_add(1, Ordering::Relaxed);
@@ -3192,25 +3609,19 @@ async fn relay_tokio_connection(job: RelayJob, ingress: &TokioIngress) -> Result
         }
     };
 
-    state.relayed_connections.fetch_add(1, Ordering::Relaxed);
-    state.record_delivery_outcome(DeliveryOutcome::RelayStarted);
-    let report = relay::copy_bidirectional(&mut client, &mut upstream, idle_timeout).await;
-    state.record_relay_report(&report);
-    match report.error {
-        None => {
-            state.completed_relays.fetch_add(1, Ordering::Relaxed);
-            state.record_delivery_outcome(DeliveryOutcome::RelayCompleted);
-            Ok(())
-        }
-        Some(error) => {
-            if error.kind() == io::ErrorKind::TimedOut {
-                state.relay_idle_timeouts.fetch_add(1, Ordering::Relaxed);
-            }
-            state.failed_relays.fetch_add(1, Ordering::Relaxed);
-            state.record_delivery_outcome(DeliveryOutcome::RelayFailed);
-            Err(format!("relay failed: {error}"))
-        }
-    }
+    Ok(Some(EstablishedRelay {
+        client,
+        upstream,
+        _admission: _relay_admission,
+        idle_timeout,
+    }))
+}
+
+fn commit_relay_start(state: &ProxyState, shutdown: &IngressShutdown) -> bool {
+    shutdown.commit_if_running(|| {
+        state.relayed_connections.fetch_add(1, Ordering::Relaxed);
+        state.record_delivery_outcome(DeliveryOutcome::RelayStarted);
+    })
 }
 
 async fn connect_tokio_backend(backend: &Backend) -> io::Result<TokioTcpStream> {
@@ -4284,20 +4695,23 @@ fn connect_backend_with_timeout(backend: &Backend, timeout: Duration) -> io::Res
 mod tests {
     use super::{
         ActiveRoute, Backend, CONTROL_RESPONSE_LIMIT, DELIVERY_EVENT_INTERVAL, DeliveryOutcome,
-        MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS, MAX_VERIFIED_ROUTES,
-        MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter, ProbeMatch, ProxyState,
-        QueuedRouteSelection, RelayJob, RouteSelectionJob, SOURCE_DIAGNOSTIC_EVENT_INTERVAL,
-        TokioIngress, WaitingClient, cache_negative, clear_conflict, collect_probe_matches,
-        handle_connection, handle_route_selection, install_active_route, observe_workloads,
-        prefer_https_per_project, reap_ready_connection_tasks, reconcile_routes,
-        reconcile_workloads, record_conflict, relay_tokio_connection, reload_public_profile,
+        IngressShutdown, MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS,
+        MAX_VERIFIED_ROUTES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter,
+        ProbeMatch, ProxyState, QueuedRouteSelection, RelayJob, RouteSelectionJob,
+        SOURCE_DIAGNOSTIC_EVENT_INTERVAL, TokioIngress, WaitingClient, cache_negative,
+        clear_conflict, collect_probe_matches, commit_relay_start, handle_connection,
+        handle_route_selection, install_active_route, observe_workloads, prefer_https_per_project,
+        reap_ready_connection_tasks, reconcile_routes, reconcile_workloads, record_conflict,
+        relay_tokio_connection, relay_tokio_connection_with_connector, reload_public_profile,
         render_control_response, render_prometheus_metrics, resolve_backend, select_tokio_route,
-        supports_eager_discovery,
+        serve_tokio_ingress, supports_eager_discovery,
     };
     #[cfg(unix)]
     use super::{ControlAccess, ControlEndpointPolicy, ControlPeer, bind_private_control_socket};
     #[cfg(target_os = "linux")]
-    use super::{HandoffJob, IngressLimits, SystemCapacity, prepare_handoff};
+    use super::{
+        HandoffJob, IngressLimits, SystemCapacity, drain_connection_tasks, prepare_handoff,
+    };
     use crate::{
         admission::AdmissionRejection,
         ingress_config::{
@@ -4338,6 +4752,8 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime};
     use tempfile::{TempDir, tempdir_in};
+    use tokio::net::TcpStream as TokioTcpStream;
+    use tokio::sync::oneshot;
     use tokio::task::JoinSet;
     use toml_edit::value;
 
@@ -4347,6 +4763,10 @@ mod tests {
         #[cfg(not(unix))]
         let root = std::env::temp_dir().canonicalize()?;
         tempdir_in(root)
+    }
+
+    fn running_shutdown() -> IngressShutdown {
+        IngressShutdown::new(Duration::from_secs(1))
     }
 
     fn backend() -> Backend {
@@ -4686,7 +5106,7 @@ mod tests {
         drop(active);
         assert_eq!(first_backend.accepted(), 1);
         assert_eq!(second_backend.accepted(), 1);
-        let status = render_control_response(&state, &AtomicBool::new(false), "STATUS");
+        let status = render_control_response(&state, &running_shutdown(), "STATUS");
         assert!(status.contains("active_routes=2"), "{status}");
         assert!(status.contains("ready=true"), "{status}");
         assert!(status.contains("degraded_routes=0"), "{status}");
@@ -4832,6 +5252,175 @@ mod tests {
         receiver.join().unwrap();
         drop(first_peer);
         drop(second_peer);
+        let admission = state.admission.snapshot();
+        assert_eq!(admission.global.in_use, 0);
+        assert_eq!(admission.pre_routing.in_use, 0);
+        assert_eq!(admission.handoff.in_use, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_waits_for_phxp_ownership_and_handoff_survives() {
+        const PROJECT: &str = "/shutdown-handoff";
+
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime_directory = directory.path().join("runtime");
+        fs::create_dir(&runtime_directory).unwrap();
+        fs::set_permissions(&runtime_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(runtime_directory.join("handoff")).unwrap();
+        let endpoint = handoff::endpoint_path(
+            EndpointIdentity::Development(PROJECT),
+            "https",
+            Some(&runtime_directory),
+        )
+        .unwrap();
+        let handoff_listener = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        bind(
+            handoff_listener.as_raw_fd(),
+            &UnixAddr::new(endpoint.as_path()).unwrap(),
+        )
+        .unwrap();
+        listen(&handoff_listener, Backlog::new(1).unwrap()).unwrap();
+
+        let (descriptor_delivered, descriptor_observed) = tokio::sync::oneshot::channel();
+        let (acknowledge, wait_for_acknowledgement) = std::sync::mpsc::channel();
+        let receiver = thread::spawn(move || {
+            let control = accept(handoff_listener.as_raw_fd()).unwrap();
+            let control = unsafe { OwnedFd::from_raw_fd(control) };
+            let mut packet = [0_u8; crate::handoff_protocol::MAX_PACKET_LENGTH + 1];
+            let length = recv(control.as_raw_fd(), &mut packet, MsgFlags::empty()).unwrap();
+            assert_eq!(decode(&packet[..length]).unwrap(), Message::Hello);
+            send(
+                control.as_raw_fd(),
+                &encode(&Message::Ready).unwrap(),
+                MsgFlags::empty(),
+            )
+            .unwrap();
+
+            let (packet_length, mut descriptors) = {
+                let mut ancillary = nix::cmsg_space!([i32; 2]);
+                let mut iov = [IoSliceMut::new(&mut packet)];
+                let message = recvmsg::<UnixAddr>(
+                    control.as_raw_fd(),
+                    &mut iov,
+                    Some(&mut ancillary),
+                    MsgFlags::MSG_CMSG_CLOEXEC,
+                )
+                .unwrap();
+                let descriptors = message
+                    .cmsgs()
+                    .unwrap()
+                    .flat_map(|message| match message {
+                        ControlMessageOwned::ScmRights(descriptors) => descriptors,
+                        _ => Vec::new(),
+                    })
+                    .map(|descriptor| unsafe { OwnedFd::from_raw_fd(descriptor) })
+                    .collect::<Vec<_>>();
+                (message.bytes, descriptors)
+            };
+            assert_eq!(descriptors.len(), 1);
+            let connection_id = match decode(&packet[..packet_length]).unwrap() {
+                Message::Handoff(request) => request.connection_id,
+                request => panic!("unexpected PHXP request: {request:?}"),
+            };
+            descriptor_delivered.send(()).unwrap();
+            wait_for_acknowledgement.recv().unwrap();
+            send(
+                control.as_raw_fd(),
+                &encode(&Message::Adopted { connection_id }).unwrap(),
+                MsgFlags::empty(),
+            )
+            .unwrap();
+            TcpStream::from(descriptors.pop().unwrap())
+        });
+
+        let state = Arc::new(ProxyState::new_with_profile_connector_and_runtime(
+            directory.path().join("ports.toml"),
+            HostingProfile::Development,
+            TestCertificate::for_hostname("unused.example.test").connector(),
+            runtime_directory,
+        ));
+        let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut public_peer = TcpStream::connect(frontend.local_addr().unwrap()).unwrap();
+        let (accepted, peer) = frontend.accept().unwrap();
+        let handoff = HandoffJob {
+            client: accepted,
+            accepted_at: Instant::now(),
+            admission: state.admission.try_admit(peer.ip()).unwrap(),
+            hostname: "shutdown-handoff.example.test".to_string(),
+            peeked_length: 0,
+            backend: Backend {
+                project: PROJECT.to_string(),
+                role: "https".to_string(),
+                port: 1,
+            },
+            cached: false,
+            relay_idle_timeout: None,
+        };
+        let shutdown = IngressShutdown::new(Duration::from_secs(1));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let handoff_state = Arc::clone(&state);
+            let mut connections = JoinSet::new();
+            connections.spawn(async move {
+                let outcome = prepare_handoff(handoff, handoff_state).await?;
+                if outcome.is_some() {
+                    return Err("PHXP handoff unexpectedly retained the relay socket".to_string());
+                }
+                Ok(())
+            });
+            tokio::time::timeout(Duration::from_secs(1), descriptor_observed)
+                .await
+                .unwrap()
+                .unwrap();
+            shutdown.request();
+
+            let mut failure = None;
+            let forced = {
+                let drain = drain_connection_tasks(
+                    &mut connections,
+                    &state,
+                    &mut failure,
+                    shutdown.drain_deadline(),
+                );
+                tokio::pin!(drain);
+                tokio::select! {
+                    forced = &mut drain => {
+                        panic!("shutdown cancelled PHXP before ownership resolved: {forced}");
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+                acknowledge.send(()).unwrap();
+                drain.await
+            };
+            assert_eq!(forced, 0);
+            assert!(failure.is_none());
+        });
+
+        let mut handed_off = receiver.join().unwrap();
+        public_peer.write_all(b"request").unwrap();
+        let mut request = [0_u8; 7];
+        handed_off.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"request");
+        handed_off.write_all(b"response").unwrap();
+        let mut response = [0_u8; 8];
+        public_peer.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"response");
+
+        assert_eq!(state.successful_handoffs.load(Ordering::Relaxed), 1);
+        assert_eq!(state.relayed_connections.load(Ordering::Relaxed), 0);
         let admission = state.admission.snapshot();
         assert_eq!(admission.global.in_use, 0);
         assert_eq!(admission.pre_routing.in_use, 0);
@@ -5062,11 +5651,11 @@ mod tests {
         assert_eq!(admission.global.in_use, 0);
         assert_eq!(admission.pre_routing.in_use, 0);
         assert_eq!(admission.relay.in_use, 0);
-        let metrics = render_prometheus_metrics(&state);
+        let metrics = render_prometheus_metrics(&state, &running_shutdown());
         assert!(metrics.contains("phx_port_relay_bytes_total{direction=\"client_to_workload\"} "));
         assert!(metrics.contains("phx_port_relay_bytes_total{direction=\"workload_to_client\"} "));
         assert!(metrics.contains("phx_port_relay_duration_seconds_total "));
-        let status = render_control_response(&state, &AtomicBool::new(false), "STATUS");
+        let status = render_control_response(&state, &running_shutdown(), "STATUS");
         assert!(status.contains("ready=true"), "{status}");
         assert!(status.contains("degraded_routes=0"), "{status}");
         assert!(status.contains("undeclared_registrations=1"), "{status}");
@@ -5161,7 +5750,7 @@ mod tests {
         assert!(state.routes.read().unwrap().is_empty());
         assert!(!state.registry_valid.load(Ordering::Acquire));
         assert_eq!(state.rejected_registry_snapshots.load(Ordering::Acquire), 1);
-        let routes = render_control_response(&state, &AtomicBool::new(false), "ROUTES");
+        let routes = render_control_response(&state, &running_shutdown(), "ROUTES");
         assert!(routes.contains("required\tregistry_invalid"), "{routes}");
     }
 
@@ -5206,7 +5795,7 @@ mod tests {
     fn async_route_selection_queue_is_bounded_and_deadlined() {
         let directory = tempdir().unwrap();
         let state = Arc::new(ProxyState::new(directory.path().join("ports.toml")));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = IngressShutdown::new(Duration::from_secs(1));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -5215,7 +5804,7 @@ mod tests {
         let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(0);
         let ingress = TokioIngress {
             state: Arc::clone(&state),
-            shutdown: Arc::clone(&shutdown),
+            shutdown: shutdown.clone(),
             route_sender,
         };
         let error = runtime
@@ -5337,6 +5926,245 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_cancels_pre_routing_without_leaking_admission() {
+        let directory = tempdir().unwrap();
+        let state = Arc::new(ProxyState::new(directory.path().join("ports.toml")));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = IngressShutdown::new(Duration::from_secs(1));
+        let ingress_state = Arc::clone(&state);
+        let ingress_shutdown = shutdown.clone();
+        let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(1);
+        let ingress = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .unwrap();
+            runtime.block_on(serve_tokio_ingress(
+                vec![listener],
+                ingress_state,
+                ingress_shutdown,
+                route_sender,
+            ))
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        let admission_deadline = Instant::now() + Duration::from_secs(1);
+        while state.admission.snapshot().pre_routing.in_use == 0 {
+            assert!(
+                Instant::now() < admission_deadline,
+                "idle ClientHello was never admitted"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let shutdown_started = Instant::now();
+        shutdown.request();
+        let ingress_report = ingress.join().unwrap();
+        assert!(ingress_report.failure.is_none());
+        assert_eq!(ingress_report.forced_connections, 0);
+        assert!(
+            shutdown_started.elapsed() < Duration::from_millis(500),
+            "pre-routing cancellation waited for the drain deadline"
+        );
+        let admission = state.admission.snapshot();
+        assert_eq!(admission.global.in_use, 0);
+        assert_eq!(admission.pre_routing.in_use, 0);
+        assert_eq!(admission.relay.in_use, 0);
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        match client.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset
+                ) => {}
+            result => panic!("cancelled pre-routing socket remained open: {result:?}"),
+        }
+    }
+
+    #[test]
+    fn shutdown_wakes_idle_listener_without_timer_progress() {
+        let directory = tempdir().unwrap();
+        let state = Arc::new(ProxyState::new(directory.path().join("ports.toml")));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let shutdown = IngressShutdown::new(Duration::from_secs(1));
+        let ingress_shutdown = shutdown.clone();
+        let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(1);
+        let (report_sender, report_receiver) = std::sync::mpsc::channel();
+        let ingress = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            let report = runtime.block_on(serve_tokio_ingress(
+                vec![listener],
+                state,
+                ingress_shutdown,
+                route_sender,
+            ));
+            report_sender.send(report).unwrap();
+        });
+        let waiter_deadline = Instant::now() + Duration::from_millis(500);
+        while shutdown.waiter_count() < 2 {
+            assert!(
+                Instant::now() < waiter_deadline,
+                "listener orchestration never subscribed to direct shutdown notification"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        shutdown.request();
+        let report = report_receiver
+            .recv_timeout(Duration::from_millis(500))
+            .expect("shutdown depended on periodic Tokio timer progress");
+        assert!(report.failure.is_none());
+        assert_eq!(report.forced_connections, 0);
+        ingress.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_drains_established_relay_until_shared_deadline() {
+        const HOSTNAME: &str = "shutdown-relay.example.test";
+
+        let certificate = TestCertificate::for_hostname(HOSTNAME);
+        let identity = Identity::from_pkcs8(
+            certificate.certificate_pem.as_bytes(),
+            certificate.private_key_pem.as_bytes(),
+        )
+        .unwrap();
+        let acceptor = TlsAcceptor::new(identity).unwrap();
+        let workload_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let workload_port = workload_listener.local_addr().unwrap().port();
+        let workload = thread::spawn(move || {
+            let (stream, _) = workload_listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut tls = acceptor.accept(stream).unwrap();
+            let mut byte = [0_u8; 1];
+            while tls.read_exact(&mut byte).is_ok() {
+                tls.write_all(&byte).unwrap();
+                tls.flush().unwrap();
+            }
+        });
+
+        let directory = tempdir().unwrap();
+        let state = Arc::new(ProxyState::new_with_profile_connector_and_runtime(
+            directory.path().join("ports.toml"),
+            HostingProfile::Development,
+            certificate.connector(),
+            directory.path().join("missing-runtime"),
+        ));
+        state.routes.write().unwrap().insert(
+            HOSTNAME.to_string(),
+            active_route(Backend {
+                project: directory.path().display().to_string(),
+                role: "https".to_string(),
+                port: workload_port,
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = IngressShutdown::new(Duration::from_millis(250));
+        let ingress_state = Arc::clone(&state);
+        let ingress_shutdown = shutdown.clone();
+        let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(1);
+        let ingress = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .unwrap();
+            runtime.block_on(serve_tokio_ingress(
+                vec![listener],
+                ingress_state,
+                ingress_shutdown,
+                route_sender,
+            ))
+        });
+
+        let stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut client = certificate.connector().connect(HOSTNAME, stream).unwrap();
+        client.write_all(b"a").unwrap();
+        client.flush().unwrap();
+        let mut echoed = [0_u8; 1];
+        client.read_exact(&mut echoed).unwrap();
+        assert_eq!(&echoed, b"a");
+
+        let relay_deadline = Instant::now() + Duration::from_secs(1);
+        while state.admission.snapshot().relay.in_use == 0 {
+            assert!(
+                Instant::now() < relay_deadline,
+                "connection never entered relay ownership"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let shutdown_started = Instant::now();
+        shutdown.request();
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err(),
+            "shutdown retained the process listener copy during relay drain"
+        );
+        let draining_status = render_control_response(&state, &shutdown, "STATUS");
+        assert!(draining_status.starts_with("draining\n"));
+        assert!(draining_status.contains("active_relays=1"));
+        assert!(draining_status.contains("ready=false"));
+        let draining_metrics = render_prometheus_metrics(&state, &shutdown);
+        assert!(draining_metrics.contains("phx_port_draining 1"));
+        assert!(draining_metrics.contains("phx_port_admission_in_use{stage=\"relay\"} 1"));
+        let after_shutdown = (|| -> io::Result<[u8; 1]> {
+            client.write_all(b"b")?;
+            client.flush()?;
+            let mut echoed = [0_u8; 1];
+            client.read_exact(&mut echoed)?;
+            Ok(echoed)
+        })();
+
+        let ingress_report = ingress.join().unwrap();
+        let drain_elapsed = shutdown_started.elapsed();
+        drop(client);
+        workload.join().unwrap();
+        assert_eq!(
+            after_shutdown.unwrap(),
+            *b"b",
+            "shutdown closed an established relay instead of draining it"
+        );
+        assert!(ingress_report.failure.is_none());
+        assert_eq!(ingress_report.forced_connections, 1);
+        assert!(
+            drain_elapsed >= Duration::from_millis(200) && drain_elapsed < Duration::from_secs(1),
+            "relay drain lasted {drain_elapsed:?} instead of respecting the shared deadline"
+        );
+        let admission = state.admission.snapshot();
+        assert_eq!(admission.global.in_use, 0);
+        assert_eq!(admission.pre_routing.in_use, 0);
+        assert_eq!(admission.relay.in_use, 0);
+    }
+
+    #[test]
     fn async_backend_connect_failure_releases_relay_capacity() {
         let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
         let public_peer = TcpStream::connect(frontend.local_addr().unwrap()).unwrap();
@@ -5363,7 +6191,7 @@ mod tests {
         let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(1);
         let ingress = TokioIngress {
             state: Arc::clone(&state),
-            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown: IngressShutdown::new(Duration::from_secs(1)),
             route_sender,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -5386,6 +6214,139 @@ mod tests {
         assert_eq!(admission.pre_routing.in_use, 0);
         assert_eq!(admission.relay.in_use, 0);
         drop(public_peer);
+    }
+
+    #[test]
+    fn shutdown_cancels_pending_relay_establishment_before_start() {
+        let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut public_peer = TcpStream::connect(frontend.local_addr().unwrap()).unwrap();
+        let (accepted, peer) = frontend.accept().unwrap();
+
+        let directory = tempdir().unwrap();
+        let state = Arc::new(ProxyState::new(directory.path().join("ports.toml")));
+        let admission = state.admission.try_admit(peer.ip()).unwrap();
+        let job = RelayJob {
+            client: accepted,
+            admission,
+            hostname: "pending.example.test".to_string(),
+            backend: Backend {
+                project: "/pending".to_string(),
+                role: "https".to_string(),
+                port: 443,
+            },
+            cached: false,
+            idle_timeout: None,
+        };
+        let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(1);
+        let ingress = TokioIngress {
+            state: Arc::clone(&state),
+            shutdown: IngressShutdown::new(Duration::from_secs(1)),
+            route_sender,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let (connect_started, connect_started_rx) = oneshot::channel();
+            let mut connect_started = Some(connect_started);
+            let task_ingress = ingress.clone();
+            let relay = tokio::spawn(async move {
+                relay_tokio_connection_with_connector(job, &task_ingress, move |_| {
+                    if let Some(started) = connect_started.take() {
+                        let _ = started.send(());
+                    }
+                    std::future::pending::<io::Result<TokioTcpStream>>()
+                })
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), connect_started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.admission.snapshot().relay.in_use, 1);
+
+            ingress.shutdown.request();
+            tokio::time::timeout(Duration::from_secs(1), relay)
+                .await
+                .expect("pending relay establishment ignored shutdown")
+                .unwrap()
+                .unwrap();
+        });
+
+        assert_eq!(state.relayed_connections.load(Ordering::Relaxed), 0);
+        assert!(
+            state.delivery_events.lock().unwrap().windows[DeliveryOutcome::RelayStarted.index()]
+                .last_emitted
+                .is_none(),
+            "cancelled establishment recorded RelayStarted"
+        );
+        let admission = state.admission.snapshot();
+        assert_eq!(admission.global.in_use, 0);
+        assert_eq!(admission.pre_routing.in_use, 0);
+        assert_eq!(admission.relay.in_use, 0);
+        public_peer
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            public_peer.read(&mut byte).unwrap(),
+            0,
+            "cancelled establishment retained the accepted socket"
+        );
+    }
+
+    #[test]
+    fn relay_start_commit_is_atomic_with_shutdown_request() {
+        let directory = tempdir().unwrap();
+        let state = Arc::new(ProxyState::new(directory.path().join("ports.toml")));
+        let shutdown = IngressShutdown::new(Duration::from_secs(1));
+        let (commit_entered, commit_entered_rx) = std::sync::mpsc::channel();
+        let (release_commit, release_commit_rx) = std::sync::mpsc::channel();
+        let state_for_commit = Arc::clone(&state);
+        let shutdown_for_commit = shutdown.clone();
+        let commit = thread::spawn(move || {
+            shutdown_for_commit.commit_if_running(|| {
+                commit_entered.send(()).unwrap();
+                release_commit_rx.recv().unwrap();
+                state_for_commit
+                    .relayed_connections
+                    .fetch_add(1, Ordering::Relaxed);
+                state_for_commit.record_delivery_outcome(DeliveryOutcome::RelayStarted);
+            })
+        });
+        commit_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let shutdown_for_request = shutdown.clone();
+        let (request_complete, request_complete_rx) = std::sync::mpsc::channel();
+        let request = thread::spawn(move || {
+            shutdown_for_request.request();
+            request_complete.send(()).unwrap();
+        });
+        assert!(
+            request_complete_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "shutdown published while a relay-start commit held the transition gate"
+        );
+        release_commit.send(()).unwrap();
+        assert!(commit.join().unwrap());
+        request_complete_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        request.join().unwrap();
+
+        assert!(shutdown.is_requested());
+        assert_eq!(state.relayed_connections.load(Ordering::Relaxed), 1);
+        assert!(
+            !commit_relay_start(&state, &shutdown),
+            "relay start committed after shutdown won the transition gate"
+        );
+        assert_eq!(state.relayed_connections.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -5413,7 +6374,7 @@ mod tests {
         let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(1);
         let ingress = TokioIngress {
             state: Arc::clone(&state),
-            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown: IngressShutdown::new(Duration::from_secs(1)),
             route_sender,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -5544,7 +6505,7 @@ mod tests {
             .unwrap()
             .insert("www.example.com".to_string(), active_route(backend()));
         state.accepted_connections.store(7, Ordering::Relaxed);
-        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let shutdown = running_shutdown();
         let routing = state
             .admission
             .try_admit(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
@@ -5595,7 +6556,27 @@ mod tests {
             render_control_response(&state, &shutdown, "STOP"),
             "stopping\n"
         );
-        assert!(shutdown.load(Ordering::Acquire));
+        assert!(shutdown.is_requested());
+        let draining = render_control_response(&state, &shutdown, "STATUS");
+        assert!(draining.starts_with("draining\n"));
+        assert!(draining.contains("draining=true"));
+        assert!(draining.contains("ready=false"));
+        let draining_json = serde_json::from_str::<serde_json::Value>(&render_control_response(
+            &state,
+            &shutdown,
+            "STATUS JSON",
+        ))
+        .unwrap();
+        assert_eq!(draining_json["live"], true);
+        assert_eq!(draining_json["draining"], true);
+        assert_eq!(draining_json["ready"], false);
+        let draining_metrics = render_prometheus_metrics(&state, &shutdown);
+        assert!(draining_metrics.contains("phx_port_ready 0"));
+        assert!(draining_metrics.contains("phx_port_draining 1"));
+        assert_eq!(
+            render_control_response(&state, &shutdown, "RELOAD"),
+            "ERROR reload is unavailable while ingress is draining\n"
+        );
     }
 
     #[cfg(unix)]
@@ -5620,7 +6601,7 @@ mod tests {
         );
         assert_eq!(state.successful_discoveries.load(Ordering::Relaxed), 0);
 
-        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let shutdown = running_shutdown();
         let status = render_control_response(&state, &shutdown, "STATUS");
         assert!(status.contains("hosting_profile=public"));
         assert!(status.contains("active_routes=0"));
@@ -5742,7 +6723,7 @@ mod tests {
             state.routes.read().unwrap()["www.example.com"].declaration_generation,
             Some(1)
         );
-        let rejected = render_control_response(&state, &AtomicBool::new(false), "STATUS");
+        let rejected = render_control_response(&state, &running_shutdown(), "STATUS");
         assert!(rejected.contains("last_reload_error=config_invalid"));
         assert!(rejected.contains("last_rejected_config_generation=2"));
 
@@ -5833,7 +6814,7 @@ mod tests {
         );
         assert_eq!(state.conflicts.read().unwrap().len(), MAX_ROUTE_CONFLICTS);
         assert_eq!(state.conflict_capacity_drops.load(Ordering::Acquire), 1);
-        let diagnostics = render_control_response(&state, &AtomicBool::new(false), "ROUTES");
+        let diagnostics = render_control_response(&state, &running_shutdown(), "ROUTES");
         assert_eq!(diagnostics.lines().count(), MAX_ROUTE_DIAGNOSTICS + 1);
         assert!(
             diagnostics
@@ -5879,7 +6860,7 @@ mod tests {
         }));
         let state = ProxyState::new_with_profile(directory.path().join("ports.toml"), profile);
 
-        let rendered = render_control_response(&state, &AtomicBool::new(false), "STATUS JSON");
+        let rendered = render_control_response(&state, &running_shutdown(), "STATUS JSON");
         assert!(rendered.len() as u64 <= CONTROL_RESPONSE_LIMIT);
         let status = serde_json::from_str::<serde_json::Value>(&rendered).unwrap();
         assert_eq!(
@@ -5895,7 +6876,7 @@ mod tests {
             "attacker-controlled.example".to_string(),
             active_route(backend()),
         );
-        let metrics = render_prometheus_metrics(&state);
+        let metrics = render_prometheus_metrics(&state, &running_shutdown());
         assert!(metrics.len() <= PROMETHEUS_BODY_LIMIT);
         assert_eq!(
             metrics
@@ -5947,8 +6928,7 @@ mod tests {
             );
         }
 
-        let status =
-            render_control_response(&state, &std::sync::atomic::AtomicBool::new(false), "STATUS");
+        let status = render_control_response(&state, &running_shutdown(), "STATUS");
         for counter in status_counters {
             assert!(
                 status.lines().any(|line| line == format!("{counter}=2")),

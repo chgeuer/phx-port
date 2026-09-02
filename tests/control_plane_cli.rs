@@ -232,6 +232,7 @@ fn public_health_is_machine_readable_and_service_uid_cannot_mutate() {
     let status = json(&status);
     assert_eq!(status["schema_version"], 1);
     assert_eq!(status["live"], true);
+    assert_eq!(status["draining"], false);
     assert_eq!(status["ready"], false);
     assert_eq!(status["generation"], 1);
     assert_eq!(status["degraded_routes"].as_array().unwrap().len(), 1);

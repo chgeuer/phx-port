@@ -3,11 +3,12 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const PROMETHEUS_BODY_LIMIT: usize = 1024 * 1024;
 const METRICS_REQUEST_LIMIT: usize = 1024;
 const METRICS_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const METRICS_IO_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetricsStartError {
@@ -48,7 +49,8 @@ pub fn start_metrics_server(
             while !shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let _ = serve_metrics_request(&mut stream, render.as_ref());
+                        let _ =
+                            serve_metrics_request(&mut stream, render.as_ref(), shutdown.as_ref());
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(50));
@@ -63,11 +65,15 @@ pub fn start_metrics_server(
 fn serve_metrics_request(
     stream: &mut TcpStream,
     render: &(impl Fn() -> String + ?Sized),
+    shutdown: &AtomicBool,
 ) -> io::Result<()> {
-    stream.set_read_timeout(Some(METRICS_IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(METRICS_IO_TIMEOUT))?;
+    stream.set_read_timeout(Some(METRICS_IO_POLL_INTERVAL))?;
+    stream.set_write_timeout(Some(METRICS_IO_POLL_INTERVAL))?;
+    let deadline = Instant::now()
+        .checked_add(METRICS_IO_TIMEOUT)
+        .ok_or_else(|| io::Error::other("metrics request deadline overflowed"))?;
 
-    let request = match read_request(stream) {
+    let request = match read_request(stream, shutdown, deadline) {
         Ok(request) => request,
         Err(RequestError::TooLarge) => {
             return write_response(
@@ -76,6 +82,8 @@ fn serve_metrics_request(
                 "text/plain; charset=utf-8",
                 "request exceeds fixed limit\n",
                 None,
+                shutdown,
+                deadline,
             );
         }
         Err(RequestError::Invalid) => {
@@ -85,6 +93,8 @@ fn serve_metrics_request(
                 "text/plain; charset=utf-8",
                 "invalid request\n",
                 None,
+                shutdown,
+                deadline,
             );
         }
         Err(RequestError::Io(error)) => return Err(error),
@@ -100,6 +110,8 @@ fn serve_metrics_request(
                     "text/plain; charset=utf-8",
                     "metrics response exceeds fixed limit\n",
                     None,
+                    shutdown,
+                    deadline,
                 );
             }
             write_response(
@@ -108,6 +120,8 @@ fn serve_metrics_request(
                 "text/plain; version=0.0.4; charset=utf-8",
                 &body,
                 None,
+                shutdown,
+                deadline,
             )
         }
         MetricsRequest::MethodNotAllowed => write_response(
@@ -116,6 +130,8 @@ fn serve_metrics_request(
             "text/plain; charset=utf-8",
             "method not allowed\n",
             Some("GET"),
+            shutdown,
+            deadline,
         ),
         MetricsRequest::NotFound => write_response(
             stream,
@@ -123,6 +139,8 @@ fn serve_metrics_request(
             "text/plain; charset=utf-8",
             "not found\n",
             None,
+            shutdown,
+            deadline,
         ),
     }
 }
@@ -139,11 +157,20 @@ enum RequestError {
     Io(io::Error),
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<MetricsRequest, RequestError> {
+fn read_request(
+    stream: &mut TcpStream,
+    shutdown: &AtomicBool,
+    deadline: Instant,
+) -> Result<MetricsRequest, RequestError> {
     let mut bytes = Vec::with_capacity(METRICS_REQUEST_LIMIT);
     loop {
+        check_io_window(shutdown, deadline).map_err(RequestError::Io)?;
         let mut chunk = [0_u8; 256];
-        let read = stream.read(&mut chunk).map_err(RequestError::Io)?;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) if retryable_io(&error) => continue,
+            Err(error) => return Err(RequestError::Io(error)),
+        };
         if read == 0 {
             break;
         }
@@ -187,17 +214,66 @@ fn write_response(
     content_type: &str,
     body: &str,
     allow: Option<&str>,
+    shutdown: &AtomicBool,
+    deadline: Instant,
 ) -> io::Result<()> {
-    write!(
-        stream,
+    let mut response = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n",
         body.len()
-    )?;
+    );
     if let Some(allow) = allow {
-        write!(stream, "Allow: {allow}\r\n")?;
+        response.push_str(&format!("Allow: {allow}\r\n"));
     }
-    write!(stream, "\r\n{body}")
+    response.push_str("\r\n");
+    response.push_str(body);
+    write_all_until(stream, response.as_bytes(), shutdown, deadline)
+}
+
+fn write_all_until(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    shutdown: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        check_io_window(shutdown, deadline)?;
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "metrics response socket stopped accepting bytes",
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if retryable_io(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn check_io_window(shutdown: &AtomicBool, deadline: Instant) -> io::Result<()> {
+    if shutdown.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "metrics request cancelled during shutdown",
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "metrics request exceeded its absolute deadline",
+        ));
+    }
+    Ok(())
+}
+
+fn retryable_io(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
 }

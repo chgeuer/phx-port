@@ -263,9 +263,24 @@ original socket to its tracked Tokio task without queueing another PHXP
 operation. Relay capacity is reserved before opening the loopback backend;
 after route selection, source and pre-routing capacity are released while
 active and relay permits remain held until async copying ends. Each direction
-uses one fixed 16 KiB buffer. Production load qualification and
-ownership-aware graceful drain remain later milestones, so this migration does
-not constitute a public-load support claim.
+uses one fixed 16 KiB buffer.
+
+Shutdown has one monotonic deadline shared by every listener. The process
+closes its direct or activated listener copies before draining, wakes all
+pre-routing tasks through a Tokio watch signal, and creates no new PHXP or
+relay work after observing that signal. PHXP already in progress keeps its
+socket-owning blocking closure until the irreversible outcome resolves.
+Successful handoffs therefore survive ingress exit, while pre-delivery
+failures during shutdown close rather than starting a relay. Existing relays
+run until completion or the 60-second public / 30-second development deadline;
+tasks still owned at the deadline are cancelled and counted. A PHXP operation
+still resolving then receives a separate bounded two-second ownership grace,
+inside the packaged service-manager stop deadlines. Read-only control and
+metrics remain available during the drain, expose `draining = true`, and make
+readiness false. One fixed-label shutdown event records complete, timed-out, or
+failed drain outcome and duration. Production load qualification remains a
+later milestone, so this behavior does not constitute a public-load support
+claim.
 
 Operator-only CIDR policy is configured with repeatable
 `--source-policy CIDR=RATE,BURST,PRE_ROUTING[,IPV6_PREFIX]` options. Longest
@@ -404,8 +419,9 @@ configured admission capacity, fixed worker and queue bounds, bounded
 rejection-reason counters, discovery resource usage, connection/discovery
 counters, handoff capacity skips, and handoff outcomes.
 `status --json`, `check --live`, and `check --ready` emit bounded schema-version
-1 JSON. Health checks exit 0 when the selected condition is true and 1 when it
-is false or cannot be queried.
+1 JSON, including an explicit drain state. Health checks exit 0 when the
+selected condition is true and 1 when it is false or cannot be queried.
+Liveness remains true while the event loop drains; readiness becomes false.
 Admission saturation writes fixed-schema `event=ingress_overload` records to
 stderr at most once per bounded reason every ten seconds. Repeated rejections
 within the interval are counted and suppressed, then reported as one aggregate
@@ -423,10 +439,12 @@ limit and labeled only with normalized declared hostname, logical Workload,
 role, required status, and a fixed state enum.
 `routes` returns the live active and conflicting route table while the daemon
 is reachable, then falls back to cached registry state for offline diagnostics.
-`stop` requests graceful shutdown: listeners and reconciliation stop accepting
-new work, existing relays receive up to 60 seconds in the public Hosting
-Profile or the existing 30 seconds in development, and the control socket is
-removed.
+`stop` requests graceful shutdown: process listener copies close,
+reconciliation and pre-routing work stop, existing relays receive up to 60
+seconds in the public Hosting Profile or 30 seconds in development, and
+read-only control plus loopback metrics remain available with readiness false.
+Reload is unavailable while draining. The local endpoints are removed only
+after the final bounded shutdown result is emitted.
 
 ## Workload discovery
 
@@ -690,7 +708,9 @@ requires strict bounds. The implementation currently:
   Tokio runtime workers. Each accepted socket obtains global, source, and
   pre-routing admission before its tracked task is created.
 - Grows each peek buffer from 4 KiB only as required, up to the fixed 64 KiB
-  ceiling, and aborts all tracked connection tasks during shutdown.
+  ceiling. Shutdown wakes and drops pre-routing tasks without a timer per
+  connection, drains established relays to one bounded deadline, then cancels
+  only work that remains.
 - Sends cache-miss route selection through eight fixed coordinator threads
   plus a 56-entry queue. Queue residence and exact route selection share one
   250 millisecond deadline.
@@ -812,7 +832,9 @@ Automated tests currently cover:
 - Waiting-client and concurrent-probe limits.
 - Exact global, pre-routing, handoff, and relay permit transitions and release.
 - Tracked Tokio listener/connection tasks, a 2,000-idle-socket constant-thread
-  regression, and prompt cancellation on shutdown.
+  regression, prompt leak-free pre-routing cancellation, deadline-bounded
+  relay drain, immediate listener-copy closure, and PHXP ownership resolution
+  across shutdown.
 - Fixed route-selection and blocking-handoff worker/queue bounds, panic
   recovery, deadlines, and immediate overload rejection.
 - Async relay forwarding of previously peeked bytes exactly once, bidirectional

@@ -372,9 +372,15 @@ source-address labels. Saturation also emits a fixed-schema
 `event=ingress_overload` stderr record at most once per bounded reason every
 ten seconds. Further rejections in that window are suppressed and aggregated
 into the next event; neither source addresses nor SNI values appear in the
-event. Production load qualification and ownership-aware graceful drain
-remain separate milestones; the bounded async relay path is not a public-load
-support claim.
+event. On shutdown, process-owned listener copies close immediately,
+pre-routing work cancels through one shared signal, and in-flight PHXP
+negotiations retain socket ownership until their result is known. Established
+relays continue until they finish or the shared drain deadline expires: 60
+seconds in the public Hosting Profile and 30 seconds in development. Remaining
+relays then close, and one fixed-schema `event=ingress_shutdown` record reports
+the result, duration, forced-task count, and remaining admission count.
+Production load qualification remains a separate milestone; bounded async
+drain is not a public-load support claim.
 
 For an unknown SNI hostname, `phx-port` probes active `https` and `main`
 workloads over loopback using that exact hostname. It routes only when exactly
@@ -399,8 +405,9 @@ phx-port proxy install-service
 phx-port proxy uninstall-service
 ```
 
-`status --json` emits schema version 1 with liveness, readiness, generation,
-bounded degraded Route Declaration detail, capacity use, and counters.
+`status --json` emits schema version 1 with liveness, drain state, readiness,
+generation, bounded degraded Route Declaration detail, capacity use, and
+counters.
 `check --live` and `check --ready` emit the same bounded JSON; exit status 0
 means the requested condition is true, while status 1 means it is false or the
 authenticated local endpoint cannot be queried.
@@ -421,7 +428,11 @@ Hosting Profile. The public
 socket is service-owned, grouped like the `0750` runtime root, and mode `0660`;
 the runtime group must be `phx-port-admin`. UID 0, the service UID, and current
 members of `phx-port-admin` may read status, routes, and health. Only UID 0 may
-issue `RELOAD` or `STOP` in the public Hosting Profile.
+issue `RELOAD` or `STOP` in the public Hosting Profile. Read-only control and
+loopback metrics remain available while relays drain, report
+`draining = true`, and force readiness false. Reload is rejected after drain
+begins. Control and metrics endpoints close only after final state and the
+bounded shutdown event are emitted.
 
 On Linux, `install-service` writes
 `$XDG_CONFIG_HOME/systemd/user/phx-port.service` (or
@@ -484,7 +495,10 @@ writable paths, uses `LimitNOFILE=65536`, `TasksMax=1024`, a finite
 `MemoryMax=70%` ceiling, and allows five seconds beyond the public profile's
 60-second drain. Tune the memory ceiling downward for the measured host and
 Workload budget; it is a resource boundary, not a capacity claim. Development
-retains its existing 30-second daemon drain.
+retains its existing 30-second daemon drain. A PHXP operation still resolving
+at the relay deadline receives at most two additional seconds to finish its
+ownership outcome; this remains inside both supplied service-manager stop
+deadlines and never permits relay fallback after descriptor delivery.
 
 The real system-manager regression uses an isolated loopback socket and
 temporary unit names so it does not disturb port 443:
