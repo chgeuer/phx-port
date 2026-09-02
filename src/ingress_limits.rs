@@ -22,10 +22,13 @@ Usage: phx-port daemon [--listen ADDRESS]... [--ingress-config PATH] [--run-as U
        [--source-policy CIDR=RATE,BURST,PRE_ROUTING[,IPV6_PREFIX]]...
        [--client-hello-timeout-ms N] [--task-budget N]";
 
-const MAX_THREADED_ACTIVE_CONNECTIONS: usize = 256;
+const MAX_ASYNC_ACTIVE_CONNECTIONS: usize = 8_192;
+const MAX_BLOCKING_DELIVERY_WORKERS: usize = 256;
 const MIN_CLIENT_HELLO_TIMEOUT_MS: u64 = 500;
 const MAX_CLIENT_HELLO_TIMEOUT_MS: u64 = 10_000;
-const CERTIFICATE_PROBE_WORKERS: usize = 32;
+pub(crate) const CERTIFICATE_PROBE_WORKERS: usize = 32;
+pub(crate) const ROUTE_SELECTION_WORKERS: usize = 8;
+pub(crate) const TOKIO_RUNTIME_WORKERS: usize = 4;
 const AUXILIARY_TASKS: usize = 4;
 const CONTROL_AND_STATE_FILE_DESCRIPTORS: usize = 8;
 const METRICS_FILE_DESCRIPTORS: usize = 2;
@@ -165,7 +168,7 @@ pub struct IngressLimits {
 impl Default for IngressLimits {
     fn default() -> Self {
         Self {
-            active_connections: MAX_THREADED_ACTIVE_CONNECTIONS,
+            active_connections: 256,
             pre_routing_connections: 128,
             relay_connections: 128,
             handoff_negotiations: 64,
@@ -409,6 +412,12 @@ impl ValidatedIngressLimits {
     pub(crate) fn source(&self) -> &SourceLimits {
         &self.limits.source
     }
+
+    pub(crate) fn delivery_workers(&self) -> usize {
+        self.limits
+            .delivery_workers()
+            .expect("validated delivery worker arithmetic cannot overflow")
+    }
 }
 
 impl IngressLimits {
@@ -539,6 +548,15 @@ impl IngressLimits {
             self.handoff_negotiations,
             self.active_connections,
         )?;
+        let delivery_workers = self.delivery_workers()?;
+        if delivery_workers > MAX_BLOCKING_DELIVERY_WORKERS {
+            return Err(format!(
+                "relay_connections and handoff_negotiations require {delivery_workers} blocking \
+                 delivery workers, but the transitional blocking delivery cap is \
+                 {MAX_BLOCKING_DELIVERY_WORKERS}; lower those limits until relay and PHXP I/O are \
+                 migrated to Tokio"
+            ));
+        }
 
         if !(MIN_CLIENT_HELLO_TIMEOUT_MS..=MAX_CLIENT_HELLO_TIMEOUT_MS)
             .contains(&self.client_hello_timeout_ms)
@@ -570,20 +588,21 @@ impl IngressLimits {
         )?;
         let required_tasks = checked_sum(
             &[
-                self.active_connections,
+                delivery_workers,
                 self.relay_connections,
                 CERTIFICATE_PROBE_WORKERS,
-                listener_count,
+                ROUTE_SELECTION_WORKERS,
+                TOKIO_RUNTIME_WORKERS,
                 AUXILIARY_TASKS,
                 usize::from(metrics_enabled),
             ],
             "task",
         )?;
 
-        if self.active_connections > MAX_THREADED_ACTIVE_CONNECTIONS {
+        if self.active_connections > MAX_ASYNC_ACTIVE_CONNECTIONS {
             return Err(format!(
-                "active_connections must not exceed the threaded runtime cap of \
-                 {MAX_THREADED_ACTIVE_CONNECTIONS}, got {}",
+                "active_connections must not exceed the async ingress state-machine cap of \
+                 {MAX_ASYNC_ACTIVE_CONNECTIONS}, got {}",
                 self.active_connections
             ));
         }
@@ -624,12 +643,22 @@ impl IngressLimits {
                 return Err(format!(
                     "ingress limits require up to {required} tasks, but the configured/systemd \
                      task budget is {limit}; raise TasksMax or --task-budget, or lower \
-                     active_connections or relay_connections"
+                     relay_connections or handoff_negotiations"
                 ));
             }
         }
 
         Ok(ValidatedIngressLimits { limits: self })
+    }
+
+    fn delivery_workers(&self) -> Result<usize, String> {
+        Ok(self.active_connections.min(
+            self.relay_connections
+                .checked_add(self.handoff_negotiations)
+                .ok_or_else(|| {
+                    "task demand overflowed while validating blocking delivery workers".to_string()
+                })?,
+        ))
     }
 }
 
@@ -867,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn threaded_defaults_are_valid_and_capped_at_256() {
+    fn async_defaults_preserve_the_transitional_delivery_limits() {
         let limits = IngressLimits::default();
         assert_eq!(limits.active_connections, 256);
         assert_eq!(limits.source.accepts_per_second, 20);
@@ -876,14 +905,12 @@ mod tests {
         assert_eq!(limits.source.ipv6_prefix, 64);
         assert_eq!(limits.source.table_capacity, 4_096);
         assert_eq!(limits.source.entry_ttl_seconds, 300);
+        let validated = limits.validate(capacity(2_048, 1_024), 2).unwrap();
         assert_eq!(
-            limits
-                .clone()
-                .validate(capacity(2_048, 1_024), 2)
-                .unwrap()
-                .client_hello_timeout(),
+            validated.client_hello_timeout(),
             std::time::Duration::from_secs(2)
         );
+        assert_eq!(validated.delivery_workers(), 192);
     }
 
     #[test]
@@ -1013,12 +1040,50 @@ mod tests {
                 "handoff_negotiations" => limits.handoff_negotiations = 257,
                 _ => unreachable!(),
             }
+
             let error = limits.validate(capacity(2_048, 2_048), 2).unwrap_err();
             assert!(
                 error.contains(field),
                 "unexpected error for {field}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn async_pre_routing_capacity_does_not_expand_blocking_delivery_workers() {
+        let limits = IngressLimits {
+            active_connections: 2_000,
+            pre_routing_connections: 2_000,
+            relay_connections: 1,
+            handoff_negotiations: 1,
+            ..IngressLimits::default()
+        };
+        let validated = limits.validate(capacity(5_000, 128), 1).unwrap();
+        assert_eq!(validated.delivery_workers(), 2);
+
+        let unsafe_delivery = IngressLimits {
+            active_connections: 2_000,
+            pre_routing_connections: 2_000,
+            relay_connections: 256,
+            handoff_negotiations: 1,
+            ..IngressLimits::default()
+        };
+        let error = unsafe_delivery
+            .validate(capacity(10_000, 10_000), 1)
+            .unwrap_err();
+        assert!(error.contains("blocking delivery cap is 256"), "{error}");
+
+        let oversized = IngressLimits {
+            active_connections: 8_193,
+            ..IngressLimits::default()
+        };
+        let error = oversized
+            .validate(capacity(u64::MAX, u64::MAX), 1)
+            .unwrap_err();
+        assert!(
+            error.contains("async ingress state-machine cap of 8192"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1054,13 +1119,13 @@ mod tests {
     #[test]
     fn task_demand_must_fit_the_configured_or_systemd_budget() {
         IngressLimits::default()
-            .validate(capacity(2_048, 422), 2)
+            .validate(capacity(2_048, 368), 2)
             .unwrap();
         let error = IngressLimits::default()
-            .validate(capacity(2_048, 421), 2)
+            .validate(capacity(2_048, 367), 2)
             .unwrap_err();
-        assert!(error.contains("require up to 422 tasks"), "{error}");
-        assert!(error.contains("task budget is 421"), "{error}");
+        assert!(error.contains("require up to 368 tasks"), "{error}");
+        assert!(error.contains("task budget is 367"), "{error}");
     }
 
     #[test]

@@ -283,7 +283,7 @@ binary can use it directly if its `PHX_PORT_CONFIG` is pointed there. Back up
 the root-owned ingress file and stable `ports.toml` with their ownership and
 modes; do not back up disposable `routes.toml`, locks, or runtime sockets.
 
-The threaded daemon has explicit startup capacity options:
+The Tokio ingress has explicit startup capacity options:
 
 | Option | Default |
 |---|---:|
@@ -303,15 +303,19 @@ The threaded daemon has explicit startup capacity options:
 
 Before binding any listener, the daemon rejects zero values, sublimits above
 the global connection limit, ClientHello timeouts outside 500-10000
-milliseconds, arithmetic overflow, and active limits above the threaded
-ceiling of 256. It also checks estimated descriptor demand against the process
-`RLIMIT_NOFILE` while preserving a 30% reserve. If the process soft limit is
-too low but its hard limit permits the configured capacity, startup raises
-only the process soft limit to the calculated minimum and verifies the result;
-the configured limits never change with the host environment. Otherwise
-startup fails with the required and available values. On Linux it also checks
-the systemd cgroup task ceiling and its existing occupants when available;
-`--task-budget N` supplies an additional operator ceiling on any platform.
+milliseconds, arithmetic overflow, and active limits above the bounded 8,192
+async state-machine ceiling. PHXP and relay I/O remain on a transitional
+blocking delivery pool, so startup also rejects configurations requiring more
+than 256 delivery workers; raising `active_connections` or
+`pre_routing_connections` does not raise that native-thread ceiling. The daemon
+checks estimated descriptor demand against the process `RLIMIT_NOFILE` while
+preserving a 30% reserve. If the process soft limit is too low but its hard
+limit permits the configured capacity, startup raises only the process soft
+limit to the calculated minimum and verifies the result; the configured limits
+never change with the host environment. Otherwise startup fails with the
+required and available values. On Linux it also checks the systemd cgroup task
+ceiling and its existing occupants when available; `--task-budget N` supplies
+an additional operator ceiling on any platform.
 
 The daemon enforces the global accept-rate/burst and active, pre-routing,
 relay, handoff, and per-source ceilings at runtime. IPv4 peers use exact-address
@@ -330,19 +334,28 @@ accepted. An optional fourth field changes IPv6 bucketing inside that CIDR and
 must be at least as specific as the CIDR itself.
 
 The daemon acquires active, source, and pre-routing permits immediately after
-`accept` and before dispatching to a fixed worker pool whose only user-space
-queue slot is also covered by those permits. Saturation closes the newly
-accepted socket immediately. Handoff negotiation uses its own permit; relay
-capacity is reserved before opening a backend socket, then source and
-pre-routing capacity are released while the active and relay permits remain
-held until encrypted copying ends. `proxy status` reports aggregate source
-table use, configured limits, and bounded rejection-reason counters without
+Tokio accepts a socket and before creating its tracked pre-routing task. Tokio
+peeks at a ClientHello without consuming it, using one total deadline and a
+buffer that grows from 4 KiB to the fixed 64 KiB ceiling. Cache-miss route
+selection crosses a fixed eight-worker blocking boundary with a 56-entry queue
+and a 250-millisecond total queue-and-selection deadline. A successfully
+verified route enters the one-slot bounded delivery queue; saturation at
+either queue closes the new socket and releases its RAII permits. Shutdown
+aborts and drains every tracked pre-routing task before the blocking delivery
+drain begins.
+
+Handoff negotiation uses its own permit; relay capacity is reserved before
+opening a backend socket, then source and pre-routing capacity are released
+while the active and relay permits remain held until encrypted copying ends.
+`proxy status` reports both queue bounds, aggregate source-table use,
+configured limits, and bounded rejection-reason counters without
 source-address labels. Saturation also emits a fixed-schema
 `event=ingress_overload` stderr record at most once per bounded reason every
 ten seconds. Further rejections in that window are suppressed and aggregated
 into the next event; neither source addresses nor SNI values appear in the
-event. Production load qualification remains a separate milestone; these
-threaded bounds are not a public-load support claim.
+event. Production load qualification and async PHXP/relay delivery remain
+separate milestones; the async pre-routing path alone is not a public-load
+support claim.
 
 For an unknown SNI hostname, `phx-port` probes active `https` and `main`
 workloads over loopback using that exact hostname. It routes only when exactly

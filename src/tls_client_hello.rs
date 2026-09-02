@@ -1,56 +1,117 @@
 use std::io;
-use std::net::{IpAddr, TcpStream};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::IpAddr;
+use std::time::Duration;
+#[cfg(test)]
+use {std::net::TcpStream, std::thread, std::time::Instant};
 
 const MAX_CLIENT_HELLO: usize = 64 * 1024;
+const INITIAL_PEEK_BUFFER: usize = 4 * 1024;
 const PEEK_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+const MAX_PEEK_RETRY_INTERVAL: Duration = Duration::from_millis(32);
 
 enum ParseResult {
     Incomplete,
     Complete(Option<String>),
 }
 
+#[cfg(test)]
 pub fn peek_sni(stream: &TcpStream, timeout: Duration) -> io::Result<(String, usize)> {
     let deadline = Instant::now() + timeout;
-    let mut buffered = vec![0_u8; MAX_CLIENT_HELLO];
+    let mut buffered = vec![0_u8; INITIAL_PEEK_BUFFER];
     let mut previous_length = 0;
 
     loop {
         let length = stream.peek(&mut buffered)?;
-        if length == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "connection closed before a complete TLS ClientHello",
-            ));
+        if let Some(result) = inspect_peeked(&buffered, length)? {
+            return Ok(result);
         }
-        match parse_records(&buffered[..length])? {
-            ParseResult::Complete(Some(hostname)) => return Ok((hostname, length)),
-            ParseResult::Complete(None) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "TLS ClientHello does not contain SNI",
-                ));
-            }
-            ParseResult::Incomplete => {}
-        }
-        if length >= MAX_CLIENT_HELLO {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "TLS ClientHello exceeds 64 KiB",
-            ));
-        }
+        grow_peek_buffer(&mut buffered, length);
         if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "timed out waiting for a complete TLS ClientHello",
-            ));
+            return client_hello_timeout();
         }
         if length == previous_length {
             thread::sleep(PEEK_RETRY_INTERVAL);
         }
         previous_length = length;
     }
+}
+
+pub async fn peek_sni_async(
+    stream: &tokio::net::TcpStream,
+    deadline: tokio::time::Instant,
+) -> io::Result<(String, usize)> {
+    let mut buffered = vec![0_u8; INITIAL_PEEK_BUFFER];
+    let mut previous_length = 0;
+    let mut retry_interval = PEEK_RETRY_INTERVAL;
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return client_hello_timeout();
+        }
+        let length = tokio::time::timeout_at(deadline, stream.peek(&mut buffered))
+            .await
+            .map_err(|_| client_hello_timeout_error())??;
+        if tokio::time::Instant::now() >= deadline {
+            return client_hello_timeout();
+        }
+        if let Some(result) = inspect_peeked(&buffered, length)? {
+            return Ok(result);
+        }
+        grow_peek_buffer(&mut buffered, length);
+
+        if length == previous_length {
+            let retry_at = (tokio::time::Instant::now() + retry_interval).min(deadline);
+            tokio::time::sleep_until(retry_at).await;
+            retry_interval = retry_interval
+                .saturating_mul(2)
+                .min(MAX_PEEK_RETRY_INTERVAL);
+        } else {
+            retry_interval = PEEK_RETRY_INTERVAL;
+        }
+        previous_length = length;
+
+        if tokio::time::Instant::now() >= deadline {
+            return client_hello_timeout();
+        }
+    }
+}
+
+fn inspect_peeked(buffered: &[u8], length: usize) -> io::Result<Option<(String, usize)>> {
+    if length == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "connection closed before a complete TLS ClientHello",
+        ));
+    }
+    match parse_records(&buffered[..length])? {
+        ParseResult::Complete(Some(hostname)) => Ok(Some((hostname, length))),
+        ParseResult::Complete(None) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS ClientHello does not contain SNI",
+        )),
+        ParseResult::Incomplete if length >= MAX_CLIENT_HELLO => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS ClientHello exceeds 64 KiB",
+        )),
+        ParseResult::Incomplete => Ok(None),
+    }
+}
+
+fn grow_peek_buffer(buffered: &mut Vec<u8>, length: usize) {
+    if length == buffered.len() && buffered.len() < MAX_CLIENT_HELLO {
+        buffered.resize(buffered.len().saturating_mul(2).min(MAX_CLIENT_HELLO), 0);
+    }
+}
+
+fn client_hello_timeout<T>() -> io::Result<T> {
+    Err(client_hello_timeout_error())
+}
+
+fn client_hello_timeout_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "timed out waiting for a complete TLS ClientHello",
+    )
 }
 
 fn parse_records(input: &[u8]) -> io::Result<ParseResult> {
@@ -207,11 +268,12 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParseResult, normalize_hostname, parse_records, peek_sni};
+    use super::{ParseResult, normalize_hostname, parse_records, peek_sni, peek_sni_async};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn client_hello(hostname: Option<&str>) -> Vec<u8> {
         let mut body = vec![0x03, 0x03];
@@ -284,6 +346,115 @@ mod tests {
             assert_eq!(received, expected);
         });
 
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn async_peeking_leaves_the_complete_client_hello_unconsumed() {
+        let input = client_hello(Some("www.contoso.com"));
+        let expected = input.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(&input).unwrap();
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let (accepted, _) = listener.accept().await.unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let (hostname, length) = peek_sni_async(&accepted, deadline).await.unwrap();
+            assert_eq!(hostname, "www.contoso.com");
+            assert_eq!(length, expected.len());
+
+            let mut accepted = accepted.into_std().unwrap();
+            accepted.set_nonblocking(false).unwrap();
+            let mut received = vec![0; length];
+            accepted.read_exact(&mut received).unwrap();
+            assert_eq!(received, expected);
+        });
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn async_peeking_uses_one_total_deadline_for_partial_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(&[22]).unwrap();
+            release_receiver.recv().unwrap();
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let started = Instant::now();
+        let error = runtime.block_on(async {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let (accepted, _) = listener.accept().await.unwrap();
+            peek_sni_async(
+                &accepted,
+                tokio::time::Instant::now() + Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err()
+        });
+        release_sender.send(()).unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "partial input reset the total ClientHello deadline"
+        );
+    }
+
+    #[test]
+    fn async_peeking_rejects_complete_input_after_the_total_deadline() {
+        let input = client_hello(Some("www.contoso.com"));
+        let expected = input.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(&input).unwrap();
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let (accepted, _) = listener.accept().await.unwrap();
+            let error = peek_sni_async(
+                &accepted,
+                tokio::time::Instant::now() - Duration::from_millis(1),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+
+            let mut accepted = accepted.into_std().unwrap();
+            accepted.set_nonblocking(false).unwrap();
+            let mut received = vec![0; expected.len()];
+            accepted.read_exact(&mut received).unwrap();
+            assert_eq!(received, expected);
+        });
         writer.join().unwrap();
     }
 

@@ -225,9 +225,9 @@ acquisition. The explicit bind-then-drop path is the exception described
 below: it cannot read or create those paths until after the identity
 transition.
 
-The transitional threaded configuration defaults to 256 active connections,
-128 pre-routing connections, 128 relays, 64 handoff negotiations, 200 accepts
-per second with burst 400, and a two-second ClientHello deadline. Per-source
+The Tokio ingress configuration defaults to 256 active connections, 128
+pre-routing connections, 128 relays, 64 handoff negotiations, 200 accepts per
+second with burst 400, and a two-second ClientHello deadline. Per-source
 defaults are 20 accepts per second, burst 40, and 16 simultaneous pre-routing
 connections. IPv4 buckets are exact addresses; IPv6 buckets use `/64` by
 default. The source table defaults to 4096 entries and a 300-second TTL. Each
@@ -237,22 +237,25 @@ limit when one exists.
 
 Capacity validation runs before the first listener bind. It rejects zero
 limits, sublimits above the global limit, ClientHello deadlines outside
-500-10000 milliseconds, arithmetic overflow, active limits above the
-threaded ceiling, task demand above the configured/systemd budget, and
-descriptor demand that would leave less than 30% of `RLIMIT_NOFILE` in
-reserve. When the configured descriptor budget fits the hard limit, startup
-may raise the process soft limit to the calculated minimum and then revalidates
-the resulting limit. It never derives or lowers configured ingress ceilings
-from ambient limits. The validated ClientHello timeout is already used by connection handling. The
-daemon also enforces the global accept-rate/burst and active, source,
+500-10000 milliseconds, arithmetic overflow, active limits above the 8,192
+async state-machine ceiling, blocking delivery demand above 256 workers, task
+demand above the configured/systemd budget, and descriptor demand that would
+leave less than 30% of `RLIMIT_NOFILE` in reserve. When the configured
+descriptor budget fits the hard limit, startup may raise the process soft
+limit to the calculated minimum and then revalidates the resulting limit. It
+never derives or lowers configured ingress ceilings from ambient limits.
+
+The daemon enforces the global accept-rate/burst and active, source,
 pre-routing, relay, and handoff ceilings. It derives source identity only from
 the kernel-reported peer address and acquires active, source, and pre-routing
-permits immediately after `accept`, before dispatch to a fixed worker pool with
-one bounded queue slot. Saturation closes the new socket without allocating a
-per-connection thread. Relay capacity is reserved before opening the loopback
-backend; after route selection, source and pre-routing capacity are released
-while active and relay permits remain held until copying ends. Production load
-qualification remains a later milestone, so these threaded bounds do not
+permits immediately after Tokio accepts a socket, before creating its tracked
+task. Saturation closes the new socket without allocating a per-connection
+thread. After non-consuming ClientHello inspection and exact route selection,
+the socket enters a separately bounded blocking delivery pool. Relay capacity
+is reserved before opening the loopback backend; after route selection, source
+and pre-routing capacity are released while active and relay permits remain
+held until copying ends. Production load qualification and async PHXP/relay
+delivery remain later milestones, so the pre-routing migration does not
 constitute a public-load support claim.
 
 Operator-only CIDR policy is configured with repeatable
@@ -674,6 +677,14 @@ requires strict bounds. The implementation currently:
 - Reject malformed, non-DNS, oversized, or missing SNI values.
 - Limits ClientHello inspection to 64 KiB and a startup-validated 500-10000
   millisecond deadline (two seconds by default).
+- Runs listener acceptance and non-consuming ClientHello inspection on four
+  Tokio runtime workers. Each accepted socket obtains global, source, and
+  pre-routing admission before its tracked task is created.
+- Grows each peek buffer from 4 KiB only as required, up to the fixed 64 KiB
+  ceiling, and aborts all tracked pre-routing tasks during shutdown.
+- Sends cache-miss route selection through eight fixed coordinator threads
+  plus a 56-entry queue. Queue residence and exact route selection share one
+  250 millisecond deadline.
 - Gives discovery a 250 millisecond deadline.
 - Applies a token bucket and simultaneous pre-routing ceiling to exact IPv4
   peers and configurable-prefix IPv6 peers before worker dispatch.
@@ -719,13 +730,21 @@ Positive persisted routes retain the fixed 1,024-entry bound.
 
 ## Implemented components
 
-The daemon is implemented in Rust with OS threads and synchronized shared
-state. Accepted connections enter a fixed worker pool only after obtaining
-global, source, and pre-routing admission permits. Source state, the one-slot
-user-space queue, active workers, relay copy threads, and certificate-probe
-threads all have hard bounds. Probe permits are acquired before their threads
-are created, and single-flight discovery prevents duplicate work for one SNI
-hostname. The implementation consists of:
+The daemon is implemented in Rust with a bounded Tokio pre-routing path and
+synchronized shared state. Nonblocking direct or service-manager listeners are
+adopted by Tokio. Accepted connections obtain global, source, and pre-routing
+admission before entering tracked tasks that perform total-deadline
+non-consuming ClientHello inspection and exact route selection. Cache misses
+cross a fixed route-selection worker pool and bounded queue; verified
+connections then cross a separate one-slot delivery queue.
+
+PHXP negotiation and relay copying remain on a transitional blocking delivery
+pool pending their dedicated async migrations. Startup permits at most 8,192
+async ingress state machines but still rejects any configuration requiring
+more than 256 blocking delivery workers. Relay copy threads and certificate
+probe threads retain their existing hard bounds. Probe permits are acquired
+before their threads are created, and single-flight discovery prevents
+duplicate work for one SNI hostname. The implementation consists of:
 
 - `admission.rs` for global/source token buckets, bounded source state, and
   RAII connection-stage capacity.
@@ -774,7 +793,10 @@ Automated tests currently cover:
 - Single-flight behavior under concurrent first requests.
 - Waiting-client and concurrent-probe limits.
 - Exact global, pre-routing, handoff, and relay permit transitions and release.
-- Fixed worker/queue bounds, panic recovery, and immediate overload rejection.
+- Tracked Tokio listener/pre-routing tasks, a 2,000-idle-socket constant-thread
+  regression, and prompt cancellation on shutdown.
+- Fixed route-selection and blocking-delivery worker/queue bounds, panic
+  recovery, deadlines, and immediate overload rejection.
 - Deterministic conflict recording and `https` role preference.
 - Persistent route creation and removal with registry changes.
 - Deactivation after three failed TCP checks while retaining the cached hint.

@@ -35,6 +35,11 @@ mod unix {
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::{TempDir, tempdir_in};
+    #[cfg(target_os = "linux")]
+    use {
+        nix::sys::resource::{RLIM_INFINITY, Resource, getrlimit, rlim_t, setrlimit},
+        std::fs,
+    };
 
     fn tempdir() -> std::io::Result<TempDir> {
         let root = Path::new("/tmp").canonicalize()?;
@@ -70,6 +75,52 @@ mod unix {
                     "1".to_string(),
                     "--handoff-negotiations".to_string(),
                     "1".to_string(),
+                    "--client-hello-timeout-ms".to_string(),
+                    "10000".to_string(),
+                    "--task-budget".to_string(),
+                    "128".to_string(),
+                ])
+                .env("HOME", home.path())
+                .env_remove("PHX_PORT_CONFIG")
+                .env_remove("XDG_RUNTIME_DIR")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut daemon = Self {
+                child: Some(child),
+                home,
+            };
+            daemon.wait_until_ready();
+            daemon
+        }
+
+        #[cfg(target_os = "linux")]
+        fn start_for_idle_scale(address: SocketAddr, connections: usize) -> Self {
+            let home = tempdir().unwrap();
+            let child = Command::new(env!("CARGO_BIN_EXE_phx-port"))
+                .args([
+                    "daemon".to_string(),
+                    "--listen".to_string(),
+                    address.to_string(),
+                    "--active-connections".to_string(),
+                    connections.to_string(),
+                    "--pre-routing-connections".to_string(),
+                    connections.to_string(),
+                    "--relay-connections".to_string(),
+                    "1".to_string(),
+                    "--handoff-negotiations".to_string(),
+                    "1".to_string(),
+                    "--accepts-per-second".to_string(),
+                    connections.to_string(),
+                    "--accept-burst".to_string(),
+                    connections.to_string(),
+                    "--source-accepts-per-second".to_string(),
+                    connections.to_string(),
+                    "--source-accept-burst".to_string(),
+                    connections.to_string(),
+                    "--source-pre-routing-connections".to_string(),
+                    connections.to_string(),
                     "--client-hello-timeout-ms".to_string(),
                     "10000".to_string(),
                     "--task-budget".to_string(),
@@ -146,6 +197,28 @@ mod unix {
             assert!(output.status.success());
             String::from_utf8(output.stderr).unwrap()
         }
+
+        #[cfg(target_os = "linux")]
+        fn stop_with_active_connections(mut self) {
+            self.request("STOP").unwrap();
+            let mut child = self.child.take().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "daemon exited unsuccessfully: {status}");
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "daemon did not cancel idle ClientHello tasks during shutdown:\n{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     impl Drop for Daemon {
@@ -169,6 +242,19 @@ mod unix {
     fn reserve_address() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ensure_open_file_limit(required: rlim_t) {
+        let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        if soft >= required {
+            return;
+        }
+        assert!(
+            hard == RLIM_INFINITY || hard >= required,
+            "idle ClientHello regression requires {required} file descriptors, hard limit is {hard}"
+        );
+        setrlimit(Resource::RLIMIT_NOFILE, required, hard).unwrap();
     }
 
     #[test]
@@ -284,5 +370,32 @@ mod unix {
         drop(admitted);
         daemon.wait_for_count("active_connections", 0);
         daemon.wait_for_count("pre_routing_connections", 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn two_thousand_idle_client_hellos_use_constant_threads_and_cancel_on_stop() {
+        const CONNECTIONS: usize = 2_000;
+
+        ensure_open_file_limit((CONNECTIONS + 256) as rlim_t);
+        let address = reserve_address();
+        let daemon = Daemon::start_for_idle_scale(address, CONNECTIONS);
+        let pid = daemon.child.as_ref().unwrap().id();
+        let baseline_threads = fs::read_dir(format!("/proc/{pid}/task")).unwrap().count();
+        let clients = (0..CONNECTIONS)
+            .map(|_| TcpStream::connect(address).unwrap())
+            .collect::<Vec<_>>();
+
+        daemon.wait_for_count("active_connections", CONNECTIONS);
+        daemon.wait_for_count("pre_routing_connections", CONNECTIONS);
+        let loaded_threads = fs::read_dir(format!("/proc/{pid}/task")).unwrap().count();
+        assert!(
+            loaded_threads <= baseline_threads + 4,
+            "native threads grew from {baseline_threads} to {loaded_threads} for \
+             {CONNECTIONS} idle ClientHellos"
+        );
+
+        daemon.stop_with_active_connections();
+        drop(clients);
     }
 }
