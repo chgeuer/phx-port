@@ -1886,6 +1886,7 @@ mod tests {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             accepted_for_worker.fetch_add(1, Ordering::AcqRel);
+                            stream.set_nonblocking(false).unwrap();
                             stream
                                 .set_read_timeout(Some(Duration::from_secs(2)))
                                 .unwrap();
