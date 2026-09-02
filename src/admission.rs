@@ -331,11 +331,10 @@ pub(crate) enum AdmissionRejection {
     Handoff,
     RoutingQueue,
     RoutingTimeout,
-    WorkerQueue,
 }
 
 impl AdmissionRejection {
-    pub(crate) const COUNT: usize = 11;
+    pub(crate) const COUNT: usize = 10;
 
     #[cfg(test)]
     pub(crate) const ALL: [Self; Self::COUNT] = [
@@ -349,7 +348,6 @@ impl AdmissionRejection {
         Self::Handoff,
         Self::RoutingQueue,
         Self::RoutingTimeout,
-        Self::WorkerQueue,
     ];
 
     pub(crate) const fn index(self) -> usize {
@@ -364,7 +362,6 @@ impl AdmissionRejection {
             Self::Handoff => 7,
             Self::RoutingQueue => 8,
             Self::RoutingTimeout => 9,
-            Self::WorkerQueue => 10,
         }
     }
 
@@ -380,7 +377,6 @@ impl AdmissionRejection {
             Self::Handoff => "handoff_capacity",
             Self::RoutingQueue => "routing_queue",
             Self::RoutingTimeout => "routing_timeout",
-            Self::WorkerQueue => "worker_queue",
         }
     }
 }
@@ -398,7 +394,6 @@ impl fmt::Display for AdmissionRejection {
             Self::Handoff => "handoff negotiation capacity exhausted",
             Self::RoutingQueue => "route-selection queue capacity exhausted",
             Self::RoutingTimeout => "route selection timed out",
-            Self::WorkerQueue => "connection worker queue capacity exhausted",
         })
     }
 }

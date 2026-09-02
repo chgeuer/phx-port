@@ -549,9 +549,8 @@ impl IngressLimits {
         let handoff_workers = self.handoff_workers();
         if handoff_workers > MAX_BLOCKING_HANDOFF_WORKERS {
             return Err(format!(
-                "handoff_negotiations requires {handoff_workers} blocking handoff workers, but \
-                 the transitional blocking handoff cap is {MAX_BLOCKING_HANDOFF_WORKERS}; lower \
-                 that limit until PHXP I/O is migrated to Tokio"
+                "handoff_negotiations requires {handoff_workers} Tokio blocking PHXP workers, but \
+                 the supported cap is {MAX_BLOCKING_HANDOFF_WORKERS}"
             ));
         }
 
@@ -1075,7 +1074,7 @@ mod tests {
         let error = unsafe_delivery
             .validate(capacity(16_384, 10_000), 1)
             .unwrap_err();
-        assert!(error.contains("blocking handoff cap is 256"), "{error}");
+        assert!(error.contains("supported cap is 256"), "{error}");
 
         let oversized = IngressLimits {
             active_connections: 8_193,
@@ -1086,6 +1085,31 @@ mod tests {
             .unwrap_err();
         assert!(
             error.contains("async ingress state-machine cap of 8192"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn task_budget_counts_every_bounded_handoff_and_probe_worker() {
+        let limits = IngressLimits {
+            handoff_negotiations: 256,
+            ..IngressLimits::default()
+        };
+        let required_tasks = 256
+            + super::CERTIFICATE_PROBE_WORKERS
+            + super::ROUTE_SELECTION_WORKERS
+            + super::TOKIO_RUNTIME_WORKERS
+            + super::AUXILIARY_TASKS;
+
+        limits
+            .clone()
+            .validate(capacity(16_384, required_tasks as u64), 1)
+            .unwrap();
+        let error = limits
+            .validate(capacity(16_384, (required_tasks - 1) as u64), 1)
+            .unwrap_err();
+        assert!(
+            error.contains(&format!("require up to {required_tasks} tasks")),
             "{error}"
         );
     }

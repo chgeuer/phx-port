@@ -243,7 +243,7 @@ limit when one exists.
 Capacity validation runs before the first listener bind. It rejects zero
 limits, sublimits above the global limit, ClientHello deadlines outside
 500-10000 milliseconds, arithmetic overflow, active limits above the 8,192
-async state-machine ceiling, blocking PHXP demand above 256 handoff workers,
+async state-machine ceiling, Tokio blocking PHXP demand above 256 operations,
 task demand above the configured/systemd budget, and descriptor demand that
 would leave less than 30% of `RLIMIT_NOFILE` in reserve. Async relay capacity
 does not allocate native copy or delivery threads. When the configured
@@ -257,13 +257,15 @@ the kernel-reported peer address and acquires active, source, and pre-routing
 permits immediately after Tokio accepts a socket, before creating its tracked
 task. Saturation closes the new socket without allocating a per-connection
 thread. After non-consuming ClientHello inspection and exact route selection,
-the socket enters a separately bounded blocking PHXP pool. Pre-delivery
-fallback returns it to its tracked Tokio task. Relay capacity is reserved
-before opening the loopback backend; after route selection, source and pre-
-routing capacity are released while active and relay permits remain held until
-async copying ends. Each direction uses one fixed 16 KiB buffer. Production
-load qualification and async PHXP remain later milestones, so this migration
-does not constitute a public-load support claim.
+the connection must acquire handoff admission before its PHXP operation enters
+Tokio's blocking scheduler. Saturation and pre-delivery failure return the
+original socket to its tracked Tokio task without queueing another PHXP
+operation. Relay capacity is reserved before opening the loopback backend;
+after route selection, source and pre-routing capacity are released while
+active and relay permits remain held until async copying ends. Each direction
+uses one fixed 16 KiB buffer. Production load qualification and
+ownership-aware graceful drain remain later milestones, so this migration does
+not constitute a public-load support claim.
 
 Operator-only CIDR policy is configured with repeatable
 `--source-policy CIDR=RATE,BURST,PRE_ROUTING[,IPV6_PREFIX]` options. Longest
@@ -742,24 +744,27 @@ synchronized shared state. Nonblocking direct or service-manager listeners are
 adopted by Tokio. Accepted connections obtain global, source, and pre-routing
 admission before entering tracked tasks that perform total-deadline
 non-consuming ClientHello inspection and exact route selection. Cache misses
-cross a fixed route-selection worker pool and bounded queue; verified
-connections then cross a separate one-slot handoff queue.
+cross a fixed route-selection worker pool and bounded queue.
 
-PHXP negotiation remains on a transitional bounded blocking pool. Its pre-
-delivery fallback returns the original socket to the owning Tokio task, which
-opens only the registered loopback backend after acquiring relay capacity and
-performs fixed-buffer bidirectional async copying. Public Route Declarations
-default to a 30-minute inactivity timeout that resets on progress and may be
-extended or disabled exactly; development retains its previous unlimited idle
-lifetime. Startup permits at most 8,192 async ingress state machines but still
-rejects any configuration requiring more than 256 blocking handoff workers.
-Certificate probe threads retain their existing hard bounds. Probe permits are
-acquired before their threads are created, and single-flight discovery
-prevents duplicate work for one SNI hostname. The implementation consists of:
+Verified connections acquire handoff admission before one PHXP operation is
+submitted to Tokio's blocking scheduler. At most 256 operations may be running
+or queued, and saturation returns the original socket directly to the owning
+Tokio task for relay. A provable pre-delivery failure has the same result;
+successful descriptor delivery and every post-delivery failure irreversibly
+remove relay as an option. The owning task opens only the registered loopback
+backend after acquiring relay capacity and performs fixed-buffer bidirectional
+async copying. Public Route Declarations default to a 30-minute inactivity
+timeout that resets on progress and may be extended or disabled exactly;
+development retains its previous unlimited idle lifetime. Startup permits at
+most 8,192 async ingress state machines and rejects more than 256 configured
+blocking PHXP operations. Certificate probe threads retain their existing hard
+bounds. Probe permits are acquired before their threads are created, and
+single-flight discovery prevents duplicate work for one SNI hostname. The
+implementation consists of:
 
 - `admission.rs` for global/source token buckets, bounded source state, and
   RAII connection-stage capacity.
-- `worker_pool.rs` for fixed bounded connection execution.
+- `worker_pool.rs` for fixed bounded route-selection execution.
 - `proxy.rs` for listeners, reconciliation, discovery, route health, control,
   handoff selection, and relay ownership.
 - `relay.rs` for fixed-buffer async copying, half-close propagation, progress-
@@ -767,8 +772,8 @@ prevents duplicate work for one SNI hostname. The implementation consists of:
 - `tls_client_hello.rs` for bounded, non-consuming ClientHello inspection.
 - `route_cache.rs` for bounded combined-development and split-public derived
   routes.
-- `handoff.rs` and `handoff_protocol.rs` for the optional Linux descriptor
-  transfer path.
+- `handoff.rs` and `handoff_protocol.rs` for the optional Linux and macOS
+  descriptor-transfer paths.
 - `ingress_config.rs` for explicit Hosting Profile activation.
 - `port_registry.rs` for locked stable development path/role and logical
   Workload/role assignments.

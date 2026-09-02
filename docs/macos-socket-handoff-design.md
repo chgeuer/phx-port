@@ -158,8 +158,8 @@ The platform-independent portion already has the required semantics:
    the kernel receive queue.
 3. The daemon resolves the hostname to one certificate-verified backend.
 4. `handoff::try_transfer` attempts a local descriptor handoff.
-5. If handoff is unavailable before delivery, `handle_connection` opens the
-   registered backend port and relays encrypted bytes.
+5. If handoff is unavailable before delivery, the owning Tokio connection task
+   opens the registered backend port and relays encrypted bytes.
 6. If handoff succeeds, the backend performs TLS directly on the original TCP
    socket.
 
@@ -596,8 +596,8 @@ The macOS sender must:
 - map failures to `Unavailable` or `Delivered` according to the ownership
   boundary.
 
-Do not change `proxy::handle_connection` fallback behavior except as needed to
-call the newly shared supported-platform implementation.
+Do not change the proxy's fallback behavior except as needed to call the newly
+shared supported-platform implementation.
 
 ### `src/handoff_protocol.rs`
 

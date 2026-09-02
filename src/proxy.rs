@@ -54,7 +54,6 @@ const TLS_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 const TCP_FAILURE_THRESHOLD: u8 = 3;
 const DEVELOPMENT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const PUBLIC_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
-const CONNECTION_QUEUE_CAPACITY: usize = 1;
 const ROUTE_SELECTION_QUEUE_CAPACITY: usize = MAX_WAITING_CLIENTS - ROUTE_SELECTION_WORKERS;
 const ASYNC_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
@@ -409,6 +408,7 @@ struct ProxyState {
     rejected_relay_capacity: AtomicU64,
     rejected_routing_queue: AtomicU64,
     rejected_routing_timeout: AtomicU64,
+    // Retained at zero for the versioned status and metric schemas after removing the delivery pool.
     rejected_worker_queue: AtomicU64,
     overload_events: Mutex<AggregateEvents<{ AdmissionRejection::COUNT }>>,
     delivery_events: Mutex<AggregateEvents<{ DeliveryOutcome::COUNT }>>,
@@ -713,7 +713,6 @@ impl ProxyState {
             AdmissionRejection::Handoff => &self.handoff_capacity_skips,
             AdmissionRejection::RoutingQueue => &self.rejected_routing_queue,
             AdmissionRejection::RoutingTimeout => &self.rejected_routing_timeout,
-            AdmissionRejection::WorkerQueue => &self.rejected_worker_queue,
         };
         counter.fetch_add(1, Ordering::Relaxed);
         self.overload_events
@@ -875,13 +874,6 @@ struct TokioIngress {
     state: Arc<ProxyState>,
     shutdown: Arc<AtomicBool>,
     route_sender: mpsc::SyncSender<RouteSelectionJob>,
-    connection_sender: mpsc::SyncSender<ConnectionJob>,
-}
-
-struct ConnectionJob {
-    handoff: HandoffJob,
-    queued: QueuedConnection,
-    result: oneshot::Sender<Result<Option<RelayJob>, String>>,
 }
 
 struct HandoffJob {
@@ -1190,35 +1182,22 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(TOKIO_RUNTIME_WORKERS)
-        .max_blocking_threads(1)
+        // PHXP is the only spawn_blocking caller; every possible worker is admission- and
+        // task-budgeted by handoff_negotiations before work reaches Tokio.
+        .max_blocking_threads(state.limits.handoff_workers())
         .thread_name("phx-port-tokio")
         .enable_io()
         .enable_time()
         .build()
         .map_err(|error| format!("cannot start Tokio ingress runtime: {error}"))?;
 
-    let worker_state = Arc::clone(&state);
-    let mut connection_workers = BoundedWorkerPool::start(
-        "phx-port-handoff",
-        state.limits.handoff_workers(),
-        CONNECTION_QUEUE_CAPACITY,
-        move |job: ConnectionJob| handle_routed_connection(job, Arc::clone(&worker_state)),
-    )?;
-
     let route_state = Arc::clone(&state);
-    let mut route_workers = match BoundedWorkerPool::start(
+    let mut route_workers = BoundedWorkerPool::start(
         "phx-port-route",
         ROUTE_SELECTION_WORKERS,
         ROUTE_SELECTION_QUEUE_CAPACITY,
         move |job: RouteSelectionJob| handle_route_selection(job, &route_state),
-    ) {
-        Ok(workers) => workers,
-        Err(error) => {
-            connection_workers.close();
-            let _ = connection_workers.join();
-            return Err(error);
-        }
-    };
+    )?;
 
     #[cfg(unix)]
     let (control_path, control_thread) =
@@ -1226,9 +1205,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
             Ok(control) => control,
             Err(error) => {
                 route_workers.close();
-                connection_workers.close();
                 let _ = route_workers.join();
-                let _ = connection_workers.join();
                 return Err(error);
             }
         };
@@ -1252,14 +1229,13 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         Arc::clone(&state),
         Arc::clone(&shutdown),
         route_workers.sender(),
-        connection_workers.sender(),
     ));
     shutdown.store(true, Ordering::Release);
-    drop(runtime);
+    let drain_deadline = Instant::now() + shutdown_drain_timeout;
+    runtime.shutdown_timeout(shutdown_drain_timeout);
 
     route_workers.close();
     let route_join_error = route_workers.join().err();
-    connection_workers.close();
     #[cfg(unix)]
     let _ = control_thread.join();
     let _ = reconciler_thread.join();
@@ -1267,27 +1243,19 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         let _ = metrics_thread.join();
     }
 
-    // Tokio-owned routing and relay work is cancelled before the bounded handoff pool drains.
-    let drain_deadline = Instant::now() + shutdown_drain_timeout;
     while state.admission.snapshot().global.in_use > 0 && Instant::now() < drain_deadline {
         thread::sleep(Duration::from_millis(50));
     }
     let remaining = state.admission.snapshot().global.in_use;
-    let worker_join_error = if remaining > 0 {
+    if remaining > 0 {
         eprintln!("TLS proxy shutdown drain timed out with {remaining} connection(s) still active");
-        None
-    } else {
-        connection_workers.join().err()
-    };
+    }
 
     #[cfg(unix)]
     if let Err(error) = std::fs::remove_file(&control_path)
         && error.kind() != io::ErrorKind::NotFound
     {
         eprintln!("Could not remove control socket: {error}");
-    }
-    if let Some(error) = worker_join_error {
-        return Err(error);
     }
     if let Some(error) = route_join_error {
         return Err(error);
@@ -1302,7 +1270,6 @@ async fn serve_tokio_ingress(
     state: Arc<ProxyState>,
     shutdown: Arc<AtomicBool>,
     route_sender: mpsc::SyncSender<RouteSelectionJob>,
-    connection_sender: mpsc::SyncSender<ConnectionJob>,
 ) -> Result<(), String> {
     let mut listener_tasks = JoinSet::new();
     for listener in listeners {
@@ -1312,12 +1279,10 @@ async fn serve_tokio_ingress(
             state: Arc::clone(&state),
             shutdown: Arc::clone(&shutdown),
             route_sender: route_sender.clone(),
-            connection_sender: connection_sender.clone(),
         };
         listener_tasks.spawn(async move { accept_tokio_connections(listener, ingress).await });
     }
     drop(route_sender);
-    drop(connection_sender);
 
     let mut failure = None;
     while !shutdown.load(Ordering::Acquire) && !listener_tasks.is_empty() {
@@ -1366,7 +1331,6 @@ async fn accept_tokio_connections(
         state,
         shutdown,
         route_sender,
-        connection_sender,
     } = ingress;
     let mut connections = JoinSet::new();
     let mut failure = None;
@@ -1407,7 +1371,6 @@ async fn accept_tokio_connections(
                             state: Arc::clone(&state),
                             shutdown: Arc::clone(&shutdown),
                             route_sender: route_sender.clone(),
-                            connection_sender: connection_sender.clone(),
                         };
                         connections.spawn(async move {
                             route_tokio_connection(
@@ -1496,40 +1459,18 @@ async fn route_tokio_connection(
     let client = client
         .into_std()
         .map_err(|error| format!("cannot release accepted socket from Tokio: {error}"))?;
-    let (result, completed) = oneshot::channel();
-    let job = ConnectionJob {
-        handoff: HandoffJob {
-            client,
-            accepted_at,
-            admission,
-            hostname,
-            peeked_length,
-            backend,
-            cached,
-            relay_idle_timeout,
-        },
-        queued: QueuedConnection::new(Arc::clone(&state.queued_connections)),
-        result,
+    let handoff = HandoffJob {
+        client,
+        accepted_at,
+        admission,
+        hostname,
+        peeked_length,
+        backend,
+        cached,
+        relay_idle_timeout,
     };
 
-    match ingress.connection_sender.try_send(job) {
-        Ok(()) => {}
-        Err(mpsc::TrySendError::Full(_)) => {
-            state.record_admission_rejection(AdmissionRejection::WorkerQueue);
-            return Err("connection delivery queue capacity exhausted".to_string());
-        }
-        Err(mpsc::TrySendError::Disconnected(_)) => {
-            if !ingress.shutdown.swap(true, Ordering::AcqRel) {
-                eprintln!("TLS proxy connection worker pool stopped");
-            }
-            return Err("connection delivery worker pool stopped".to_string());
-        }
-    };
-
-    match completed
-        .await
-        .map_err(|_| "connection delivery worker dropped its result".to_string())??
-    {
+    match prepare_handoff(handoff, Arc::clone(&ingress.state)).await? {
         None => Ok(()),
         Some(job) => relay_tokio_connection(job, &ingress).await,
     }
@@ -2478,7 +2419,7 @@ fn render_json_control_status(state: &ProxyState) -> String {
             route_selection_queue_limit: ROUTE_SELECTION_QUEUE_CAPACITY,
             route_selection_workers: ROUTE_SELECTION_WORKERS,
             queued_connections: state.queued_connections.load(Ordering::Relaxed),
-            connection_queue_limit: CONNECTION_QUEUE_CAPACITY,
+            connection_queue_limit: state.limits.handoff_workers(),
             connection_workers: state.limits.handoff_workers(),
             waiting_clients: state.waiting_clients.load(Ordering::Relaxed),
             inflight_discoveries: discoveries,
@@ -2602,7 +2543,7 @@ fn render_prometheus_metrics(state: &ProxyState) -> String {
     );
     metric!(
         "phx_port_delivery_queue{{state=\"limit\"}} {}",
-        CONNECTION_QUEUE_CAPACITY
+        state.limits.handoff_workers()
     );
     metric!(
         "phx_port_connections_total{{outcome=\"accepted\"}} {}",
@@ -2835,7 +2776,7 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
             let last_rejected_config_generation =
                 reload_status.last_rejected_generation.unwrap_or(0);
             format!(
-                "running\nhosting_profile={hosting_profile}\nconfig_generation={config_generation}\ndeclared_routes={declared_routes}\nrequired_routes={required_routes}\noptional_routes={optional_routes}\nactive_routes={active_routes}\ndegraded_routes={degraded_routes}\nready={ready}\nregistry_valid={registry_valid}\nundeclared_registrations={undeclared_registrations}\nrejected_registry_snapshots={rejected_registry_snapshots}\naccepted_config_reloads={accepted_config_reloads}\nrejected_config_reloads={rejected_config_reloads}\nlast_rejected_config_generation={last_rejected_config_generation}\nlast_reload_error={last_reload_error}\nlisteners={listeners}\nconflicts={conflicts}\nconflict_capacity_drops={conflict_capacity_drops}\nroute_capacity_rejections={route_capacity_rejections}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nsource_entries={source_entries}\nsource_entry_limit={source_entry_limit}\nsource_accepts_per_second_limit={source_accepts_per_second_limit}\nsource_accept_burst_limit={source_accept_burst_limit}\nsource_pre_routing_limit={source_pre_routing_limit}\nsource_ipv6_prefix={source_ipv6_prefix}\nsource_entry_ttl_seconds={source_entry_ttl_seconds}\nsource_policy_overrides={source_policy_overrides}\nqueued_route_selections={queued_route_selections}\nroute_selection_queue_limit={ROUTE_SELECTION_QUEUE_CAPACITY}\nroute_selection_workers={ROUTE_SELECTION_WORKERS}\nqueued_connections={queued_connections}\nconnection_queue_limit={CONNECTION_QUEUE_CAPACITY}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\ncompleted_relays={completed_relays}\nfailed_relays={failed_relays}\nrelay_idle_timeouts={relay_idle_timeouts}\nrelay_backend_connect_failures={relay_backend_connect_failures}\nrelay_client_to_workload_bytes={relay_client_to_workload_bytes}\nrelay_workload_to_client_bytes={relay_workload_to_client_bytes}\nrelay_duration_nanoseconds={relay_duration_nanoseconds}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_source_rate={rejected_source_rate}\nrejected_source_concurrency={rejected_source_concurrency}\nrejected_source_state_capacity={rejected_source_state_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_routing_queue={rejected_routing_queue}\nrejected_routing_timeout={rejected_routing_timeout}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
+                "running\nhosting_profile={hosting_profile}\nconfig_generation={config_generation}\ndeclared_routes={declared_routes}\nrequired_routes={required_routes}\noptional_routes={optional_routes}\nactive_routes={active_routes}\ndegraded_routes={degraded_routes}\nready={ready}\nregistry_valid={registry_valid}\nundeclared_registrations={undeclared_registrations}\nrejected_registry_snapshots={rejected_registry_snapshots}\naccepted_config_reloads={accepted_config_reloads}\nrejected_config_reloads={rejected_config_reloads}\nlast_rejected_config_generation={last_rejected_config_generation}\nlast_reload_error={last_reload_error}\nlisteners={listeners}\nconflicts={conflicts}\nconflict_capacity_drops={conflict_capacity_drops}\nroute_capacity_rejections={route_capacity_rejections}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nsource_entries={source_entries}\nsource_entry_limit={source_entry_limit}\nsource_accepts_per_second_limit={source_accepts_per_second_limit}\nsource_accept_burst_limit={source_accept_burst_limit}\nsource_pre_routing_limit={source_pre_routing_limit}\nsource_ipv6_prefix={source_ipv6_prefix}\nsource_entry_ttl_seconds={source_entry_ttl_seconds}\nsource_policy_overrides={source_policy_overrides}\nqueued_route_selections={queued_route_selections}\nroute_selection_queue_limit={ROUTE_SELECTION_QUEUE_CAPACITY}\nroute_selection_workers={ROUTE_SELECTION_WORKERS}\nqueued_connections={queued_connections}\nconnection_queue_limit={connection_queue_limit}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\ncompleted_relays={completed_relays}\nfailed_relays={failed_relays}\nrelay_idle_timeouts={relay_idle_timeouts}\nrelay_backend_connect_failures={relay_backend_connect_failures}\nrelay_client_to_workload_bytes={relay_client_to_workload_bytes}\nrelay_workload_to_client_bytes={relay_workload_to_client_bytes}\nrelay_duration_nanoseconds={relay_duration_nanoseconds}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_source_rate={rejected_source_rate}\nrejected_source_concurrency={rejected_source_concurrency}\nrejected_source_state_capacity={rejected_source_state_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_routing_queue={rejected_routing_queue}\nrejected_routing_timeout={rejected_routing_timeout}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
                 hosting_profile = route_summary.hosting_profile,
                 config_generation = route_summary.config_generation,
                 declared_routes = route_summary.declared_routes,
@@ -2872,6 +2813,7 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 source_policy_overrides = state.limits.source().overrides.len(),
                 queued_route_selections = state.queued_route_selections.load(Ordering::Relaxed),
                 queued_connections = state.queued_connections.load(Ordering::Relaxed),
+                connection_queue_limit = state.limits.handoff_workers(),
                 connection_workers = state.limits.handoff_workers(),
                 waiting_clients = state.waiting_clients.load(Ordering::Relaxed),
                 accepted_connections = state.accepted_connections.load(Ordering::Relaxed),
@@ -3054,69 +2996,70 @@ fn handle_connection(
         resolve_backend(&hostname, &state)?
     };
     let relay_idle_timeout = state.relay_idle_timeout(&hostname);
-    let (result, completed) = oneshot::channel();
-    let job = ConnectionJob {
-        handoff: HandoffJob {
-            client,
-            accepted_at,
-            admission,
-            hostname,
-            peeked_length,
-            backend,
-            cached: cached_backend.is_some(),
-            relay_idle_timeout,
-        },
-        queued: QueuedConnection::new(Arc::clone(&state.queued_connections)),
-        result,
+    let handoff = HandoffJob {
+        client,
+        accepted_at,
+        admission,
+        hostname,
+        peeked_length,
+        backend,
+        cached: cached_backend.is_some(),
+        relay_idle_timeout,
     };
-    handle_routed_connection(job, Arc::clone(&state));
 
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(state.limits.handoff_workers())
         .enable_io()
         .enable_time()
         .build()
         .map_err(|error| format!("cannot start test Tokio runtime: {error}"))?;
-    match runtime
-        .block_on(completed)
-        .map_err(|_| "connection delivery worker dropped its result".to_string())??
-    {
+    match runtime.block_on(prepare_handoff(handoff, Arc::clone(&state)))? {
         None => Ok(()),
         Some(job) => {
             let (route_sender, _route_receiver) = mpsc::sync_channel(1);
-            let (connection_sender, _connection_receiver) = mpsc::sync_channel(1);
             let ingress = TokioIngress {
                 state,
                 shutdown: Arc::new(AtomicBool::new(false)),
                 route_sender,
-                connection_sender,
             };
             runtime.block_on(relay_tokio_connection(job, &ingress))
         }
     }
 }
 
-fn handle_routed_connection(job: ConnectionJob, state: Arc<ProxyState>) {
-    let ConnectionJob {
-        handoff,
-        queued,
-        result,
-    } = job;
-    drop(queued);
-    let completed = handoff
-        .client
-        .set_nonblocking(false)
-        .map_err(|error| format!("cannot configure accepted client socket: {error}"))
-        .and_then(|()| {
-            handoff
-                .client
-                .set_read_timeout(None)
-                .map_err(|error| format!("cannot clear accepted client timeout: {error}"))
-        })
-        .and_then(|()| prepare_handoff(handoff, &state));
-    let _ = result.send(completed);
+async fn prepare_handoff(
+    handoff: HandoffJob,
+    state: Arc<ProxyState>,
+) -> Result<Option<RelayJob>, String> {
+    let permit = match state.admission.try_acquire_handoff() {
+        Ok(permit) => permit,
+        Err(rejection) => {
+            state.record_admission_rejection(rejection);
+            state.record_delivery_outcome(DeliveryOutcome::HandoffCapacityUnavailable);
+            return Ok(Some(handoff.into_relay()));
+        }
+    };
+    let queued = QueuedConnection::new(Arc::clone(&state.queued_connections));
+    // Cancellation may detach blocking work, so the closure owns the socket through the
+    // irreversible PHXP outcome; only an awaited pre-delivery failure can return it for relay.
+    tokio::task::spawn_blocking(move || {
+        drop(queued);
+        let _handoff_permit = permit;
+        handoff
+            .client
+            .set_nonblocking(false)
+            .map_err(|error| format!("cannot configure accepted client socket: {error}"))?;
+        handoff
+            .client
+            .set_read_timeout(None)
+            .map_err(|error| format!("cannot clear accepted client timeout: {error}"))?;
+        perform_handoff(handoff, &state)
+    })
+    .await
+    .map_err(|error| format!("blocking PHXP task failed: {error}"))?
 }
 
-fn prepare_handoff(handoff: HandoffJob, state: &ProxyState) -> Result<Option<RelayJob>, String> {
+fn perform_handoff(handoff: HandoffJob, state: &ProxyState) -> Result<Option<RelayJob>, String> {
     let HandoffJob {
         mut client,
         accepted_at,
@@ -3134,57 +3077,47 @@ fn prepare_handoff(handoff: HandoffJob, state: &ProxyState) -> Result<Option<Rel
         .min(u128::from(u64::MAX)) as u64;
     let public_profile = state.public_snapshot().is_some();
 
-    match state.admission.try_acquire_handoff() {
-        Ok(_handoff_permit) => {
-            let mut connection_id = [0_u8; 16];
-            match getrandom::fill(&mut connection_id) {
-                Ok(()) => {
-                    let identity = if public_profile {
-                        handoff::EndpointIdentity::Production(&backend.project)
-                    } else {
-                        handoff::EndpointIdentity::Development(&backend.project)
-                    };
-                    state.handoff_attempts.fetch_add(1, Ordering::Relaxed);
-                    match handoff::try_transfer(
-                        client,
-                        identity,
-                        &backend.role,
-                        state.handoff_runtime.as_deref(),
-                        &hostname,
-                        peeked_length,
-                        connection_id,
-                        accepted_at_ns,
-                    ) {
-                        handoff::Outcome::Transferred => {
-                            state.successful_handoffs.fetch_add(1, Ordering::Relaxed);
-                            state.record_delivery_outcome(DeliveryOutcome::HandoffSuccess);
-                            return Ok(None);
-                        }
-                        handoff::Outcome::Delivered(error) => {
-                            state
-                                .delivered_handoff_failures
-                                .fetch_add(1, Ordering::Relaxed);
-                            state.record_delivery_outcome(
-                                DeliveryOutcome::HandoffPostDeliveryFailure,
-                            );
-                            return Err(error);
-                        }
-                        handoff::Outcome::Unavailable(returned) => {
-                            state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
-                            state.record_delivery_outcome(DeliveryOutcome::HandoffFallback);
-                            client = returned;
-                        }
-                    }
+    let mut connection_id = [0_u8; 16];
+    match getrandom::fill(&mut connection_id) {
+        Ok(()) => {
+            let identity = if public_profile {
+                handoff::EndpointIdentity::Production(&backend.project)
+            } else {
+                handoff::EndpointIdentity::Development(&backend.project)
+            };
+            state.handoff_attempts.fetch_add(1, Ordering::Relaxed);
+            match handoff::try_transfer(
+                client,
+                identity,
+                &backend.role,
+                state.handoff_runtime.as_deref(),
+                &hostname,
+                peeked_length,
+                connection_id,
+                accepted_at_ns,
+            ) {
+                handoff::Outcome::Transferred => {
+                    state.successful_handoffs.fetch_add(1, Ordering::Relaxed);
+                    state.record_delivery_outcome(DeliveryOutcome::HandoffSuccess);
+                    return Ok(None);
                 }
-                Err(_) => {
+                handoff::Outcome::Delivered(error) => {
+                    state
+                        .delivered_handoff_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.record_delivery_outcome(DeliveryOutcome::HandoffPostDeliveryFailure);
+                    return Err(error);
+                }
+                handoff::Outcome::Unavailable(returned) => {
                     state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
                     state.record_delivery_outcome(DeliveryOutcome::HandoffFallback);
+                    client = returned;
                 }
             }
         }
-        Err(rejection) => {
-            state.record_admission_rejection(rejection);
-            state.record_delivery_outcome(DeliveryOutcome::HandoffCapacityUnavailable);
+        Err(_) => {
+            state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
+            state.record_delivery_outcome(DeliveryOutcome::HandoffFallback);
         }
     }
 
@@ -3196,6 +3129,19 @@ fn prepare_handoff(handoff: HandoffJob, state: &ProxyState) -> Result<Option<Rel
         cached,
         idle_timeout: relay_idle_timeout,
     }))
+}
+
+impl HandoffJob {
+    fn into_relay(self) -> RelayJob {
+        RelayJob {
+            client: self.client,
+            admission: self.admission,
+            hostname: self.hostname,
+            backend: self.backend,
+            cached: self.cached,
+            idle_timeout: self.relay_idle_timeout,
+        }
+    }
 }
 
 async fn relay_tokio_connection(job: RelayJob, ingress: &TokioIngress) -> Result<(), String> {
@@ -4338,15 +4284,15 @@ fn connect_backend_with_timeout(backend: &Backend, timeout: Duration) -> io::Res
 mod tests {
     use super::{
         ActiveRoute, Backend, CONTROL_RESPONSE_LIMIT, DELIVERY_EVENT_INTERVAL, DeliveryOutcome,
-        MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS, MAX_VERIFIED_ROUTES,
-        MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter, ProbeMatch, ProxyState,
-        QueuedRouteSelection, RelayJob, RouteSelectionJob, SOURCE_DIAGNOSTIC_EVENT_INTERVAL,
-        TokioIngress, WaitingClient, cache_negative, clear_conflict, collect_probe_matches,
-        handle_connection, handle_route_selection, install_active_route, observe_workloads,
-        prefer_https_per_project, reap_ready_connection_tasks, reconcile_routes,
-        reconcile_workloads, record_conflict, relay_tokio_connection, reload_public_profile,
-        render_control_response, render_prometheus_metrics, resolve_backend, select_tokio_route,
-        supports_eager_discovery,
+        HandoffJob, IngressLimits, MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS,
+        MAX_VERIFIED_ROUTES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter,
+        ProbeMatch, ProxyState, QueuedRouteSelection, RelayJob, RouteSelectionJob,
+        SOURCE_DIAGNOSTIC_EVENT_INTERVAL, SystemCapacity, TokioIngress, WaitingClient,
+        cache_negative, clear_conflict, collect_probe_matches, handle_connection,
+        handle_route_selection, install_active_route, observe_workloads, prefer_https_per_project,
+        prepare_handoff, reap_ready_connection_tasks, reconcile_routes, reconcile_workloads,
+        record_conflict, relay_tokio_connection, reload_public_profile, render_control_response,
+        render_prometheus_metrics, resolve_backend, select_tokio_route, supports_eager_discovery,
     };
     #[cfg(unix)]
     use super::{ControlAccess, ControlEndpointPolicy, ControlPeer, bind_private_control_socket};
@@ -4746,6 +4692,152 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn saturated_async_handoff_falls_back_without_queueing() {
+        const PROJECT: &str = "/project";
+
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime_directory = directory.path().join("runtime");
+        fs::create_dir(&runtime_directory).unwrap();
+        fs::set_permissions(&runtime_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(runtime_directory.join("handoff")).unwrap();
+        let endpoint = handoff::endpoint_path(
+            EndpointIdentity::Development(PROJECT),
+            "https",
+            Some(&runtime_directory),
+        )
+        .unwrap();
+        let handoff_listener = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        bind(
+            handoff_listener.as_raw_fd(),
+            &UnixAddr::new(endpoint.as_path()).unwrap(),
+        )
+        .unwrap();
+        listen(&handoff_listener, Backlog::new(1).unwrap()).unwrap();
+
+        let (handshake_started, handshake_observed) = tokio::sync::oneshot::channel();
+        let (release_handshake, wait_for_release) = std::sync::mpsc::channel();
+        let receiver = thread::spawn(move || {
+            let control = accept(handoff_listener.as_raw_fd()).unwrap();
+            let control = unsafe { OwnedFd::from_raw_fd(control) };
+            let mut packet = [0_u8; crate::handoff_protocol::MAX_PACKET_LENGTH + 1];
+            let length = recv(control.as_raw_fd(), &mut packet, MsgFlags::empty()).unwrap();
+            assert_eq!(decode(&packet[..length]).unwrap(), Message::Hello);
+            handshake_started.send(()).unwrap();
+            wait_for_release.recv().unwrap();
+        });
+
+        let limits = IngressLimits {
+            handoff_negotiations: 1,
+            ..IngressLimits::default()
+        }
+        .validate(
+            SystemCapacity {
+                file_descriptors: None,
+                tasks: None,
+            },
+            1,
+        )
+        .unwrap();
+        let state = Arc::new(ProxyState::with_limits(
+            directory.path().join("ports.toml"),
+            None,
+            HostingProfile::Development,
+            Some(runtime_directory),
+            limits,
+            None,
+        ));
+
+        let first_frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_peer = TcpStream::connect(first_frontend.local_addr().unwrap()).unwrap();
+        let (first_client, first_source) = first_frontend.accept().unwrap();
+        let first_admission = state.admission.try_admit(first_source.ip()).unwrap();
+        let first_handoff = HandoffJob {
+            client: first_client,
+            accepted_at: Instant::now(),
+            admission: first_admission,
+            hostname: "first.example.test".to_string(),
+            peeked_length: 0,
+            backend: Backend {
+                project: PROJECT.to_string(),
+                role: "https".to_string(),
+                port: 1,
+            },
+            cached: false,
+            relay_idle_timeout: None,
+        };
+
+        let second_frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second_peer = TcpStream::connect(second_frontend.local_addr().unwrap()).unwrap();
+        let (second_client, second_source) = second_frontend.accept().unwrap();
+        let second_admission = state.admission.try_admit(second_source.ip()).unwrap();
+        let second_handoff = HandoffJob {
+            client: second_client,
+            accepted_at: Instant::now(),
+            admission: second_admission,
+            hostname: "second.example.test".to_string(),
+            peeked_length: 0,
+            backend: Backend {
+                project: PROJECT.to_string(),
+                role: "https".to_string(),
+                port: 1,
+            },
+            cached: false,
+            relay_idle_timeout: None,
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let first = tokio::spawn(prepare_handoff(first_handoff, Arc::clone(&state)));
+            tokio::time::timeout(Duration::from_secs(1), handshake_observed)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.admission.snapshot().handoff.in_use, 1);
+
+            let second = tokio::time::timeout(
+                Duration::from_millis(250),
+                prepare_handoff(second_handoff, Arc::clone(&state)),
+            )
+            .await
+            .expect("handoff saturation queued a second blocking operation")
+            .unwrap()
+            .expect("handoff saturation must retain the original socket for relay");
+            assert_eq!(state.queued_connections.load(Ordering::Acquire), 0);
+            assert_eq!(state.handoff_capacity_skips.load(Ordering::Acquire), 1);
+            assert_eq!(state.handoff_attempts.load(Ordering::Acquire), 1);
+
+            release_handshake.send(()).unwrap();
+            let first = first
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("pre-delivery handshake failure must retain the socket for relay");
+            drop(first);
+            drop(second);
+        });
+
+        receiver.join().unwrap();
+        drop(first_peer);
+        drop(second_peer);
+        let admission = state.admission.snapshot();
+        assert_eq!(admission.global.in_use, 0);
+        assert_eq!(admission.pre_routing.in_use, 0);
+        assert_eq!(admission.handoff.in_use, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn public_route_hands_the_original_descriptor_to_its_logical_workload_endpoint() {
         const HOSTNAME: &str = "handoff.example.test";
         const WORKLOAD: &str = "handoff-web";
@@ -5119,12 +5211,10 @@ mod tests {
             .unwrap();
 
         let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(0);
-        let (connection_sender, _connection_receiver) = std::sync::mpsc::sync_channel(1);
         let ingress = TokioIngress {
             state: Arc::clone(&state),
             shutdown: Arc::clone(&shutdown),
             route_sender,
-            connection_sender,
         };
         let error = runtime
             .block_on(select_tokio_route("queued.example.test", &ingress))
@@ -5134,12 +5224,10 @@ mod tests {
         assert_eq!(state.queued_route_selections.load(Ordering::Relaxed), 0);
 
         let (route_sender, route_receiver) = std::sync::mpsc::sync_channel(1);
-        let (connection_sender, _connection_receiver) = std::sync::mpsc::sync_channel(1);
         let ingress = TokioIngress {
             state: Arc::clone(&state),
             shutdown,
             route_sender,
-            connection_sender,
         };
         let error = runtime
             .block_on(select_tokio_route("timeout.example.test", &ingress))
@@ -5271,12 +5359,10 @@ mod tests {
             idle_timeout: None,
         };
         let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(1);
-        let (connection_sender, _connection_receiver) = std::sync::mpsc::sync_channel(1);
         let ingress = TokioIngress {
             state: Arc::clone(&state),
             shutdown: Arc::new(AtomicBool::new(false)),
             route_sender,
-            connection_sender,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -5323,12 +5409,10 @@ mod tests {
             idle_timeout: None,
         };
         let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(1);
-        let (connection_sender, _connection_receiver) = std::sync::mpsc::sync_channel(1);
         let ingress = TokioIngress {
             state: Arc::clone(&state),
             shutdown: Arc::new(AtomicBool::new(false)),
             route_sender,
-            connection_sender,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -5489,7 +5573,7 @@ mod tests {
         assert!(status.contains("source_policy_overrides=0"));
         assert!(status.contains("route_selection_queue_limit=56"));
         assert!(status.contains("route_selection_workers=8"));
-        assert!(status.contains("connection_queue_limit=1"));
+        assert!(status.contains("connection_queue_limit=64"));
         assert!(status.contains("connection_workers=64"));
 
         drop(handoff);
@@ -5843,7 +5927,6 @@ mod tests {
             "handoff_capacity_skips",
             "rejected_routing_queue",
             "rejected_routing_timeout",
-            "rejected_worker_queue",
         ];
 
         for reason in AdmissionRejection::ALL {

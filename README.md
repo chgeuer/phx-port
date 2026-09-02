@@ -313,18 +313,20 @@ Before binding any listener, the daemon rejects zero values, sublimits above
 the global connection limit, ClientHello timeouts outside 500-10000
 milliseconds, arithmetic overflow, and active limits above the bounded 8,192
 async state-machine ceiling. Relay connect and copy I/O run inside those
-tracked Tokio tasks. PHXP remains on a transitional blocking handoff pool, so
-startup also rejects configurations requiring more than 256 handoff workers;
-raising active, pre-routing, or relay capacity does not raise that native-
-thread ceiling. The daemon checks estimated descriptor demand against the
-process `RLIMIT_NOFILE` while preserving a 30% reserve. If the process soft
-limit is too low but its hard limit permits the configured capacity, startup
-raises only the process soft limit to the calculated minimum and verifies the
-result; the configured limits never change with the host environment.
-Otherwise startup fails with the required and available values. On Linux it
-also checks the systemd cgroup task ceiling and its existing occupants when
-available; `--task-budget N` supplies an additional operator ceiling on any
-platform.
+tracked Tokio tasks. PHXP uses Tokio's blocking scheduler only after acquiring
+its handoff permit, so at most 256 configured negotiations may be running or
+queued and raising active, pre-routing, or relay capacity does not raise that
+native-thread ceiling. The daemon checks those potential blocking workers plus
+the 32 certificate-probe workers and fixed runtime/auxiliary tasks against the
+configured or systemd task budget. It also checks estimated descriptor demand
+against the process `RLIMIT_NOFILE` while preserving a 30% reserve. If the
+process soft limit is too low but its hard limit permits the configured
+capacity, startup raises only the process soft limit to the calculated minimum
+and verifies the result; the configured limits never change with the host
+environment. Otherwise startup fails with the required and available values.
+On Linux it also checks the systemd cgroup task ceiling and its existing
+occupants when available; `--task-budget N` supplies an additional operator
+ceiling on any platform.
 
 The daemon enforces the global accept-rate/burst and active, pre-routing,
 relay, handoff, and per-source ceilings at runtime. IPv4 peers use exact-address
@@ -348,11 +350,14 @@ peeks at a ClientHello without consuming it, using one total deadline and a
 buffer that grows from 4 KiB to the fixed 64 KiB ceiling. Cache-miss route
 selection crosses a fixed eight-worker blocking boundary with a 56-entry queue
 and a 250-millisecond total queue-and-selection deadline. A successfully
-verified route enters the one-slot bounded handoff queue. The PHXP result
-returns to the same tracked Tokio task before fallback relay begins;
-saturation at either queue closes the new socket and releases its RAII
-permits. Shutdown cancels and drains Tokio-owned routing and relay work before
-the blocking handoff pool drain begins.
+verified route acquires handoff capacity before submitting one bounded-capacity
+PHXP operation with `spawn_blocking`; saturation bypasses PHXP immediately
+and retains the original socket for relay rather than adding a user-space queue.
+The PHXP ownership result returns to the same tracked Tokio task before
+fallback relay begins. A provable pre-delivery failure returns that socket;
+successful descriptor delivery and every post-delivery failure return no
+relay-capable socket. Runtime shutdown waits for blocking PHXP work only until
+the configured development or public drain deadline.
 
 Handoff negotiation uses its own permit; relay capacity is reserved before
 opening a backend socket, then source and pre-routing capacity are released
@@ -367,8 +372,9 @@ source-address labels. Saturation also emits a fixed-schema
 `event=ingress_overload` stderr record at most once per bounded reason every
 ten seconds. Further rejections in that window are suppressed and aggregated
 into the next event; neither source addresses nor SNI values appear in the
-event. Production load qualification and async PHXP remain separate
-milestones; the bounded async relay path is not a public-load support claim.
+event. Production load qualification and ownership-aware graceful drain
+remain separate milestones; the bounded async relay path is not a public-load
+support claim.
 
 For an unknown SNI hostname, `phx-port` probes active `https` and `main`
 workloads over loopback using that exact hostname. It routes only when exactly
