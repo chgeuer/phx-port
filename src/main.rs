@@ -19,6 +19,7 @@ mod handoff_protocol;
 mod handoff_stream;
 mod ingress_config;
 mod ingress_limits;
+mod observability;
 mod port_registry;
 mod privilege;
 mod production_paths;

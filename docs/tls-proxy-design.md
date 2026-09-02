@@ -165,6 +165,16 @@ normalized exact hostnames, a valid logical `workload`, a bounded lowercase
 An optional `[ingress] listen` array declares at most one IPv4 and one IPv6
 socket address. It is mandatory for `--run-as` startup and immutable across
 configuration reloads.
+An optional `[ingress.metrics] listen` address must be numeric, loopback-only,
+and use a nonzero port. The read-only Prometheus listener is immutable across
+reloads, handles requests on one bounded worker, accepts only `GET /metrics`,
+caps request headers at 1 KiB and response bodies at 1 MiB, and never stops
+the data plane if it cannot bind.
+Temporary sampled source diagnostics require both
+`[ingress.source_diagnostics] sample_every` and an absolute
+`expires_at_unix_seconds` no more than one hour in the future. Expired
+settings are inert. Active diagnostics emit at most once per second and only
+after SNI has been normalized.
 `PHX_PORT_WORKLOAD_ID` is not a profile selector.
 
 Each declaration resolves only its exact logical Workload/role assignment from
@@ -390,6 +400,15 @@ within the interval are counted and suppressed, then reported as one aggregate
 when that reason next emits. These events contain only a fixed reason name and
 numeric counts, never a source address, arbitrary SNI, or per-connection error
 string.
+Handoff and relay outcomes use the same ten-second aggregation discipline in
+fixed-schema `event=handoff` and `event=relay` records. Route activation,
+deactivation, conflicts, certificate rotation, registry state, and
+configuration reloads use bounded structured events; public route identity
+comes only from a Route Declaration. The optional Prometheus endpoint exports
+aggregate capacity, route, delivery, registry, and reload state. Its only
+identity-bearing series is `phx_port_route_state`, bounded by the declaration
+limit and labeled only with normalized declared hostname, logical Workload,
+role, required status, and a fixed state enum.
 `routes` returns the live active and conflicting route table while the daemon
 is reachable, then falls back to cached registry state for offline diagnostics.
 `stop` requests graceful shutdown: listeners and reconciliation stop accepting

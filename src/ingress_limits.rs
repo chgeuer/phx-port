@@ -28,6 +28,7 @@ const MAX_CLIENT_HELLO_TIMEOUT_MS: u64 = 10_000;
 const CERTIFICATE_PROBE_WORKERS: usize = 32;
 const AUXILIARY_TASKS: usize = 4;
 const CONTROL_AND_STATE_FILE_DESCRIPTORS: usize = 8;
+const METRICS_FILE_DESCRIPTORS: usize = 2;
 const RELAY_ADDITIONAL_FILE_DESCRIPTORS: usize = 3;
 const FILE_DESCRIPTOR_RESERVE_PERCENT: u64 = 30;
 const DEFAULT_SOURCE_TABLE_CAPACITY: usize = 4_096;
@@ -415,11 +416,12 @@ impl IngressLimits {
         self,
         configured_task_budget: Option<usize>,
         listener_count: usize,
+        metrics_enabled: bool,
     ) -> Result<ValidatedIngressLimits, String> {
         if configured_task_budget == Some(0) {
             return Err("task_budget must be greater than zero".to_string());
         }
-        let demand = self.resource_demand(listener_count)?;
+        let demand = self.resource_demand(listener_count, metrics_enabled)?;
         let required_file_descriptors = u64::try_from(demand.file_descriptors)
             .map_err(|_| "file descriptor demand does not fit u64".to_string())?;
         let minimum_file_descriptor_limit =
@@ -434,11 +436,15 @@ impl IngressLimits {
         system: SystemCapacity,
         listener_count: usize,
     ) -> Result<ValidatedIngressLimits, String> {
-        let demand = self.resource_demand(listener_count)?;
+        let demand = self.resource_demand(listener_count, false)?;
         self.validate_system_capacity(system, demand)
     }
 
-    fn resource_demand(&self, listener_count: usize) -> Result<ResourceDemand, String> {
+    fn resource_demand(
+        &self,
+        listener_count: usize,
+        metrics_enabled: bool,
+    ) -> Result<ResourceDemand, String> {
         for (field, value) in [
             ("active_connections", self.active_connections),
             ("pre_routing_connections", self.pre_routing_connections),
@@ -558,6 +564,7 @@ impl IngressLimits {
                 CERTIFICATE_PROBE_WORKERS,
                 listener_count,
                 CONTROL_AND_STATE_FILE_DESCRIPTORS,
+                METRICS_FILE_DESCRIPTORS * usize::from(metrics_enabled),
             ],
             "file descriptor",
         )?;
@@ -568,6 +575,7 @@ impl IngressLimits {
                 CERTIFICATE_PROBE_WORKERS,
                 listener_count,
                 AUXILIARY_TASKS,
+                usize::from(metrics_enabled),
             ],
             "task",
         )?;
@@ -1053,6 +1061,19 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("require up to 422 tasks"), "{error}");
         assert!(error.contains("task budget is 421"), "{error}");
+    }
+
+    #[test]
+    fn metrics_listener_accounts_for_its_thread_and_both_open_sockets() {
+        let limits = IngressLimits::default();
+        let without_metrics = limits.resource_demand(2, false).unwrap();
+        let with_metrics = limits.resource_demand(2, true).unwrap();
+
+        assert_eq!(
+            with_metrics.file_descriptors,
+            without_metrics.file_descriptors + 2
+        );
+        assert_eq!(with_metrics.tasks, without_metrics.tasks + 1);
     }
 
     #[test]

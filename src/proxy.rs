@@ -8,7 +8,7 @@ use crate::{
         HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot, RouteDeclaration,
     },
     ingress_limits::{DaemonConfig, ValidatedIngressLimits},
-    is_port_open, port_registry, privilege,
+    is_port_open, observability, port_registry, privilege,
     production_paths::{IntentOwner, ProductionPaths},
     read_config, route_cache, tls_client_hello,
     worker_pool::BoundedWorkerPool,
@@ -17,13 +17,14 @@ use native_tls::TlsConnector;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as FmtWrite;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
@@ -31,9 +32,6 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
-#[cfg(unix)]
-use std::time::{SystemTime, UNIX_EPOCH};
-
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(250);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_PROBES: usize = 32;
@@ -50,6 +48,8 @@ const DEVELOPMENT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const PUBLIC_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECTION_QUEUE_CAPACITY: usize = 1;
 const OVERLOAD_EVENT_INTERVAL: Duration = Duration::from_secs(10);
+const DELIVERY_EVENT_INTERVAL: Duration = Duration::from_secs(10);
+const SOURCE_DIAGNOSTIC_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_REQUEST_LIMIT: u64 = 1024;
 const CONTROL_RESPONSE_LIMIT: u64 = 64 * 1024;
@@ -112,6 +112,7 @@ impl ConfigReloadError {
 #[derive(Default)]
 struct ConfigReloadStatus {
     last_error: Option<ConfigReloadError>,
+    accepted_reloads: u64,
     rejected_reloads: u64,
     last_rejected_generation: Option<u64>,
 }
@@ -213,38 +214,35 @@ impl Drop for ProbePermit {
 }
 
 #[derive(Clone, Copy, Default)]
-struct OverloadEventWindow {
+struct AggregateEventWindow {
     last_emitted: Option<Instant>,
     pending: u64,
 }
 
-struct OverloadEvents {
-    windows: [OverloadEventWindow; AdmissionRejection::COUNT],
+struct AggregateEvents<const N: usize> {
+    windows: [AggregateEventWindow; N],
 }
 
-impl OverloadEvents {
+impl<const N: usize> AggregateEvents<N> {
     fn new() -> Self {
         Self {
-            windows: [OverloadEventWindow::default(); AdmissionRejection::COUNT],
+            windows: [AggregateEventWindow::default(); N],
         }
     }
 
-    fn record(&mut self, reason: AdmissionRejection, now: Instant) -> Option<OverloadEvent> {
-        let window = &mut self.windows[reason.index()];
+    fn record(&mut self, index: usize, now: Instant, interval: Duration) -> Option<u64> {
+        let window = &mut self.windows[index];
         window.pending = window.pending.saturating_add(1);
         let should_emit = match window.last_emitted {
-            Some(last_emitted) => {
-                now.saturating_duration_since(last_emitted) >= OVERLOAD_EVENT_INTERVAL
-            }
+            Some(last_emitted) => now.saturating_duration_since(last_emitted) >= interval,
             None => true,
         };
         if !should_emit {
             return None;
         }
-
         window.last_emitted = Some(now);
-        let rejected = std::mem::take(&mut window.pending);
-        Some(OverloadEvent { reason, rejected })
+        window.last_emitted = Some(now);
+        Some(std::mem::take(&mut window.pending))
     }
 }
 
@@ -261,6 +259,98 @@ impl std::fmt::Display for OverloadEvent {
             self.reason.event_reason(),
             self.rejected,
             self.rejected.saturating_sub(1)
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeliveryOutcome {
+    HandoffSuccess,
+    HandoffFallback,
+    HandoffPostDeliveryFailure,
+    HandoffCapacityUnavailable,
+    RelayStarted,
+    RelayCompleted,
+    RelayFailed,
+}
+
+impl DeliveryOutcome {
+    const COUNT: usize = 7;
+    #[cfg(test)]
+    const ALL: [Self; Self::COUNT] = [
+        Self::HandoffSuccess,
+        Self::HandoffFallback,
+        Self::HandoffPostDeliveryFailure,
+        Self::HandoffCapacityUnavailable,
+        Self::RelayStarted,
+        Self::RelayCompleted,
+        Self::RelayFailed,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::HandoffSuccess => 0,
+            Self::HandoffFallback => 1,
+            Self::HandoffPostDeliveryFailure => 2,
+            Self::HandoffCapacityUnavailable => 3,
+            Self::RelayStarted => 4,
+            Self::RelayCompleted => 5,
+            Self::RelayFailed => 6,
+        }
+    }
+
+    const fn event(self) -> &'static str {
+        match self {
+            Self::HandoffSuccess
+            | Self::HandoffFallback
+            | Self::HandoffPostDeliveryFailure
+            | Self::HandoffCapacityUnavailable => "handoff",
+            Self::RelayStarted | Self::RelayCompleted | Self::RelayFailed => "relay",
+        }
+    }
+
+    const fn result(self) -> &'static str {
+        match self {
+            Self::HandoffSuccess => "success",
+            Self::HandoffFallback => "fallback",
+            Self::HandoffPostDeliveryFailure => "post_delivery_failure",
+            Self::HandoffCapacityUnavailable => "capacity_unavailable",
+            Self::RelayStarted => "started",
+            Self::RelayCompleted => "completed",
+            Self::RelayFailed => "failed",
+        }
+    }
+}
+
+struct DeliveryEvent {
+    outcome: DeliveryOutcome,
+    count: u64,
+}
+
+impl std::fmt::Display for DeliveryEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "event={} result={} count={} suppressed={}",
+            self.outcome.event(),
+            self.outcome.result(),
+            self.count,
+            self.count.saturating_sub(1)
+        )
+    }
+}
+
+struct SourceDiagnosticEvent {
+    source: IpAddr,
+    hostname: String,
+}
+
+impl std::fmt::Display for SourceDiagnosticEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "event=source_diagnostic source={} hostname={}",
+            self.source, self.hostname
         )
     }
 }
@@ -300,13 +390,18 @@ struct ProxyState {
     rejected_pre_routing_capacity: AtomicU64,
     rejected_relay_capacity: AtomicU64,
     rejected_worker_queue: AtomicU64,
-    overload_events: Mutex<OverloadEvents>,
+    overload_events: Mutex<AggregateEvents<{ AdmissionRejection::COUNT }>>,
+    delivery_events: Mutex<AggregateEvents<{ DeliveryOutcome::COUNT }>>,
+    source_diagnostic_candidates: AtomicU64,
+    source_diagnostic_last_emitted: Mutex<Option<Instant>>,
     successful_discoveries: AtomicU64,
     handoff_attempts: AtomicU64,
     successful_handoffs: AtomicU64,
     handoff_fallbacks: AtomicU64,
     handoff_capacity_skips: AtomicU64,
     delivered_handoff_failures: AtomicU64,
+    completed_relays: AtomicU64,
+    failed_relays: AtomicU64,
 }
 
 impl ProxyState {
@@ -354,13 +449,18 @@ impl ProxyState {
             rejected_pre_routing_capacity: AtomicU64::new(0),
             rejected_relay_capacity: AtomicU64::new(0),
             rejected_worker_queue: AtomicU64::new(0),
-            overload_events: Mutex::new(OverloadEvents::new()),
+            overload_events: Mutex::new(AggregateEvents::new()),
+            delivery_events: Mutex::new(AggregateEvents::new()),
+            source_diagnostic_candidates: AtomicU64::new(0),
+            source_diagnostic_last_emitted: Mutex::new(None),
             successful_discoveries: AtomicU64::new(0),
             handoff_attempts: AtomicU64::new(0),
             successful_handoffs: AtomicU64::new(0),
             handoff_fallbacks: AtomicU64::new(0),
             handoff_capacity_skips: AtomicU64::new(0),
             delivered_handoff_failures: AtomicU64::new(0),
+            completed_relays: AtomicU64::new(0),
+            failed_relays: AtomicU64::new(0),
         }
     }
 
@@ -561,7 +661,74 @@ impl ProxyState {
         self.overload_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record(rejection, now)
+            .record(rejection.index(), now, OVERLOAD_EVENT_INTERVAL)
+            .map(|rejected| OverloadEvent {
+                reason: rejection,
+                rejected,
+            })
+    }
+
+    fn record_delivery_outcome(&self, outcome: DeliveryOutcome) {
+        if let Some(event) = self.record_delivery_outcome_at(outcome, Instant::now()) {
+            eprintln!("{event}");
+        }
+    }
+
+    fn record_delivery_outcome_at(
+        &self,
+        outcome: DeliveryOutcome,
+        now: Instant,
+    ) -> Option<DeliveryEvent> {
+        self.delivery_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(outcome.index(), now, DELIVERY_EVENT_INTERVAL)
+            .map(|count| DeliveryEvent { outcome, count })
+    }
+
+    fn record_source_diagnostic(&self, source: IpAddr, hostname: &str) {
+        let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return;
+        };
+        if let Some(event) =
+            self.record_source_diagnostic_at(source, hostname, now.as_secs(), Instant::now())
+        {
+            eprintln!("{event}");
+        }
+    }
+
+    fn record_source_diagnostic_at(
+        &self,
+        source: IpAddr,
+        hostname: &str,
+        unix_seconds: u64,
+        now: Instant,
+    ) -> Option<SourceDiagnosticEvent> {
+        let diagnostics = self.public_snapshot()?.source_diagnostics?;
+        if !diagnostics.active_at(unix_seconds) {
+            return None;
+        }
+        let candidate = self
+            .source_diagnostic_candidates
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        if !candidate.is_multiple_of(diagnostics.sample_every) {
+            return None;
+        }
+        let mut last_emitted = self
+            .source_diagnostic_last_emitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last_emitted.is_some_and(|previous| {
+            now.saturating_duration_since(previous) < SOURCE_DIAGNOSTIC_EVENT_INTERVAL
+        }) {
+            return None;
+        }
+        *last_emitted = Some(now);
+        Some(SourceDiagnosticEvent {
+            source,
+            hostname: hostname.to_string(),
+        })
     }
 }
 
@@ -605,6 +772,7 @@ impl Drop for QueuedConnection {
 
 struct ConnectionJob {
     client: TcpStream,
+    source: IpAddr,
     accepted_at: Instant,
     admission: PreRoutingAdmission,
     queued: QueuedConnection,
@@ -726,7 +894,14 @@ fn reload_public_profile(state: &ProxyState) -> ConfigReloadOutcome {
             eprintln!("event=route_state_update result=failed");
         }
     }
-    clear_config_reload_failure(state);
+    {
+        let mut status = state
+            .config_reload_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.last_error = None;
+        status.accepted_reloads = status.accepted_reloads.saturating_add(1);
+    }
     eprintln!(
         "event=ingress_config_reload result=accepted generation={} declared_routes={}",
         replacement_snapshot.generation,
@@ -792,7 +967,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
 
     let (hosting_profile, production_paths, acquired_listeners, limits) =
         if let Some(privilege_drop) = privilege_drop {
-            let limits = limits.validate_for_startup(task_budget, listen_addresses.len())?;
+            let limits = limits.validate_for_startup(task_budget, listen_addresses.len(), true)?;
             let acquired_listeners = activated_listener::acquire_direct(&listen_addresses)?;
             privilege_drop.apply()?;
             let hosting_profile = HostingProfile::load_for_daemon(ingress_config, loopback_only)?;
@@ -816,7 +991,14 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         } else {
             let hosting_profile = HostingProfile::load_for_daemon(ingress_config, loopback_only)?;
             hosting_profile.validate_daemon_listeners(&listen_addresses, false)?;
-            let limits = limits.validate_for_startup(task_budget, listen_addresses.len())?;
+            let metrics_enabled = hosting_profile
+                .public_snapshot()
+                .is_some_and(|snapshot| snapshot.metrics.is_some());
+            let limits = limits.validate_for_startup(
+                task_budget,
+                listen_addresses.len(),
+                metrics_enabled,
+            )?;
             let production_paths = prepare_production_paths(&hosting_profile)?;
             let acquired_listeners = activated_listener::acquire(&listen_addresses)?;
             (
@@ -888,12 +1070,20 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         move |job: ConnectionJob| {
             let ConnectionJob {
                 client,
+                source,
                 accepted_at,
                 admission,
                 queued,
             } = job;
             drop(queued);
-            if handle_connection(client, accepted_at, Arc::clone(&worker_state), admission).is_err()
+            if handle_connection(
+                client,
+                source,
+                accepted_at,
+                Arc::clone(&worker_state),
+                admission,
+            )
+            .is_err()
             {
                 worker_state
                     .rejected_connections
@@ -905,6 +1095,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     #[cfg(unix)]
     let (control_path, control_thread) =
         start_control_server(Arc::clone(&state), Arc::clone(&shutdown))?;
+    let metrics_thread = start_metrics_server(Arc::clone(&state), Arc::clone(&shutdown));
 
     let mut listener_threads = Vec::new();
     for listener in listeners {
@@ -927,6 +1118,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
                         };
                         let job = ConnectionJob {
                             client: stream,
+                            source: peer.ip(),
                             accepted_at,
                             admission,
                             queued: QueuedConnection::new(Arc::clone(&state.queued_connections)),
@@ -978,6 +1170,9 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     #[cfg(unix)]
     let _ = control_thread.join();
     let _ = reconciler_thread.join();
+    if let Some(metrics_thread) = metrics_thread {
+        let _ = metrics_thread.join();
+    }
 
     let drain_deadline = Instant::now() + shutdown_drain_timeout;
     while state.admission.snapshot().global.in_use > 0 && Instant::now() < drain_deadline {
@@ -1002,6 +1197,32 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     }
     eprintln!("TLS proxy stopped");
     Ok(())
+}
+
+fn start_metrics_server(
+    state: Arc<ProxyState>,
+    shutdown: Arc<AtomicBool>,
+) -> Option<thread::JoinHandle<()>> {
+    let metrics = state.public_snapshot()?.metrics?;
+    let render_state = Arc::clone(&state);
+    match observability::start_metrics_server(metrics.listen, shutdown, move || {
+        render_prometheus_metrics(&render_state)
+    }) {
+        Ok(metrics_thread) => {
+            eprintln!(
+                "event=metrics_listener result=started address={}",
+                metrics.listen
+            );
+            Some(metrics_thread)
+        }
+        Err(error) => {
+            eprintln!(
+                "event=metrics_listener result=unavailable reason={}",
+                error.reason()
+            );
+            None
+        }
+    }
 }
 
 fn prepare_production_paths(
@@ -1628,6 +1849,7 @@ struct ControlConfigurationStatus {
     registry_valid: bool,
     undeclared_registrations: usize,
     rejected_registry_snapshots: u64,
+    accepted_config_reloads: u64,
     rejected_config_reloads: u64,
     last_rejected_generation: Option<u64>,
     last_reload_error: Option<&'static str>,
@@ -1638,6 +1860,8 @@ struct ControlConfigurationStatus {
 struct ControlCounterStatus {
     accepted_connections: u64,
     relayed_connections: u64,
+    completed_relays: u64,
+    failed_relays: u64,
     rejected_connections: u64,
     rejected_accept_rate: u64,
     rejected_global_capacity: u64,
@@ -1788,6 +2012,7 @@ fn render_json_control_status(state: &ProxyState) -> String {
             registry_valid: state.registry_valid.load(Ordering::Acquire),
             undeclared_registrations: state.undeclared_registrations.load(Ordering::Acquire),
             rejected_registry_snapshots: state.rejected_registry_snapshots.load(Ordering::Acquire),
+            accepted_config_reloads: reload_status.accepted_reloads,
             rejected_config_reloads: reload_status.rejected_reloads,
             last_rejected_generation: reload_status.last_rejected_generation,
             last_reload_error: reload_status.last_error.map(ConfigReloadError::label),
@@ -1834,6 +2059,8 @@ fn render_json_control_status(state: &ProxyState) -> String {
         counters: ControlCounterStatus {
             accepted_connections: state.accepted_connections.load(Ordering::Relaxed),
             relayed_connections: state.relayed_connections.load(Ordering::Relaxed),
+            completed_relays: state.completed_relays.load(Ordering::Relaxed),
+            failed_relays: state.failed_relays.load(Ordering::Relaxed),
             rejected_connections: state.rejected_connections.load(Ordering::Relaxed),
             rejected_accept_rate: state.rejected_accept_rate.load(Ordering::Relaxed),
             rejected_global_capacity: state.rejected_global_capacity.load(Ordering::Relaxed),
@@ -1861,6 +2088,222 @@ fn render_json_control_status(state: &ProxyState) -> String {
         serde_json::to_string(&status).expect("control status contains only JSON-safe values");
     rendered.push('\n');
     rendered
+}
+
+fn render_prometheus_metrics(state: &ProxyState) -> String {
+    let profile = state.hosting_profile();
+    let summary = route_summary_for_profile(state, &profile);
+    let admission = state.admission.snapshot();
+    let conflicts = state
+        .conflicts
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let reload_status = state
+        .config_reload_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut output = String::with_capacity(16 * 1024);
+    macro_rules! metric {
+        ($($argument:tt)*) => {
+            writeln!(&mut output, $($argument)*)
+                .expect("writing Prometheus metrics to a String cannot fail")
+        };
+    }
+
+    metric!(
+        "phx_port_build_info{{version=\"{}\"}} 1",
+        prometheus_label(env!("CARGO_PKG_VERSION"))
+    );
+    metric!("phx_port_ready {}", usize::from(summary.ready));
+    metric!("phx_port_config_generation {}", summary.config_generation);
+    for (route_state, value) in [
+        ("declared", summary.declared_routes),
+        ("required", summary.required_routes),
+        ("optional", summary.optional_routes),
+        ("active", summary.active_routes),
+        ("degraded", summary.degraded_routes),
+        ("conflict", conflicts.len()),
+    ] {
+        metric!("phx_port_routes{{state=\"{route_state}\"}} {value}");
+    }
+    for (stage, in_use, limit) in [
+        ("active", admission.global.in_use, admission.global.limit),
+        (
+            "pre_routing",
+            admission.pre_routing.in_use,
+            admission.pre_routing.limit,
+        ),
+        ("relay", admission.relay.in_use, admission.relay.limit),
+        ("handoff", admission.handoff.in_use, admission.handoff.limit),
+    ] {
+        metric!("phx_port_admission_in_use{{stage=\"{stage}\"}} {in_use}");
+        metric!("phx_port_admission_limit{{stage=\"{stage}\"}} {limit}");
+    }
+    metric!(
+        "phx_port_source_entries{{state=\"in_use\"}} {}",
+        admission.source_entries
+    );
+    metric!(
+        "phx_port_source_entries{{state=\"limit\"}} {}",
+        admission.source_entry_limit
+    );
+    metric!(
+        "phx_port_connections_total{{outcome=\"accepted\"}} {}",
+        state.accepted_connections.load(Ordering::Relaxed)
+    );
+    metric!(
+        "phx_port_connections_total{{outcome=\"rejected\"}} {}",
+        state.rejected_connections.load(Ordering::Relaxed)
+    );
+    for (reason, value) in [
+        (
+            "accept_rate",
+            state.rejected_accept_rate.load(Ordering::Relaxed),
+        ),
+        (
+            "global_capacity",
+            state.rejected_global_capacity.load(Ordering::Relaxed),
+        ),
+        (
+            "source_rate",
+            state.rejected_source_rate.load(Ordering::Relaxed),
+        ),
+        (
+            "source_concurrency",
+            state.rejected_source_concurrency.load(Ordering::Relaxed),
+        ),
+        (
+            "source_state_capacity",
+            state.rejected_source_state_capacity.load(Ordering::Relaxed),
+        ),
+        (
+            "pre_routing_capacity",
+            state.rejected_pre_routing_capacity.load(Ordering::Relaxed),
+        ),
+        (
+            "relay_capacity",
+            state.rejected_relay_capacity.load(Ordering::Relaxed),
+        ),
+        (
+            "worker_queue",
+            state.rejected_worker_queue.load(Ordering::Relaxed),
+        ),
+    ] {
+        metric!("phx_port_admission_rejections_total{{reason=\"{reason}\"}} {value}");
+    }
+    for (outcome, value) in [
+        ("attempt", state.handoff_attempts.load(Ordering::Relaxed)),
+        ("success", state.successful_handoffs.load(Ordering::Relaxed)),
+        ("fallback", state.handoff_fallbacks.load(Ordering::Relaxed)),
+        (
+            "capacity_skip",
+            state.handoff_capacity_skips.load(Ordering::Relaxed),
+        ),
+        (
+            "post_delivery_failure",
+            state.delivered_handoff_failures.load(Ordering::Relaxed),
+        ),
+    ] {
+        metric!("phx_port_handoffs_total{{outcome=\"{outcome}\"}} {value}");
+    }
+    for (outcome, value) in [
+        ("started", state.relayed_connections.load(Ordering::Relaxed)),
+        ("completed", state.completed_relays.load(Ordering::Relaxed)),
+        ("failed", state.failed_relays.load(Ordering::Relaxed)),
+    ] {
+        metric!("phx_port_relays_total{{outcome=\"{outcome}\"}} {value}");
+    }
+    for (outcome, value) in [
+        ("accepted", reload_status.accepted_reloads),
+        ("rejected", reload_status.rejected_reloads),
+    ] {
+        metric!("phx_port_config_reloads_total{{outcome=\"{outcome}\"}} {value}");
+    }
+    metric!(
+        "phx_port_registry_valid {}",
+        usize::from(state.registry_valid.load(Ordering::Acquire))
+    );
+    metric!(
+        "phx_port_registry_rejected_snapshots_total {}",
+        state.rejected_registry_snapshots.load(Ordering::Acquire)
+    );
+    metric!(
+        "phx_port_undeclared_registrations {}",
+        state.undeclared_registrations.load(Ordering::Acquire)
+    );
+    metric!(
+        "phx_port_route_conflict_capacity_drops_total {}",
+        state.conflict_capacity_drops.load(Ordering::Acquire)
+    );
+    metric!(
+        "phx_port_route_capacity_rejections_total {}",
+        state.route_capacity_rejections.load(Ordering::Acquire)
+    );
+    metric!(
+        "phx_port_discoveries_total{{outcome=\"success\"}} {}",
+        state.successful_discoveries.load(Ordering::Relaxed)
+    );
+    let source_diagnostics_enabled = profile
+        .public_snapshot()
+        .and_then(|snapshot| snapshot.source_diagnostics)
+        .is_some_and(|diagnostics| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .is_ok_and(|now| diagnostics.active_at(now.as_secs()))
+        });
+    metric!(
+        "phx_port_source_diagnostics_enabled {}",
+        usize::from(source_diagnostics_enabled)
+    );
+
+    if let Some(snapshot) = profile.public_snapshot() {
+        let routes = state
+            .routes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failures = state
+            .route_failures
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (hostname, declaration) in &snapshot.routes {
+            let route_state = if routes.get(hostname).is_some_and(|active| {
+                active.declaration_generation == Some(snapshot.generation)
+                    && active.backend.project == declaration.workload
+                    && active.backend.role == declaration.role
+            }) {
+                "active"
+            } else if conflicts.contains_key(hostname) {
+                "conflict"
+            } else {
+                failures
+                    .get(hostname)
+                    .copied()
+                    .map(RouteFailure::label)
+                    .unwrap_or("pending")
+            };
+            metric!(
+                "phx_port_route_state{{hostname=\"{}\",workload=\"{}\",role=\"{}\",required=\"{}\",state=\"{route_state}\"}} 1",
+                prometheus_label(hostname),
+                prometheus_label(&declaration.workload),
+                prometheus_label(&declaration.role),
+                declaration.required
+            );
+        }
+    }
+    output
+}
+
+fn prometheus_label(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &str) -> String {
@@ -1901,7 +2344,7 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
             let last_rejected_config_generation =
                 reload_status.last_rejected_generation.unwrap_or(0);
             format!(
-                "running\nhosting_profile={hosting_profile}\nconfig_generation={config_generation}\ndeclared_routes={declared_routes}\nrequired_routes={required_routes}\noptional_routes={optional_routes}\nactive_routes={active_routes}\ndegraded_routes={degraded_routes}\nready={ready}\nregistry_valid={registry_valid}\nundeclared_registrations={undeclared_registrations}\nrejected_registry_snapshots={rejected_registry_snapshots}\nrejected_config_reloads={rejected_config_reloads}\nlast_rejected_config_generation={last_rejected_config_generation}\nlast_reload_error={last_reload_error}\nlisteners={listeners}\nconflicts={conflicts}\nconflict_capacity_drops={conflict_capacity_drops}\nroute_capacity_rejections={route_capacity_rejections}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nsource_entries={source_entries}\nsource_entry_limit={source_entry_limit}\nsource_accepts_per_second_limit={source_accepts_per_second_limit}\nsource_accept_burst_limit={source_accept_burst_limit}\nsource_pre_routing_limit={source_pre_routing_limit}\nsource_ipv6_prefix={source_ipv6_prefix}\nsource_entry_ttl_seconds={source_entry_ttl_seconds}\nsource_policy_overrides={source_policy_overrides}\nqueued_connections={queued_connections}\nconnection_queue_limit={CONNECTION_QUEUE_CAPACITY}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_source_rate={rejected_source_rate}\nrejected_source_concurrency={rejected_source_concurrency}\nrejected_source_state_capacity={rejected_source_state_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
+                "running\nhosting_profile={hosting_profile}\nconfig_generation={config_generation}\ndeclared_routes={declared_routes}\nrequired_routes={required_routes}\noptional_routes={optional_routes}\nactive_routes={active_routes}\ndegraded_routes={degraded_routes}\nready={ready}\nregistry_valid={registry_valid}\nundeclared_registrations={undeclared_registrations}\nrejected_registry_snapshots={rejected_registry_snapshots}\naccepted_config_reloads={accepted_config_reloads}\nrejected_config_reloads={rejected_config_reloads}\nlast_rejected_config_generation={last_rejected_config_generation}\nlast_reload_error={last_reload_error}\nlisteners={listeners}\nconflicts={conflicts}\nconflict_capacity_drops={conflict_capacity_drops}\nroute_capacity_rejections={route_capacity_rejections}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nsource_entries={source_entries}\nsource_entry_limit={source_entry_limit}\nsource_accepts_per_second_limit={source_accepts_per_second_limit}\nsource_accept_burst_limit={source_accept_burst_limit}\nsource_pre_routing_limit={source_pre_routing_limit}\nsource_ipv6_prefix={source_ipv6_prefix}\nsource_entry_ttl_seconds={source_entry_ttl_seconds}\nsource_policy_overrides={source_policy_overrides}\nqueued_connections={queued_connections}\nconnection_queue_limit={CONNECTION_QUEUE_CAPACITY}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\ncompleted_relays={completed_relays}\nfailed_relays={failed_relays}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_source_rate={rejected_source_rate}\nrejected_source_concurrency={rejected_source_concurrency}\nrejected_source_state_capacity={rejected_source_state_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
                 hosting_profile = route_summary.hosting_profile,
                 config_generation = route_summary.config_generation,
                 declared_routes = route_summary.declared_routes,
@@ -1914,6 +2357,7 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 undeclared_registrations = state.undeclared_registrations.load(Ordering::Acquire),
                 rejected_registry_snapshots =
                     state.rejected_registry_snapshots.load(Ordering::Acquire),
+                accepted_config_reloads = reload_status.accepted_reloads,
                 rejected_config_reloads = reload_status.rejected_reloads,
                 conflict_capacity_drops = state.conflict_capacity_drops.load(Ordering::Relaxed),
                 route_capacity_rejections = state.route_capacity_rejections.load(Ordering::Relaxed),
@@ -1940,6 +2384,8 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 waiting_clients = state.waiting_clients.load(Ordering::Relaxed),
                 accepted_connections = state.accepted_connections.load(Ordering::Relaxed),
                 relayed_connections = state.relayed_connections.load(Ordering::Relaxed),
+                completed_relays = state.completed_relays.load(Ordering::Relaxed),
+                failed_relays = state.failed_relays.load(Ordering::Relaxed),
                 rejected_connections = state.rejected_connections.load(Ordering::Relaxed),
                 rejected_accept_rate = state.rejected_accept_rate.load(Ordering::Relaxed),
                 rejected_global_capacity = state.rejected_global_capacity.load(Ordering::Relaxed),
@@ -2066,6 +2512,7 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
 
 fn handle_connection(
     mut client: TcpStream,
+    source: IpAddr,
     accepted_at: Instant,
     state: Arc<ProxyState>,
     admission: PreRoutingAdmission,
@@ -2091,6 +2538,7 @@ fn handle_connection(
         .map_err(|error| format!("cannot set ClientHello timeout: {error}"))?;
     let (hostname, peeked_length) = tls_client_hello::peek_sni(&client, client_hello_remaining)
         .map_err(|error| error.to_string())?;
+    state.record_source_diagnostic(source, &hostname);
     client
         .set_read_timeout(None)
         .map_err(|error| format!("cannot clear ClientHello timeout before handoff: {error}"))?;
@@ -2132,33 +2580,35 @@ fn handle_connection(
                     ) {
                         handoff::Outcome::Transferred => {
                             state.successful_handoffs.fetch_add(1, Ordering::Relaxed);
-                            eprintln!(
-                                "Handed off {hostname} to {} ({})",
-                                backend.project, backend.role
-                            );
+                            state.record_delivery_outcome(DeliveryOutcome::HandoffSuccess);
                             return Ok(());
                         }
                         handoff::Outcome::Delivered(error) => {
                             state
                                 .delivered_handoff_failures
                                 .fetch_add(1, Ordering::Relaxed);
+                            state.record_delivery_outcome(
+                                DeliveryOutcome::HandoffPostDeliveryFailure,
+                            );
                             return Err(error);
                         }
                         handoff::Outcome::Unavailable(returned) => {
                             state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
+                            state.record_delivery_outcome(DeliveryOutcome::HandoffFallback);
                             client = returned;
                         }
                     }
                 }
-                Err(error) => {
+                Err(_) => {
                     state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "TLS socket handoff unavailable: cannot create connection ID: {error}"
-                    );
+                    state.record_delivery_outcome(DeliveryOutcome::HandoffFallback);
                 }
             }
         }
-        Err(rejection) => state.record_admission_rejection(rejection),
+        Err(rejection) => {
+            state.record_admission_rejection(rejection);
+            state.record_delivery_outcome(DeliveryOutcome::HandoffCapacityUnavailable);
+        }
     }
 
     let relay_permit = match acquire_relay_capacity(&state) {
@@ -2198,14 +2648,19 @@ fn handle_connection(
     client
         .set_read_timeout(None)
         .map_err(|error| format!("cannot clear ClientHello timeout: {error}"))?;
-    eprintln!(
-        "Routing {hostname} to 127.0.0.1:{} ({} {})",
-        backend.port, backend.project, backend.role
-    );
     state.relayed_connections.fetch_add(1, Ordering::Relaxed);
+    state.record_delivery_outcome(DeliveryOutcome::RelayStarted);
     match relay(client, upstream, &buffered) {
-        Ok(()) => Ok(()),
-        Err(error) => Err(format!("relay failed: {error}")),
+        Ok(()) => {
+            state.completed_relays.fetch_add(1, Ordering::Relaxed);
+            state.record_delivery_outcome(DeliveryOutcome::RelayCompleted);
+            Ok(())
+        }
+        Err(error) => {
+            state.failed_relays.fetch_add(1, Ordering::Relaxed);
+            state.record_delivery_outcome(DeliveryOutcome::RelayFailed);
+            Err(format!("relay failed: {error}"))
+        }
     }
 }
 
@@ -2305,8 +2760,8 @@ fn activate_declared_route(
     })?;
     clear_route_failure(state, hostname);
     eprintln!(
-        "Activated declared route {hostname} at 127.0.0.1:{} ({} {})",
-        backend.port, backend.project, backend.role
+        "event=route result=activated hostname={hostname} workload={} role={} backend_port={}",
+        backend.project, backend.role, backend.port
     );
     Ok(backend)
 }
@@ -2403,8 +2858,8 @@ fn discover_backend(
     clear_conflict(state, hostname);
     state.successful_discoveries.fetch_add(1, Ordering::Relaxed);
     eprintln!(
-        "Discovered {hostname} at 127.0.0.1:{} ({} {})",
-        backend.port, backend.project, backend.role
+        "event=route result=discovered hostname={hostname} role={} backend_port={}",
+        backend.role, backend.port
     );
     Ok(backend)
 }
@@ -2454,12 +2909,10 @@ fn record_conflict(state: &ProxyState, hostname: &str, mut backends: Vec<Backend
     if !changed {
         return;
     }
-    let owners = backends
-        .iter()
-        .map(|backend| format!("{} {}:{}", backend.project, backend.role, backend.port))
-        .collect::<Vec<_>>()
-        .join(", ");
-    eprintln!("TLS route conflict for {hostname}: {owners}");
+    eprintln!(
+        "event=route result=conflict hostname={hostname} contenders={}",
+        backends.len()
+    );
 }
 
 fn clear_conflict(state: &ProxyState, hostname: &str) {
@@ -2557,12 +3010,7 @@ fn reconcile_public_workloads(state: &ProxyState, snapshot: &PublicIngressSnapsh
         let desired = match registered_declared_backend(&assignments, declaration) {
             Ok(backend) => backend,
             Err(_) => {
-                deactivate_route(
-                    state,
-                    hostname,
-                    false,
-                    "logical Workload registration is unavailable",
-                );
+                deactivate_route(state, hostname, false, "missing_registration");
                 set_route_failure(state, hostname, RouteFailure::MissingRegistration);
                 continue;
             }
@@ -2581,12 +3029,7 @@ fn reconcile_public_workloads(state: &ProxyState, snapshot: &PublicIngressSnapsh
                 Some(active)
             }
             Some(_) => {
-                deactivate_route(
-                    state,
-                    hostname,
-                    false,
-                    "Route Declaration or logical Workload registration changed",
-                );
+                deactivate_route(state, hostname, false, "declaration_changed");
                 None
             }
             None => None,
@@ -2648,12 +3091,7 @@ fn revalidate_declared_route(
     ) {
         Ok(certificate_fingerprint) => certificate_fingerprint,
         Err(_) => {
-            deactivate_route(
-                state,
-                hostname,
-                false,
-                "declared Workload failed exact-hostname TLS revalidation",
-            );
+            deactivate_route(state, hostname, false, "verification_failed");
             set_route_failure(state, hostname, RouteFailure::VerificationFailed);
             return;
         }
@@ -2745,7 +3183,7 @@ fn reconcile_routes(state: &ProxyState) {
 
     for (hostname, route) in routes {
         if !registration_matches(&state.config, &route.backend) {
-            deactivate_route(state, &hostname, true, "registration was removed");
+            deactivate_route(state, &hostname, true, "registration_removed");
             continue;
         }
 
@@ -2777,7 +3215,7 @@ fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRou
         clear_conflict(state, hostname);
         if certificate_fingerprint != incumbent.certificate_fingerprint {
             eprintln!(
-                "Observed certificate rotation for {hostname} at 127.0.0.1:{}",
+                "event=certificate result=rotated hostname={hostname} backend_port={}",
                 incumbent.backend.port
             );
         }
@@ -2812,19 +3250,14 @@ fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRou
     match matches.len() {
         0 => {
             clear_conflict(state, hostname);
-            deactivate_route(state, hostname, false, "TLS revalidation failed");
+            deactivate_route(state, hostname, false, "verification_failed");
         }
         1 => {
             clear_conflict(state, hostname);
             let replacement = matches.pop().unwrap();
             eprintln!(
-                "Moving TLS route {hostname} from {} {}:{} to {} {}:{} after revalidation",
-                incumbent.backend.project,
-                incumbent.backend.role,
-                incumbent.backend.port,
-                replacement.backend.project,
-                replacement.backend.role,
-                replacement.backend.port
+                "event=route result=moved hostname={hostname} from_port={} to_port={}",
+                incumbent.backend.port, replacement.backend.port
             );
             let _ = install_active_route(state, hostname, replacement, None);
         }
@@ -2834,12 +3267,7 @@ fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRou
                 hostname,
                 matches.into_iter().map(|matched| matched.backend).collect(),
             );
-            deactivate_route(
-                state,
-                hostname,
-                false,
-                "incumbent is invalid and multiple contenders remain",
-            );
+            deactivate_route(state, hostname, false, "conflict");
         }
     }
 }
@@ -2949,16 +3377,11 @@ fn record_tcp_failure(state: &ProxyState, hostname: &str) {
     };
 
     if failures.is_some_and(|failures| failures >= TCP_FAILURE_THRESHOLD) {
-        deactivate_route(
-            state,
-            hostname,
-            false,
-            "backend failed three consecutive TCP checks",
-        );
+        deactivate_route(state, hostname, false, "backend_unavailable");
     }
 }
 
-fn deactivate_route(state: &ProxyState, hostname: &str, remove_cached: bool, reason: &str) {
+fn deactivate_route(state: &ProxyState, hostname: &str, remove_cached: bool, reason: &'static str) {
     let removed = state
         .routes
         .write()
@@ -2966,7 +3389,7 @@ fn deactivate_route(state: &ProxyState, hostname: &str, remove_cached: bool, rea
         .and_then(|mut routes| routes.remove(hostname))
         .is_some();
     if removed {
-        eprintln!("Deactivated TLS route {hostname}: {reason}");
+        eprintln!("event=route result=deactivated hostname={hostname} reason={reason}");
     }
     if remove_cached
         && let Some((route_cache_path, route_cache_storage)) = state.route_cache()
@@ -3177,12 +3600,14 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream, buffered: &[u8]) -> io:
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveRoute, Backend, CONTROL_RESPONSE_LIMIT, MAX_PROBES, MAX_ROUTE_CONFLICTS,
-        MAX_ROUTE_DIAGNOSTICS, MAX_VERIFIED_ROUTES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL,
-        ProbeLimiter, ProbeMatch, ProxyState, WaitingClient, cache_negative, clear_conflict,
+        ActiveRoute, Backend, CONTROL_RESPONSE_LIMIT, DELIVERY_EVENT_INTERVAL, DeliveryOutcome,
+        MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS, MAX_VERIFIED_ROUTES,
+        MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter, ProbeMatch, ProxyState,
+        SOURCE_DIAGNOSTIC_EVENT_INTERVAL, WaitingClient, cache_negative, clear_conflict,
         collect_probe_matches, handle_connection, install_active_route, observe_workloads,
         prefer_https_per_project, reconcile_routes, reconcile_workloads, record_conflict,
-        reload_public_profile, render_control_response, resolve_backend, supports_eager_discovery,
+        reload_public_profile, render_control_response, render_prometheus_metrics, resolve_backend,
+        supports_eager_discovery,
     };
     #[cfg(unix)]
     use super::{ControlAccess, ControlEndpointPolicy, ControlPeer, bind_private_control_socket};
@@ -3190,7 +3615,9 @@ mod tests {
         admission::AdmissionRejection,
         ingress_config::{
             HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot, RouteDeclaration,
+            SourceDiagnosticsConfig,
         },
+        observability::PROMETHEUS_BODY_LIMIT,
         production_paths::{IntentOwner, ProductionPaths},
         route_cache, update_config,
     };
@@ -3211,7 +3638,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::io::IoSliceMut;
     use std::io::{self, Read, Write};
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     #[cfg(target_os = "linux")]
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     #[cfg(unix)]
@@ -3471,6 +3898,8 @@ mod tests {
             intent_owner: IntentOwner::EffectiveUser,
             generation: 1,
             listeners: None,
+            metrics: None,
+            source_diagnostics: None,
             routes: BTreeMap::from([(hostname.to_string(), declaration)]),
         }))
     }
@@ -3549,6 +3978,8 @@ mod tests {
             intent_owner: IntentOwner::EffectiveUser,
             generation: 1,
             listeners: None,
+            metrics: None,
+            source_diagnostics: None,
             routes,
         }));
         let state =
@@ -3695,7 +4126,14 @@ mod tests {
         });
         let (accepted, peer) = frontend.accept().unwrap();
         let admission = state.admission.try_admit(peer.ip()).unwrap();
-        handle_connection(accepted, Instant::now(), Arc::clone(&state), admission).unwrap();
+        handle_connection(
+            accepted,
+            peer.ip(),
+            Instant::now(),
+            Arc::clone(&state),
+            admission,
+        )
+        .unwrap();
 
         assert_eq!(&client.join().unwrap(), b"handoff");
         receiver.join().unwrap();
@@ -3749,7 +4187,14 @@ mod tests {
         });
         let (accepted, peer) = frontend.accept().unwrap();
         let admission = state.admission.try_admit(peer.ip()).unwrap();
-        handle_connection(accepted, Instant::now(), Arc::clone(&state), admission).unwrap();
+        handle_connection(
+            accepted,
+            peer.ip(),
+            Instant::now(),
+            Arc::clone(&state),
+            admission,
+        )
+        .unwrap();
         assert_eq!(&client.join().unwrap(), b"declared");
         assert_eq!(declared_backend.accepted(), 2);
         assert_eq!(decoy_backend.accepted(), 0);
@@ -3788,8 +4233,14 @@ mod tests {
         });
         let (undeclared, peer) = undeclared_frontend.accept().unwrap();
         let admission = state.admission.try_admit(peer.ip()).unwrap();
-        let error = handle_connection(undeclared, Instant::now(), Arc::clone(&state), admission)
-            .unwrap_err();
+        let error = handle_connection(
+            undeclared,
+            peer.ip(),
+            Instant::now(),
+            Arc::clone(&state),
+            admission,
+        )
+        .unwrap_err();
         assert_eq!(
             error,
             "public ingress has no Route Declaration for undeclared.example.test"
@@ -4294,13 +4745,19 @@ mod tests {
         let directory = tempdir().unwrap();
         let routes = (0..MAX_ROUTE_DECLARATIONS)
             .map(|index| {
-                let hostname = format!("route-{index:04}.example.test");
+                let hostname = format!(
+                    "r{index:04}.{}.{}.{}.{}",
+                    "a".repeat(63),
+                    "b".repeat(63),
+                    "c".repeat(63),
+                    "d".repeat(55)
+                );
                 (
                     hostname.clone(),
                     RouteDeclaration {
                         hostname,
-                        workload: format!("workload-{index:04}"),
-                        role: "https".to_string(),
+                        workload: format!("w{index:04}-{}", "a".repeat(122)),
+                        role: "r".repeat(128),
                         required: true,
                     },
                 )
@@ -4311,6 +4768,8 @@ mod tests {
             intent_owner: IntentOwner::EffectiveUser,
             generation: 1,
             listeners: None,
+            metrics: None,
+            source_diagnostics: None,
             routes,
         }));
         let state = ProxyState::new_with_profile(directory.path().join("ports.toml"), profile);
@@ -4326,6 +4785,27 @@ mod tests {
             status["degraded_routes_omitted"],
             MAX_ROUTE_DECLARATIONS - MAX_ROUTE_DIAGNOSTICS
         );
+
+        state.routes.write().unwrap().insert(
+            "attacker-controlled.example".to_string(),
+            active_route(backend()),
+        );
+        let metrics = render_prometheus_metrics(&state);
+        assert!(metrics.len() <= PROMETHEUS_BODY_LIMIT);
+        assert_eq!(
+            metrics
+                .lines()
+                .filter(|line| line.starts_with("phx_port_route_state{"))
+                .count(),
+            MAX_ROUTE_DECLARATIONS
+        );
+        assert!(!metrics.contains("attacker-controlled.example"));
+        for forbidden in ["source=", "connection_id", "certificate", "error="] {
+            assert!(
+                !metrics.contains(forbidden),
+                "metrics leaked forbidden label {forbidden:?}"
+            );
+        }
     }
 
     #[test]
@@ -4382,6 +4862,126 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn delivery_events_are_rate_limited_with_fixed_outcomes() {
+        let directory = tempdir().unwrap();
+        let state = ProxyState::new(directory.path().join("ports.toml"));
+        let now = Instant::now();
+
+        for outcome in DeliveryOutcome::ALL {
+            let event = state.record_delivery_outcome_at(outcome, now).unwrap();
+            assert_eq!(
+                event.to_string(),
+                format!(
+                    "event={} result={} count=1 suppressed=0",
+                    outcome.event(),
+                    outcome.result()
+                )
+            );
+            assert!(
+                state
+                    .record_delivery_outcome_at(outcome, now + Duration::from_millis(1))
+                    .is_none()
+            );
+        }
+
+        for outcome in DeliveryOutcome::ALL {
+            let event = state
+                .record_delivery_outcome_at(outcome, now + DELIVERY_EVENT_INTERVAL)
+                .unwrap();
+            assert_eq!(
+                event.to_string(),
+                format!(
+                    "event={} result={} count=2 suppressed=1",
+                    outcome.event(),
+                    outcome.result()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn source_diagnostics_are_sampled_rate_limited_and_expire() {
+        let directory = tempdir().unwrap();
+        let profile = match public_profile("www.example.com", "contoso-web") {
+            HostingProfile::Public(snapshot) => {
+                let mut snapshot = (*snapshot).clone();
+                snapshot.source_diagnostics = Some(SourceDiagnosticsConfig {
+                    sample_every: 2,
+                    expires_at_unix_seconds: 100,
+                });
+                HostingProfile::Public(Arc::new(snapshot))
+            }
+            HostingProfile::Development => unreachable!(),
+        };
+        let state = ProxyState::new_with_profile(directory.path().join("ports.toml"), profile);
+        let source = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let now = Instant::now();
+
+        assert!(
+            state
+                .record_source_diagnostic_at(source, "www.example.com", 50, now)
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .record_source_diagnostic_at(source, "www.example.com", 50, now)
+                .unwrap()
+                .to_string(),
+            "event=source_diagnostic source=192.0.2.1 hostname=www.example.com"
+        );
+        assert!(
+            state
+                .record_source_diagnostic_at(
+                    source,
+                    "www.example.com",
+                    50,
+                    now + Duration::from_millis(1),
+                )
+                .is_none()
+        );
+        assert!(
+            state
+                .record_source_diagnostic_at(
+                    source,
+                    "www.example.com",
+                    50,
+                    now + Duration::from_millis(1),
+                )
+                .is_none()
+        );
+        assert!(
+            state
+                .record_source_diagnostic_at(
+                    source,
+                    "www.example.com",
+                    50,
+                    now + SOURCE_DIAGNOSTIC_EVENT_INTERVAL,
+                )
+                .is_none()
+        );
+        assert!(
+            state
+                .record_source_diagnostic_at(
+                    source,
+                    "www.example.com",
+                    50,
+                    now + SOURCE_DIAGNOSTIC_EVENT_INTERVAL,
+                )
+                .is_some()
+        );
+        assert!(
+            state
+                .record_source_diagnostic_at(
+                    source,
+                    "www.example.com",
+                    100,
+                    now + SOURCE_DIAGNOSTIC_EVENT_INTERVAL * 2,
+                )
+                .is_none()
+        );
     }
 
     #[test]

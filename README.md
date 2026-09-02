@@ -159,6 +159,9 @@ mode = "public"
 unknown_sni = "reject"
 listen = ["0.0.0.0:443", "[::]:443"]
 
+[ingress.metrics]
+listen = "127.0.0.1:9464"
+
 [ingress.hosts."www.contoso.com"]
 workload = "contoso-web"
 role = "https"
@@ -169,6 +172,29 @@ workload = "contoso-api"
 role = "https"
 required = false
 ```
+
+`[ingress.metrics]` is optional and accepts one numeric loopback socket
+address with a nonzero port. It serves only `GET /metrics`, limits request
+headers to 1 KiB and the Prometheus body to 1 MiB, and provides no mutation
+endpoint. A bind or setup failure emits a bounded
+`event=metrics_listener result=unavailable` record without stopping the data
+plane. Capacity, delivery, reload, registry, and aggregate route metrics use
+fixed labels. Per-route metrics are emitted only for the at-most-1,000 Route
+Declarations, never for dynamically supplied SNI or source addresses.
+
+Temporary source diagnostics are a separate explicit opt-in:
+
+```toml
+[ingress.source_diagnostics]
+sample_every = 100
+expires_at_unix_seconds = 0 # replace with current Unix time plus at most 3600
+```
+
+The absolute expiry may be at most one hour in the future when loaded. While
+active, every `sample_every`-th successfully normalized ClientHello may emit
+at most one `event=source_diagnostic` per second containing its kernel peer IP
+and normalized SNI. Expired settings are inert; normal events and metrics
+contain no source address.
 
 The public Hosting Profile keeps operator intent, stable assignments, derived
 state, and runtime endpoints in separate ownership domains:

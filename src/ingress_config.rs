@@ -8,11 +8,30 @@ use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use toml_edit::DocumentMut;
+use std::time::{SystemTime, UNIX_EPOCH};
+use toml_edit::{DocumentMut, Table};
 
 const INGRESS_CONFIG_ENV: &str = "PHX_PORT_INGRESS_CONFIG";
 pub(crate) const MAX_ROUTE_DECLARATIONS: usize = 1_000;
 const MAX_INGRESS_LISTENERS: usize = 2;
+const MAX_SOURCE_DIAGNOSTIC_DURATION_SECONDS: u64 = 60 * 60;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MetricsConfig {
+    pub listen: SocketAddr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceDiagnosticsConfig {
+    pub sample_every: u64,
+    pub expires_at_unix_seconds: u64,
+}
+
+impl SourceDiagnosticsConfig {
+    pub fn active_at(self, unix_seconds: u64) -> bool {
+        unix_seconds < self.expires_at_unix_seconds
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteDeclaration {
@@ -28,6 +47,8 @@ pub struct PublicIngressSnapshot {
     pub intent_owner: IntentOwner,
     pub generation: u64,
     pub listeners: Option<Vec<SocketAddr>>,
+    pub metrics: Option<MetricsConfig>,
+    pub source_diagnostics: Option<SourceDiagnosticsConfig>,
     pub routes: BTreeMap<String, RouteDeclaration>,
 }
 
@@ -106,7 +127,10 @@ impl HostingProfile {
             .and_then(|item| item.as_table())
             .expect("the public mode was read from an ingress table");
         for (key, _) in ingress {
-            if !matches!(key, "mode" | "unknown_sni" | "listen" | "hosts") {
+            if !matches!(
+                key,
+                "mode" | "unknown_sni" | "listen" | "metrics" | "source_diagnostics" | "hosts"
+            ) {
                 return Err(format!(
                     "ingress config {} contains unknown [ingress] key {key:?}",
                     path.display()
@@ -177,6 +201,8 @@ impl HostingProfile {
                 Some(parsed)
             }
         };
+        let metrics = Self::parse_metrics_config(ingress, &path)?;
+        let source_diagnostics = Self::parse_source_diagnostics_config(ingress, &path)?;
 
         let hosts = ingress
             .get("hosts")
@@ -292,6 +318,8 @@ impl HostingProfile {
             intent_owner: owner,
             generation,
             listeners,
+            metrics,
+            source_diagnostics,
             routes,
         })))
     }
@@ -317,7 +345,14 @@ impl HostingProfile {
                 "public ingress listener declarations cannot change during reload".to_string(),
             );
         }
-        if candidate_snapshot.routes == current.routes {
+        if candidate_snapshot.metrics != current.metrics {
+            return Err(
+                "public metrics listener declaration cannot change during reload".to_string(),
+            );
+        }
+        if candidate_snapshot.routes == current.routes
+            && candidate_snapshot.source_diagnostics == current.source_diagnostics
+        {
             return Ok(None);
         }
         Ok(Some(candidate))
@@ -378,6 +413,136 @@ impl HostingProfile {
         }
     }
 
+    fn parse_metrics_config(
+        ingress: &Table,
+        path: &std::path::Path,
+    ) -> Result<Option<MetricsConfig>, String> {
+        let Some(metrics) = ingress.get("metrics") else {
+            return Ok(None);
+        };
+        let metrics = metrics.as_table().ok_or_else(|| {
+            format!(
+                "ingress config {} [ingress.metrics] must be a table",
+                path.display()
+            )
+        })?;
+        for (key, _) in metrics {
+            if key != "listen" {
+                return Err(format!(
+                    "ingress config {} contains unknown [ingress.metrics] key {key:?}",
+                    path.display()
+                ));
+            }
+        }
+        let configured = metrics
+            .get("listen")
+            .and_then(|item| item.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "ingress config {} [ingress.metrics] requires a string listen address",
+                    path.display()
+                )
+            })?;
+        let listen = configured.parse::<SocketAddr>().map_err(|error| {
+            format!(
+                "ingress config {} has invalid metrics listen address {configured:?}: {error}",
+                path.display()
+            )
+        })?;
+        if listen.port() == 0 {
+            return Err(format!(
+                "ingress config {} metrics listen address {configured:?} must use a nonzero port",
+                path.display()
+            ));
+        }
+        if !listen.ip().is_loopback() {
+            return Err(format!(
+                "ingress config {} metrics listen address {configured:?} must be loopback-only",
+                path.display()
+            ));
+        }
+        Ok(Some(MetricsConfig { listen }))
+    }
+
+    fn parse_source_diagnostics_config(
+        ingress: &Table,
+        path: &std::path::Path,
+    ) -> Result<Option<SourceDiagnosticsConfig>, String> {
+        let Some(diagnostics) = ingress.get("source_diagnostics") else {
+            return Ok(None);
+        };
+        let diagnostics = diagnostics.as_table().ok_or_else(|| {
+            format!(
+                "ingress config {} [ingress.source_diagnostics] must be a table",
+                path.display()
+            )
+        })?;
+        for (key, _) in diagnostics {
+            if !matches!(key, "sample_every" | "expires_at_unix_seconds") {
+                return Err(format!(
+                    "ingress config {} contains unknown [ingress.source_diagnostics] key {key:?}",
+                    path.display()
+                ));
+            }
+        }
+        let sample_every = Self::parse_positive_u64(
+            diagnostics.get("sample_every"),
+            path,
+            "[ingress.source_diagnostics] sample_every",
+        )?;
+        let expires_at_unix_seconds = Self::parse_nonnegative_u64(
+            diagnostics.get("expires_at_unix_seconds"),
+            path,
+            "[ingress.source_diagnostics] expires_at_unix_seconds",
+        )?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system clock is before the Unix epoch".to_string())?
+            .as_secs();
+        let latest = now.saturating_add(MAX_SOURCE_DIAGNOSTIC_DURATION_SECONDS);
+        if expires_at_unix_seconds > latest {
+            return Err(format!(
+                "ingress config {} source diagnostics expiry must be no more than {MAX_SOURCE_DIAGNOSTIC_DURATION_SECONDS} seconds in the future",
+                path.display()
+            ));
+        }
+        Ok(Some(SourceDiagnosticsConfig {
+            sample_every,
+            expires_at_unix_seconds,
+        }))
+    }
+
+    fn parse_positive_u64(
+        item: Option<&toml_edit::Item>,
+        path: &std::path::Path,
+        field: &str,
+    ) -> Result<u64, String> {
+        let value = Self::parse_nonnegative_u64(item, path, field)?;
+        if value == 0 {
+            return Err(format!(
+                "ingress config {} {field} must be greater than zero",
+                path.display()
+            ));
+        }
+        Ok(value)
+    }
+
+    fn parse_nonnegative_u64(
+        item: Option<&toml_edit::Item>,
+        path: &std::path::Path,
+        field: &str,
+    ) -> Result<u64, String> {
+        let value = item
+            .and_then(|item| item.as_integer())
+            .ok_or_else(|| format!("ingress config {} requires integer {field}", path.display()))?;
+        u64::try_from(value).map_err(|_| {
+            format!(
+                "ingress config {} {field} must be nonnegative",
+                path.display()
+            )
+        })
+    }
+
     pub fn public_snapshot(&self) -> Option<Arc<PublicIngressSnapshot>> {
         match self {
             Self::Public(snapshot) => Some(Arc::clone(snapshot)),
@@ -395,13 +560,17 @@ impl HostingProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot, RouteDeclaration};
+    use super::{
+        HostingProfile, MAX_ROUTE_DECLARATIONS, MAX_SOURCE_DIAGNOSTIC_DURATION_SECONDS,
+        PublicIngressSnapshot, RouteDeclaration,
+    };
     use crate::production_paths::IntentOwner;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::{TempDir, tempdir_in};
 
     fn tempdir() -> std::io::Result<TempDir> {
@@ -462,6 +631,8 @@ mod tests {
                 intent_owner: IntentOwner::EffectiveUser,
                 generation: 1,
                 listeners: None,
+                metrics: None,
+                source_diagnostics: None,
                 routes,
             }))
         );
@@ -573,6 +744,176 @@ mod tests {
                 "unsafe listener declarations were accepted: {listeners}"
             );
         }
+    }
+
+    #[test]
+    fn public_observability_is_loopback_only_bounded_and_explicitly_expiring() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("ingress.toml");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let write_config = |metrics: &str, diagnostics: &str| {
+            fs::write(
+                &config,
+                format!(
+                    "[ingress]\nmode = \"public\"\n\
+                     {metrics}\n\
+                     {diagnostics}\n\
+                     [ingress.hosts.\"www.example.com\"]\n\
+                     workload = \"contoso-web\"\nrole = \"https\"\n"
+                ),
+            )
+            .unwrap();
+        };
+
+        write_config(
+            "[ingress.metrics]\nlisten = \"127.0.0.1:9464\"",
+            &format!(
+                "[ingress.source_diagnostics]\n\
+                 sample_every = 100\n\
+                 expires_at_unix_seconds = {}",
+                now + 60
+            ),
+        );
+        let profile =
+            HostingProfile::load_with_env(Some(config.clone()), None, IntentOwner::EffectiveUser)
+                .unwrap();
+        let snapshot = profile.public_snapshot().unwrap();
+        assert_eq!(
+            snapshot.metrics.unwrap().listen,
+            "127.0.0.1:9464".parse().unwrap()
+        );
+        assert_eq!(snapshot.source_diagnostics.unwrap().sample_every, 100);
+        assert!(snapshot.source_diagnostics.unwrap().active_at(now));
+
+        for (metrics, expected) in [
+            (
+                "[ingress.metrics]\nlisten = \"0.0.0.0:9464\"",
+                "loopback-only",
+            ),
+            (
+                "[ingress.metrics]\nlisten = \"127.0.0.1:0\"",
+                "nonzero port",
+            ),
+            (
+                "[ingress.metrics]\nlisten = \"127.0.0.1:9464\"\nmutation = true",
+                "unknown [ingress.metrics] key",
+            ),
+        ] {
+            write_config(metrics, "");
+            let error = HostingProfile::load_with_env(
+                Some(config.clone()),
+                None,
+                IntentOwner::EffectiveUser,
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        for (diagnostics, expected) in [
+            (
+                format!(
+                    "[ingress.source_diagnostics]\n\
+                     sample_every = 0\n\
+                     expires_at_unix_seconds = {}",
+                    now + 60
+                ),
+                "sample_every must be greater than zero",
+            ),
+            (
+                format!(
+                    "[ingress.source_diagnostics]\n\
+                     sample_every = 1\n\
+                     expires_at_unix_seconds = {}",
+                    now + MAX_SOURCE_DIAGNOSTIC_DURATION_SECONDS + 1
+                ),
+                "no more than 3600 seconds in the future",
+            ),
+            (
+                "[ingress.source_diagnostics]\nsample_every = 1".to_string(),
+                "requires integer [ingress.source_diagnostics] expires_at_unix_seconds",
+            ),
+        ] {
+            write_config("", &diagnostics);
+            let error = HostingProfile::load_with_env(
+                Some(config.clone()),
+                None,
+                IntentOwner::EffectiveUser,
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        write_config(
+            "",
+            &format!(
+                "[ingress.source_diagnostics]\n\
+                 sample_every = 1\n\
+                 expires_at_unix_seconds = {}",
+                now.saturating_sub(1)
+            ),
+        );
+        let expired =
+            HostingProfile::load_with_env(Some(config), None, IntentOwner::EffectiveUser).unwrap();
+        assert!(
+            !expired
+                .public_snapshot()
+                .unwrap()
+                .source_diagnostics
+                .unwrap()
+                .active_at(now)
+        );
+    }
+
+    #[test]
+    fn metrics_listener_is_reload_immutable_but_diagnostics_can_change() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("ingress.toml");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let write_config = |metrics_port: u16, expiry: u64| {
+            fs::write(
+                &config,
+                format!(
+                    "[ingress]\nmode = \"public\"\n\
+                     [ingress.metrics]\nlisten = \"127.0.0.1:{metrics_port}\"\n\
+                     [ingress.source_diagnostics]\n\
+                     sample_every = 10\nexpires_at_unix_seconds = {expiry}\n\
+                     [ingress.hosts.\"www.example.com\"]\n\
+                     workload = \"contoso-web\"\nrole = \"https\"\n"
+                ),
+            )
+            .unwrap();
+        };
+
+        write_config(9464, now + 60);
+        let profile =
+            HostingProfile::load_with_env(Some(config.clone()), None, IntentOwner::EffectiveUser)
+                .unwrap();
+        write_config(9464, now + 120);
+        let replacement = profile.reload().unwrap().unwrap();
+        assert_eq!(replacement.public_snapshot().unwrap().generation, 2);
+        assert_eq!(
+            replacement
+                .public_snapshot()
+                .unwrap()
+                .source_diagnostics
+                .unwrap()
+                .expires_at_unix_seconds,
+            now + 120
+        );
+
+        write_config(9465, now + 120);
+        let error = replacement.reload().unwrap_err();
+        assert!(
+            error.contains("metrics listener declaration cannot change during reload"),
+            "{error}"
+        );
+        assert_eq!(replacement.public_snapshot().unwrap().generation, 2);
     }
 
     #[test]
