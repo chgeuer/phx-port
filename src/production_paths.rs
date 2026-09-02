@@ -18,6 +18,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 const DEFAULT_PORT_REGISTRY: &str = "/var/lib/phx-port/ports.toml";
 const DEFAULT_RUNTIME_ROOT: &str = "/run/phx-port";
 const MAX_INGRESS_CONFIG_BYTES: u64 = 1024 * 1024;
+pub const PUBLIC_CONTROL_GROUP: &str = "phx-port-admin";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntentOwner {
@@ -101,11 +102,57 @@ impl ProductionPaths {
     }
 
     #[cfg(unix)]
-    pub fn ensure_control_directory(&self) -> Result<PathBuf, String> {
+    pub fn control_group(&self) -> Result<u32, String> {
         validate_runtime_root(&self.runtime_root)?;
+        let runtime_metadata = fs::symlink_metadata(&self.runtime_root).map_err(|error| {
+            format!(
+                "cannot inspect production runtime root {}: {error}",
+                self.runtime_root.display()
+            )
+        })?;
+        Ok(runtime_metadata.gid())
+    }
+
+    #[cfg(unix)]
+    pub fn validate_control_group(&self) -> Result<u32, String> {
+        let actual_gid = self.control_group()?;
+        let group = nix::unistd::Group::from_name(PUBLIC_CONTROL_GROUP)
+            .map_err(|error| format!("cannot resolve {PUBLIC_CONTROL_GROUP} group: {error}"))?
+            .ok_or_else(|| {
+                format!("required control group {PUBLIC_CONTROL_GROUP} does not exist")
+            })?;
+        if group.gid.as_raw() != actual_gid {
+            return Err(format!(
+                "production runtime root must be grouped to {PUBLIC_CONTROL_GROUP} (GID {}), got GID {actual_gid}",
+                group.gid.as_raw()
+            ));
+        }
+        Ok(actual_gid)
+    }
+
+    #[cfg(unix)]
+    pub fn ensure_control_directory(&self) -> Result<(PathBuf, u32), String> {
+        let control_gid = self.control_group()?;
         let directory = self.runtime_root.join("control");
+        let existed = fs::symlink_metadata(&directory).is_ok();
         ensure_owned_directory(&directory, "production control directory", 0o750)?;
-        Ok(directory)
+        if !existed {
+            set_directory_group_no_follow(&directory, "production control directory", control_gid)?;
+        }
+        let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+            format!(
+                "cannot inspect production control directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        if metadata.gid() != control_gid {
+            return Err(format!(
+                "production control directory {} must have runtime administration GID {control_gid}, got {}",
+                directory.display(),
+                metadata.gid()
+            ));
+        }
+        Ok((directory, control_gid))
     }
 }
 
@@ -546,6 +593,35 @@ fn set_directory_mode_no_follow(path: &Path, description: &str, mode: u32) -> Re
     if unsafe { nix::libc::fchmod(directory.as_raw_fd(), mode as nix::libc::mode_t) } == -1 {
         return Err(format!(
             "cannot set {description} path component {} to mode {mode:04o}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_directory_group_no_follow(path: &Path, description: &str, group: u32) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW);
+    let directory = options.open(path).map_err(|error| {
+        format!(
+            "cannot open newly created {description} {} without following links: {error}",
+            path.display()
+        )
+    })?;
+    if unsafe {
+        nix::libc::fchown(
+            directory.as_raw_fd(),
+            nix::libc::uid_t::MAX,
+            group as nix::libc::gid_t,
+        )
+    } == -1
+    {
+        return Err(format!(
+            "cannot set {description} {} to administration GID {group}: {}",
             path.display(),
             std::io::Error::last_os_error()
         ));

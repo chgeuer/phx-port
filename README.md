@@ -178,7 +178,7 @@ state, and runtime endpoints in separate ownership domains:
 | Route Declarations and policy | `/etc/phx-port/ingress.toml` | root-owned regular file, not group/other writable |
 | Stable Workload/role assignments | `/var/lib/phx-port/ports.toml` | service-owned `0600`; parent and sibling lock are private |
 | Disposable verified-route state | `/var/lib/phx-port/routes.toml` | service-owned `0600`; separate private lock |
-| Runtime endpoints | `/run/phx-port/` | service-owned `0750` root, `0700` handoff directory, `0750` control directory |
+| Runtime endpoints | `/run/phx-port/` | service-owned, `phx-port-admin`-grouped `0750` root; `0700` handoff directory; `0750` control directory |
 
 `PHX_PORT_CONFIG` explicitly overrides the public Port Registry; derived route
 state remains the sibling `routes.toml`. `PHX_PORT_RUNTIME_DIR` explicitly
@@ -330,11 +330,22 @@ Public verified-route state is stored only in the separate disposable
 
 ```bash
 phx-port proxy status
+phx-port proxy status --json
+phx-port proxy check --live
+phx-port proxy check --ready
 phx-port proxy routes
+sudo --preserve-env=PHX_PORT_INGRESS_CONFIG,PHX_PORT_CONFIG,PHX_PORT_RUNTIME_DIR \
+  phx-port proxy reload
 phx-port proxy stop
 phx-port proxy install-service
 phx-port proxy uninstall-service
 ```
+
+`status --json` emits schema version 1 with liveness, readiness, generation,
+bounded degraded Route Declaration detail, capacity use, and counters.
+`check --live` and `check --ready` emit the same bounded JSON; exit status 0
+means the requested condition is true, while status 1 means it is false or the
+authenticated local endpoint cannot be queried.
 
 `proxy routes` uses the daemon's live route table when it is running and falls
 back to persisted routes otherwise. Development keeps its current-user control
@@ -344,6 +355,15 @@ directory when `XDG_RUNTIME_DIR` is unavailable. Public mode uses
 `/run/phx-port/control/control.sock`; public CLI queries must receive the same
 `PHX_PORT_INGRESS_CONFIG`, `PHX_PORT_CONFIG`, and `PHX_PORT_RUNTIME_DIR`
 selection as the daemon.
+
+Every accepted control connection is authenticated from kernel peer
+credentials. The development socket remains owner-only mode `0600`, and that
+current user retains full authority for commands applicable to the development
+Hosting Profile. The public
+socket is service-owned, grouped like the `0750` runtime root, and mode `0660`;
+the runtime group must be `phx-port-admin`. UID 0, the service UID, and current
+members of `phx-port-admin` may read status, routes, and health. Only UID 0 may
+issue `RELOAD` or `STOP` in the public Hosting Profile.
 
 On Linux, `install-service` writes
 `$XDG_CONFIG_HOME/systemd/user/phx-port.service` (or
@@ -375,9 +395,10 @@ rejected. Other root CLI commands retain their existing behavior.
 
 The explicit public Hosting Profile ships separate system units in
 `packaging/systemd/` and in the Linux release archive's `systemd/` directory.
-Provision the non-login `phx-port` user and group, install the binary at
-`/usr/local/bin/phx-port`, install the root-owned ingress intent, then install
-and start all three units:
+Provision the non-login `phx-port` user and group plus a `phx-port-admin`
+group, add the service account and read-only operators to that administration
+group, install the binary at `/usr/local/bin/phx-port`, install the root-owned
+ingress intent, then install and start all three units:
 
 ```bash
 sudo install -o root -g root -m 0755 target/release/phx-port \
@@ -393,7 +414,9 @@ sudo systemctl enable --now phx-port-ipv4.socket phx-port-ipv6.socket \
   phx-port.service
 ```
 
-The IPv4 and IPv6 socket units own port 443 and pass descriptors named
+The service unit initializes the service account's `phx-port-admin`
+supplementary membership and groups the runtime root for authenticated
+read-only control access. The IPv4 and IPv6 socket units own port 443 and pass descriptors named
 `tls-ipv4` and `tls-ipv6`. The unprivileged service accepts only the exact
 configured listening TCP sockets, sets them nonblocking and close-on-exec, and
 does not bind again. systemd creates private state/runtime roots; the service
@@ -420,16 +443,17 @@ non-root identity with no effective capabilities, and routing after restart.
 
 On macOS, the public Hosting Profile ships
 `packaging/launchd/dev.phx-port.ingress.plist`, also included under `launchd/`
-in macOS release archives. Provision the non-login `phx-port` account and its
-root-owned intent plus service-owned state/runtime directories, then install
-the LaunchDaemon:
+in macOS release archives. Provision the non-login `phx-port` account and
+`phx-port-admin` group, add the service account and read-only operators to that
+group, then provision its root-owned intent plus service-owned state/runtime
+directories and install the LaunchDaemon:
 
 ```bash
 sudo install -d -o root -g phx-port -m 0755 \
   "/Library/Application Support/phx-port"
 sudo install -d -o phx-port -g phx-port -m 0700 \
   "/Library/Application Support/phx-port/state"
-sudo install -d -o phx-port -g phx-port -m 0750 \
+sudo install -d -o phx-port -g phx-port-admin -m 0750 \
   /private/var/run/phx-port
 sudo install -d -o phx-port -g phx-port -m 0700 \
   /private/var/run/phx-port/handoff

@@ -30,6 +30,8 @@
   <string>phx-port</string>
   <key>GroupName</key>
   <string>phx-port</string>
+  <key>InitGroups</key>
+  <true/>
   <key>Umask</key>
   <integer>63</integer>
   <key>ProcessType</key>

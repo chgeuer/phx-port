@@ -43,6 +43,22 @@ fn request(path: &Path, command: &str) -> std::io::Result<(String, u32, Option<i
     Ok((response, peer_uid, peer_pid))
 }
 
+fn root_request(path: &Path, command: &str) -> std::process::Output {
+    let runtime = path
+        .parent()
+        .and_then(Path::parent)
+        .expect("control socket has no runtime root");
+    Command::new("sudo")
+        .args(["-n", "--", "/usr/bin/env"])
+        .arg("PHX_PORT_INGRESS_CONFIG=/tmp/phx-port-control-test.toml")
+        .arg("PHX_PORT_CONFIG=/tmp/phx-port-control-test-ports.toml")
+        .arg(environment_assignment("PHX_PORT_RUNTIME_DIR", runtime))
+        .arg(env!("CARGO_BIN_EXE_phx-port"))
+        .args(["proxy", command])
+        .output()
+        .unwrap()
+}
+
 struct Daemon {
     child: Option<Child>,
     control: PathBuf,
@@ -77,10 +93,12 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = request(&self.control, "STOP");
         let Some(mut child) = self.child.take() else {
             return;
         };
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = root_request(&self.control, "stop");
+        }
         if child.try_wait().ok().flatten().is_none() {
             let _ = child.kill();
         }
@@ -230,10 +248,20 @@ fn manual_privileged_startup_drops_before_public_files_and_input() {
         &runtime.join("control/control.sock"),
         uid.as_raw(),
         user.gid.as_raw(),
-        0o600,
+        0o660,
     );
 
-    assert_eq!(request(&daemon.control, "STOP").unwrap().0, "stopping\n");
+    assert_eq!(
+        request(&daemon.control, "STOP").unwrap().0,
+        "ERROR control command is not authorized\n"
+    );
+    let stop = root_request(&daemon.control, "stop");
+    assert!(
+        stop.status.success(),
+        "root STOP failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert_eq!(String::from_utf8(stop.stdout).unwrap(), "stopping\n");
     let output = daemon.child.take().unwrap().wait_with_output().unwrap();
     assert!(
         output.status.success(),

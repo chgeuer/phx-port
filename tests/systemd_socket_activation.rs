@@ -146,7 +146,14 @@ fn daemon_adopts_named_systemd_listener_without_rebinding() {
             & 0o7777,
         0o750
     );
-    assert_eq!(request(&control, "STOP").unwrap(), "stopping\n");
+    assert_eq!(
+        request(&control, "STOP").unwrap(),
+        "ERROR control command is not authorized\n"
+    );
+    assert_eq!(
+        unsafe { nix::libc::kill(child.id() as nix::libc::pid_t, nix::libc::SIGINT) },
+        0
+    );
 
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -653,10 +660,12 @@ fn real_systemd_unit_routes_writes_state_and_restarts_rootlessly() {
          Type=simple\n\
          User={user}\n\
          Group={group}\n\
+         SupplementaryGroups={group}\n\
          Sockets={socket}\n\
          Environment=\"PHX_PORT_CONFIG={registry}\"\n\
          Environment=\"PHX_PORT_RUNTIME_DIR={runtime}\"\n\
          Environment=\"SSL_CERT_FILE={root}\"\n\
+         ExecStartPre=/usr/bin/chgrp {group} {runtime}\n\
          ExecStartPre=/usr/bin/install --directory --mode=0700 {runtime}/handoff\n\
          ExecStart={binary} daemon --ingress-config {config} --listen {address} \
          --active-connections 8 --pre-routing-connections 8 --relay-connections 8 \

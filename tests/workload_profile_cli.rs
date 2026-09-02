@@ -151,6 +151,15 @@ impl RunningDaemon {
     }
 
     fn stop(mut self) {
+        if self.ingress_config.is_some() {
+            let mut child = self.child.take().unwrap();
+            let result =
+                unsafe { nix::libc::kill(child.id() as nix::libc::pid_t, nix::libc::SIGINT) };
+            assert_eq!(result, 0, "cannot terminate public test daemon");
+            let status = child.wait().unwrap();
+            assert!(status.success(), "daemon failed during shutdown: {status}");
+            return;
+        }
         let output = self.control("stop");
         assert!(
             output.status.success(),
@@ -165,9 +174,16 @@ impl RunningDaemon {
 #[cfg(unix)]
 impl Drop for RunningDaemon {
     fn drop(&mut self) {
-        let _ = self.control("stop");
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
+            if self.ingress_config.is_some() {
+                let _ =
+                    unsafe { nix::libc::kill(child.id() as nix::libc::pid_t, nix::libc::SIGINT) };
+            } else {
+                let _ = self.control("stop");
+            }
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
             let _ = child.wait();
         }
     }

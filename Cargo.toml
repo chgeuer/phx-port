@@ -18,6 +18,8 @@ fs2 = "0.4"
 getrandom = "0.3"
 native-tls = "0.2"
 nix = { version = "0.30", features = ["fs", "resource", "socket", "uio", "user"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 socket2 = "0.6"
 toml_edit = "0.22"

@@ -9,11 +9,12 @@ use crate::{
     },
     ingress_limits::{DaemonConfig, ValidatedIngressLimits},
     is_port_open, port_registry, privilege,
-    production_paths::ProductionPaths,
+    production_paths::{IntentOwner, ProductionPaths},
     read_config, route_cache, tls_client_hello,
     worker_pool::BoundedWorkerPool,
 };
 use native_tls::TlsConnector;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read, Write};
@@ -49,6 +50,10 @@ const DEVELOPMENT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const PUBLIC_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECTION_QUEUE_CAPACITY: usize = 1;
 const OVERLOAD_EVENT_INTERVAL: Duration = Duration::from_secs(10);
+const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTROL_REQUEST_LIMIT: u64 = 1024;
+const CONTROL_RESPONSE_LIMIT: u64 = 64 * 1024;
+const CONTROL_SCHEMA_VERSION: u32 = 1;
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -109,6 +114,15 @@ struct ConfigReloadStatus {
     last_error: Option<ConfigReloadError>,
     rejected_reloads: u64,
     last_rejected_generation: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigReloadOutcome {
+    NotPublic,
+    Unchanged(u64),
+    Accepted(u64),
+    Rejected(u64),
+    Superseded(u64),
 }
 
 struct DiscoveryFlight {
@@ -622,20 +636,20 @@ fn clear_config_reload_failure(state: &ProxyState) {
         .last_error = None;
 }
 
-fn reload_public_profile(state: &ProxyState) {
+fn reload_public_profile(state: &ProxyState) -> ConfigReloadOutcome {
     let current = state.hosting_profile();
     let Some(current_snapshot) = current.public_snapshot() else {
-        return;
+        return ConfigReloadOutcome::NotPublic;
     };
     let replacement = match current.reload() {
         Ok(Some(replacement)) => replacement,
         Ok(None) => {
             clear_config_reload_failure(state);
-            return;
+            return ConfigReloadOutcome::Unchanged(current_snapshot.generation);
         }
         Err(_) => {
             record_config_reload_failure(state, current_snapshot.generation.saturating_add(1));
-            return;
+            return ConfigReloadOutcome::Rejected(current_snapshot.generation.saturating_add(1));
         }
     };
     let replacement_snapshot = replacement
@@ -647,10 +661,10 @@ fn reload_public_profile(state: &ProxyState) {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(installed_snapshot) = profile.public_snapshot() else {
-        return;
+        return ConfigReloadOutcome::NotPublic;
     };
     if installed_snapshot.generation != current_snapshot.generation {
-        return;
+        return ConfigReloadOutcome::Superseded(installed_snapshot.generation);
     }
     let mut routes = state
         .routes
@@ -718,6 +732,7 @@ fn reload_public_profile(state: &ProxyState) {
         replacement_snapshot.generation,
         replacement_snapshot.routes.len()
     );
+    ConfigReloadOutcome::Accepted(replacement_snapshot.generation)
 }
 
 fn record_registry_snapshot_failure(state: &ProxyState) {
@@ -1001,13 +1016,59 @@ fn prepare_production_paths(
     Ok(Some(paths))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HealthCheck {
+    Live,
+    Ready,
+}
+
+impl HealthCheck {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Live => "CHECK LIVE",
+            Self::Ready => "CHECK READY",
+        }
+    }
+
+    fn satisfied_by(self, health: &ControlHealth) -> bool {
+        match self {
+            Self::Live => health.live,
+            Self::Ready => health.ready,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ControlHealth {
+    schema_version: u32,
+    live: bool,
+    ready: bool,
+}
+
+pub fn query_health(check: HealthCheck) -> Result<(String, bool), String> {
+    let response = query_control(check.command())?;
+    let health = serde_json::from_str::<ControlHealth>(&response)
+        .map_err(|error| format!("daemon returned invalid health JSON: {error}"))?;
+    if health.schema_version != CONTROL_SCHEMA_VERSION {
+        return Err(format!(
+            "daemon returned unsupported health schema version {}",
+            health.schema_version
+        ));
+    }
+    let satisfied = check.satisfied_by(&health);
+    Ok((response, satisfied))
+}
+
 pub fn query_control(command: &str) -> Result<String, String> {
     #[cfg(unix)]
     {
         let mut stream = UnixStream::connect(client_control_socket_path()?)
             .map_err(|error| format!("TLS proxy daemon is not reachable: {error}"))?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(CONTROL_IO_TIMEOUT))
+            .map_err(|error| format!("cannot configure control connection: {error}"))?;
+        stream
+            .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
             .map_err(|error| format!("cannot configure control connection: {error}"))?;
         stream
             .write_all(format!("{command}\n").as_bytes())
@@ -1015,11 +1076,24 @@ pub fn query_control(command: &str) -> Result<String, String> {
         stream
             .shutdown(Shutdown::Write)
             .map_err(|error| format!("cannot finish daemon command: {error}"))?;
-        let mut response = String::new();
-        stream
-            .take(64 * 1024)
-            .read_to_string(&mut response)
+        let mut response = Vec::new();
+        (&mut stream)
+            .take(CONTROL_RESPONSE_LIMIT + 1)
+            .read_to_end(&mut response)
             .map_err(|error| format!("cannot read daemon response: {error}"))?;
+        if response.len() as u64 > CONTROL_RESPONSE_LIMIT {
+            return Err(format!(
+                "daemon response exceeds the {CONTROL_RESPONSE_LIMIT} byte limit"
+            ));
+        }
+        let response = String::from_utf8(response)
+            .map_err(|_| "daemon response is not valid UTF-8".to_string())?;
+        if let Some(error) = response.strip_prefix("ERROR ") {
+            return Err(format!(
+                "TLS proxy control request failed: {}",
+                error.trim()
+            ));
+        }
         Ok(response)
     }
 
@@ -1051,7 +1125,159 @@ fn development_control_socket_path() -> PathBuf {
 }
 
 #[cfg(unix)]
-fn bind_private_control_socket(path: &Path) -> Result<UnixListener, String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ControlPeer {
+    uid: u32,
+    gid: u32,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlAccess {
+    ReadOnly,
+    Mutation,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlAuthorization {
+    Development { owner_uid: u32 },
+    Public { service_uid: u32, admin_gid: u32 },
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ControlEndpointPolicy {
+    authorization: ControlAuthorization,
+    socket_mode: u32,
+    socket_gid: Option<u32>,
+}
+
+#[cfg(unix)]
+impl ControlEndpointPolicy {
+    fn development() -> Self {
+        Self {
+            authorization: ControlAuthorization::Development {
+                owner_uid: nix::unistd::geteuid().as_raw(),
+            },
+            socket_mode: 0o600,
+            socket_gid: None,
+        }
+    }
+
+    fn public(admin_gid: u32) -> Self {
+        Self {
+            authorization: ControlAuthorization::Public {
+                service_uid: nix::unistd::geteuid().as_raw(),
+                admin_gid,
+            },
+            socket_mode: 0o660,
+            socket_gid: Some(admin_gid),
+        }
+    }
+
+    fn authorizes(self, peer: ControlPeer, access: ControlAccess) -> bool {
+        match self.authorization {
+            ControlAuthorization::Development { owner_uid } => {
+                peer.uid == 0 || peer.uid == owner_uid
+            }
+            ControlAuthorization::Public {
+                service_uid,
+                admin_gid,
+            } => match access {
+                ControlAccess::Mutation => peer.uid == 0,
+                ControlAccess::ReadOnly => {
+                    peer.uid == 0
+                        || peer.uid == service_uid
+                        || peer_belongs_to_group(peer, admin_gid)
+                }
+            },
+        }
+    }
+}
+
+#[cfg(unix)]
+fn control_command_access(request: &str) -> Option<ControlAccess> {
+    match request {
+        "STATUS" | "STATUS JSON" | "ROUTES" | "CHECK LIVE" | "CHECK READY" => {
+            Some(ControlAccess::ReadOnly)
+        }
+        "RELOAD" | "STOP" => Some(ControlAccess::Mutation),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn peer_belongs_to_group(peer: ControlPeer, admin_gid: u32) -> bool {
+    if peer.gid == admin_gid {
+        return true;
+    }
+    let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(peer.uid)) else {
+        return false;
+    };
+    if user.gid.as_raw() == admin_gid {
+        return true;
+    }
+    let Ok(Some(group)) = nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(admin_gid))
+    else {
+        return false;
+    };
+    group.mem.iter().any(|member| member == &user.name)
+}
+
+#[cfg(target_os = "linux")]
+fn control_peer(stream: &UnixStream) -> Result<ControlPeer, String> {
+    use nix::sys::socket::{getsockopt, sockopt};
+
+    let credentials = getsockopt(stream, sockopt::PeerCredentials)
+        .map_err(|error| format!("cannot authenticate control peer: {error}"))?;
+    Ok(ControlPeer {
+        uid: credentials.uid(),
+        gid: credentials.gid(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn control_peer(stream: &UnixStream) -> Result<ControlPeer, String> {
+    let (uid, gid) = nix::unistd::getpeereid(stream)
+        .map_err(|error| format!("cannot authenticate control peer: {error}"))?;
+    Ok(ControlPeer {
+        uid: uid.as_raw(),
+        gid: gid.as_raw(),
+    })
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn control_peer(_stream: &UnixStream) -> Result<ControlPeer, String> {
+    Err("control peer authentication is supported only on Linux and macOS".to_string())
+}
+
+#[cfg(unix)]
+fn validate_control_socket(
+    path: &Path,
+    description: &str,
+    policy: ControlEndpointPolicy,
+) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {description}: {error}"))?;
+    let group_matches = policy
+        .socket_gid
+        .is_none_or(|expected| metadata.gid() == expected);
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || !group_matches
+        || metadata.mode() & 0o7777 != policy.socket_mode
+    {
+        return Err(format!("{description} has unsafe ownership or mode"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn bind_private_control_socket(
+    path: &Path,
+    policy: ControlEndpointPolicy,
+) -> Result<UnixListener, String> {
     let directory = path
         .parent()
         .ok_or_else(|| "control socket has no parent directory".to_string())?;
@@ -1078,7 +1304,7 @@ fn bind_private_control_socket(path: &Path) -> Result<UnixListener, String> {
                             staging.display()
                         )
                     })?;
-                return publish_control_socket(path, &staging);
+                return publish_control_socket(path, &staging, policy);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
@@ -1094,7 +1320,11 @@ fn bind_private_control_socket(path: &Path) -> Result<UnixListener, String> {
 }
 
 #[cfg(unix)]
-fn publish_control_socket(path: &Path, staging: &Path) -> Result<UnixListener, String> {
+fn publish_control_socket(
+    path: &Path,
+    staging: &Path,
+    policy: ControlEndpointPolicy,
+) -> Result<UnixListener, String> {
     let staged_path = staging.join("s");
     let listener = match UnixListener::bind(&staged_path) {
         Ok(listener) => listener,
@@ -1106,27 +1336,25 @@ fn publish_control_socket(path: &Path, staging: &Path) -> Result<UnixListener, S
             ));
         }
     };
-    if let Err(error) =
-        std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o600))
+    if let Some(group) = policy.socket_gid
+        && let Err(error) =
+            nix::unistd::chown(&staged_path, None, Some(nix::unistd::Gid::from_raw(group)))
     {
+        remove_staged_control_socket(&staged_path, staging);
+        return Err(format!(
+            "cannot set staged control socket administration group: {error}"
+        ));
+    }
+    if let Err(error) = std::fs::set_permissions(
+        &staged_path,
+        std::fs::Permissions::from_mode(policy.socket_mode),
+    ) {
         remove_staged_control_socket(&staged_path, staging);
         return Err(format!("cannot secure staged control socket: {error}"));
     }
-    let metadata = std::fs::symlink_metadata(&staged_path)
-        .map_err(|error| format!("cannot inspect staged control socket: {error}"));
-    match metadata {
-        Ok(metadata)
-            if metadata.file_type().is_socket()
-                && metadata.uid() == nix::unistd::geteuid().as_raw()
-                && metadata.mode() & 0o7777 == 0o600 => {}
-        Ok(_) => {
-            remove_staged_control_socket(&staged_path, staging);
-            return Err("staged control socket has unsafe ownership or mode".to_string());
-        }
-        Err(error) => {
-            remove_staged_control_socket(&staged_path, staging);
-            return Err(error);
-        }
+    if let Err(error) = validate_control_socket(&staged_path, "staged control socket", policy) {
+        remove_staged_control_socket(&staged_path, staging);
+        return Err(error);
     }
 
     if let Err(error) = std::fs::hard_link(&staged_path, path) {
@@ -1152,17 +1380,9 @@ fn publish_control_socket(path: &Path, staging: &Path) -> Result<UnixListener, S
         ));
     }
 
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect published control socket: {error}"))?;
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != nix::unistd::geteuid().as_raw()
-        || metadata.mode() & 0o7777 != 0o600
-    {
+    if let Err(error) = validate_control_socket(path, "published control socket", policy) {
         let _ = std::fs::remove_file(path);
-        return Err(format!(
-            "published control socket {} has unsafe ownership or mode",
-            path.display()
-        ));
+        return Err(error);
     }
 
     Ok(listener)
@@ -1183,32 +1403,29 @@ fn start_control_server(
     let directory = path
         .parent()
         .ok_or_else(|| "control socket has no parent directory".to_string())?;
-    if let Some(paths) = &state.production_paths {
-        paths.ensure_control_directory()?;
+    let policy = if let Some(paths) = &state.production_paths {
+        if state
+            .public_snapshot()
+            .is_some_and(|snapshot| snapshot.intent_owner == IntentOwner::Root)
+        {
+            paths.validate_control_group()?;
+        }
+        let (prepared_directory, admin_gid) = paths.ensure_control_directory()?;
+        debug_assert_eq!(prepared_directory, directory);
+        ControlEndpointPolicy::public(admin_gid)
     } else {
         crate::production_paths::ensure_owned_directory(
             directory,
             "development control directory",
             0o700,
         )?;
-    }
+        ControlEndpointPolicy::development()
+    };
 
     match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
-                return Err(format!(
-                    "refusing unsafe existing control socket path {}",
-                    path.display()
-                ));
-            }
-            if metadata.uid() != nix::unistd::geteuid().as_raw()
-                || metadata.mode() & 0o7777 != 0o600
-            {
-                return Err(format!(
-                    "existing control socket {} has unsafe ownership or mode",
-                    path.display()
-                ));
-            }
+        Ok(_) => {
+            validate_control_socket(&path, "existing control socket", policy)
+                .map_err(|error| format!("{error}: {}", path.display()))?;
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -1229,18 +1446,8 @@ fn start_control_server(
             .map_err(|error| format!("cannot remove stale control socket: {error}"))?;
     }
 
-    let listener = bind_private_control_socket(&path)?;
-    let metadata = std::fs::symlink_metadata(&path)
-        .map_err(|error| format!("cannot inspect control socket after publication: {error}"))?;
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != nix::unistd::geteuid().as_raw()
-        || metadata.mode() & 0o7777 != 0o600
-    {
-        return Err(format!(
-            "bound control socket {} has unsafe ownership or mode",
-            path.display()
-        ));
-    }
+    let listener = bind_private_control_socket(&path, policy)?;
+    validate_control_socket(&path, "bound control socket", policy)?;
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("cannot configure control socket: {error}"))?;
@@ -1249,13 +1456,45 @@ fn start_control_server(
         while !shutdown.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(2))) {
+                    if let Err(error) = stream.set_read_timeout(Some(CONTROL_IO_TIMEOUT)) {
                         let _ = writeln!(stream, "ERROR cannot configure request timeout: {error}");
                         continue;
                     }
-                    let mut request = String::new();
-                    let response = match (&mut stream).take(1024).read_to_string(&mut request) {
-                        Ok(_) => render_control_response(&state, &shutdown, request.trim()),
+                    if let Err(error) = stream.set_write_timeout(Some(CONTROL_IO_TIMEOUT)) {
+                        let _ =
+                            writeln!(stream, "ERROR cannot configure response timeout: {error}");
+                        continue;
+                    }
+                    let peer = match control_peer(&stream) {
+                        Ok(peer) => peer,
+                        Err(_) => {
+                            let _ = stream.write_all(b"ERROR control peer authentication failed\n");
+                            continue;
+                        }
+                    };
+                    let mut request = Vec::new();
+                    let response = match (&mut stream)
+                        .take(CONTROL_REQUEST_LIMIT + 1)
+                        .read_to_end(&mut request)
+                    {
+                        Ok(_) if request.len() as u64 > CONTROL_REQUEST_LIMIT => format!(
+                            "ERROR request exceeds the {CONTROL_REQUEST_LIMIT} byte limit\n"
+                        ),
+                        Ok(_) => match String::from_utf8(request) {
+                            Ok(request) => {
+                                let request = request.trim();
+                                match control_command_access(request) {
+                                    Some(access) if policy.authorizes(peer, access) => {
+                                        render_control_response(&state, &shutdown, request)
+                                    }
+                                    Some(_) => {
+                                        "ERROR control command is not authorized\n".to_string()
+                                    }
+                                    None => "ERROR unknown command\n".to_string(),
+                                }
+                            }
+                            Err(_) => "ERROR request is not valid UTF-8\n".to_string(),
+                        },
                         Err(error) => format!("ERROR cannot read request: {error}\n"),
                     };
                     let _ = stream.write_all(response.as_bytes());
@@ -1284,6 +1523,10 @@ struct RouteSummary {
 
 fn route_summary(state: &ProxyState) -> RouteSummary {
     let profile = state.hosting_profile();
+    route_summary_for_profile(state, &profile)
+}
+
+fn route_summary_for_profile(state: &ProxyState, profile: &HostingProfile) -> RouteSummary {
     let routes = state
         .routes
         .read()
@@ -1333,8 +1576,291 @@ fn route_summary(state: &ProxyState) -> RouteSummary {
         optional_routes: snapshot.routes.len().saturating_sub(required_routes),
         active_routes,
         degraded_routes: snapshot.routes.len().saturating_sub(active_routes),
-        ready: active_required_routes == required_routes,
+        ready: active_required_routes == required_routes
+            && state.registry_valid.load(Ordering::Acquire),
     }
+}
+
+#[derive(Serialize)]
+struct DegradedRouteStatus {
+    hostname: String,
+    workload: String,
+    role: String,
+    required: bool,
+    reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct CapacityStatus {
+    in_use: usize,
+    limit: usize,
+}
+
+#[derive(Serialize)]
+struct ControlAdmissionStatus {
+    active_connections: CapacityStatus,
+    pre_routing_connections: CapacityStatus,
+    relay_connections: CapacityStatus,
+    handoff_negotiations: CapacityStatus,
+    accepts_per_second_limit: usize,
+    accept_burst_limit: usize,
+    source_entries: CapacityStatus,
+    source_accepts_per_second_limit: usize,
+    source_accept_burst_limit: usize,
+    source_pre_routing_limit: usize,
+    source_ipv6_prefix: u8,
+    source_entry_ttl_seconds: u64,
+    source_policy_overrides: usize,
+}
+
+#[derive(Serialize)]
+struct ControlActivityStatus {
+    queued_connections: usize,
+    connection_queue_limit: usize,
+    connection_workers: usize,
+    waiting_clients: usize,
+    inflight_discoveries: usize,
+    active_probes: usize,
+}
+
+#[derive(Serialize)]
+struct ControlConfigurationStatus {
+    registry_valid: bool,
+    undeclared_registrations: usize,
+    rejected_registry_snapshots: u64,
+    rejected_config_reloads: u64,
+    last_rejected_generation: Option<u64>,
+    last_reload_error: Option<&'static str>,
+    conflicts: usize,
+}
+
+#[derive(Serialize)]
+struct ControlCounterStatus {
+    accepted_connections: u64,
+    relayed_connections: u64,
+    rejected_connections: u64,
+    rejected_accept_rate: u64,
+    rejected_global_capacity: u64,
+    rejected_source_rate: u64,
+    rejected_source_concurrency: u64,
+    rejected_source_state_capacity: u64,
+    rejected_pre_routing_capacity: u64,
+    rejected_relay_capacity: u64,
+    rejected_worker_queue: u64,
+    successful_discoveries: u64,
+    handoff_attempts: u64,
+    successful_handoffs: u64,
+    handoff_fallbacks: u64,
+    handoff_capacity_skips: u64,
+    delivered_handoff_failures: u64,
+    conflict_capacity_drops: u64,
+    route_capacity_rejections: u64,
+}
+
+#[derive(Serialize)]
+struct ControlJsonStatus {
+    schema_version: u32,
+    live: bool,
+    ready: bool,
+    hosting_profile: &'static str,
+    generation: u64,
+    listeners: Vec<String>,
+    declared_routes: usize,
+    required_routes: usize,
+    optional_routes: usize,
+    active_routes: usize,
+    degraded_route_count: usize,
+    degraded_routes: Vec<DegradedRouteStatus>,
+    degraded_routes_omitted: usize,
+    configuration: ControlConfigurationStatus,
+    admission: ControlAdmissionStatus,
+    activity: ControlActivityStatus,
+    counters: ControlCounterStatus,
+}
+
+fn degraded_route_statuses(
+    state: &ProxyState,
+    profile: &HostingProfile,
+) -> Vec<DegradedRouteStatus> {
+    let Some(snapshot) = profile.public_snapshot() else {
+        return Vec::new();
+    };
+    let active_hostnames = state
+        .routes
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter_map(|(hostname, active)| {
+            let declaration = snapshot.routes.get(hostname)?;
+            (active.declaration_generation == Some(snapshot.generation)
+                && declaration.workload == active.backend.project
+                && declaration.role == active.backend.role)
+                .then(|| hostname.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let failures = state
+        .route_failures
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let conflicts = state
+        .conflicts
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    snapshot
+        .routes
+        .iter()
+        .filter(|(hostname, _)| !active_hostnames.contains(*hostname))
+        .take(MAX_ROUTE_DIAGNOSTICS)
+        .map(|(hostname, declaration)| {
+            let reason = if conflicts.contains(hostname) {
+                "conflict"
+            } else {
+                failures
+                    .get(hostname)
+                    .copied()
+                    .map(RouteFailure::label)
+                    .unwrap_or("pending")
+            };
+            DegradedRouteStatus {
+                hostname: hostname.clone(),
+                workload: declaration.workload.clone(),
+                role: declaration.role.clone(),
+                required: declaration.required,
+                reason,
+            }
+        })
+        .collect()
+}
+
+fn render_json_control_status(state: &ProxyState) -> String {
+    let profile = state.hosting_profile();
+    let route_summary = route_summary_for_profile(state, &profile);
+    let degraded_routes = degraded_route_statuses(state, &profile);
+    let admission = state.admission.snapshot();
+    let mut listeners = state
+        .listeners
+        .read()
+        .map(|listeners| {
+            listeners
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    listeners.sort();
+    let conflicts = state
+        .conflicts
+        .read()
+        .map(|conflicts| conflicts.len())
+        .unwrap_or(0);
+    let discoveries = state
+        .flights
+        .lock()
+        .map(|flights| flights.len())
+        .unwrap_or(0);
+    let probes = state.probes.in_use.lock().map(|count| *count).unwrap_or(0);
+    let reload_status = state
+        .config_reload_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let status = ControlJsonStatus {
+        schema_version: CONTROL_SCHEMA_VERSION,
+        live: true,
+        ready: route_summary.ready,
+        hosting_profile: route_summary.hosting_profile,
+        generation: route_summary.config_generation,
+        listeners,
+        declared_routes: route_summary.declared_routes,
+        required_routes: route_summary.required_routes,
+        optional_routes: route_summary.optional_routes,
+        active_routes: route_summary.active_routes,
+        degraded_route_count: route_summary.degraded_routes,
+        degraded_routes,
+        degraded_routes_omitted: route_summary
+            .degraded_routes
+            .saturating_sub(MAX_ROUTE_DIAGNOSTICS),
+        configuration: ControlConfigurationStatus {
+            registry_valid: state.registry_valid.load(Ordering::Acquire),
+            undeclared_registrations: state.undeclared_registrations.load(Ordering::Acquire),
+            rejected_registry_snapshots: state.rejected_registry_snapshots.load(Ordering::Acquire),
+            rejected_config_reloads: reload_status.rejected_reloads,
+            last_rejected_generation: reload_status.last_rejected_generation,
+            last_reload_error: reload_status.last_error.map(ConfigReloadError::label),
+            conflicts,
+        },
+        admission: ControlAdmissionStatus {
+            active_connections: CapacityStatus {
+                in_use: admission.global.in_use,
+                limit: admission.global.limit,
+            },
+            pre_routing_connections: CapacityStatus {
+                in_use: admission.pre_routing.in_use,
+                limit: admission.pre_routing.limit,
+            },
+            relay_connections: CapacityStatus {
+                in_use: admission.relay.in_use,
+                limit: admission.relay.limit,
+            },
+            handoff_negotiations: CapacityStatus {
+                in_use: admission.handoff.in_use,
+                limit: admission.handoff.limit,
+            },
+            accepts_per_second_limit: state.limits.accepts_per_second(),
+            accept_burst_limit: state.limits.accept_burst(),
+            source_entries: CapacityStatus {
+                in_use: admission.source_entries,
+                limit: admission.source_entry_limit,
+            },
+            source_accepts_per_second_limit: state.limits.source().accepts_per_second,
+            source_accept_burst_limit: state.limits.source().accept_burst,
+            source_pre_routing_limit: state.limits.source().pre_routing_connections,
+            source_ipv6_prefix: state.limits.source().ipv6_prefix,
+            source_entry_ttl_seconds: state.limits.source().entry_ttl_seconds,
+            source_policy_overrides: state.limits.source().overrides.len(),
+        },
+        activity: ControlActivityStatus {
+            queued_connections: state.queued_connections.load(Ordering::Relaxed),
+            connection_queue_limit: CONNECTION_QUEUE_CAPACITY,
+            connection_workers: state.limits.active_connections(),
+            waiting_clients: state.waiting_clients.load(Ordering::Relaxed),
+            inflight_discoveries: discoveries,
+            active_probes: probes,
+        },
+        counters: ControlCounterStatus {
+            accepted_connections: state.accepted_connections.load(Ordering::Relaxed),
+            relayed_connections: state.relayed_connections.load(Ordering::Relaxed),
+            rejected_connections: state.rejected_connections.load(Ordering::Relaxed),
+            rejected_accept_rate: state.rejected_accept_rate.load(Ordering::Relaxed),
+            rejected_global_capacity: state.rejected_global_capacity.load(Ordering::Relaxed),
+            rejected_source_rate: state.rejected_source_rate.load(Ordering::Relaxed),
+            rejected_source_concurrency: state.rejected_source_concurrency.load(Ordering::Relaxed),
+            rejected_source_state_capacity: state
+                .rejected_source_state_capacity
+                .load(Ordering::Relaxed),
+            rejected_pre_routing_capacity: state
+                .rejected_pre_routing_capacity
+                .load(Ordering::Relaxed),
+            rejected_relay_capacity: state.rejected_relay_capacity.load(Ordering::Relaxed),
+            rejected_worker_queue: state.rejected_worker_queue.load(Ordering::Relaxed),
+            successful_discoveries: state.successful_discoveries.load(Ordering::Relaxed),
+            handoff_attempts: state.handoff_attempts.load(Ordering::Relaxed),
+            successful_handoffs: state.successful_handoffs.load(Ordering::Relaxed),
+            handoff_fallbacks: state.handoff_fallbacks.load(Ordering::Relaxed),
+            handoff_capacity_skips: state.handoff_capacity_skips.load(Ordering::Relaxed),
+            delivered_handoff_failures: state.delivered_handoff_failures.load(Ordering::Relaxed),
+            conflict_capacity_drops: state.conflict_capacity_drops.load(Ordering::Relaxed),
+            route_capacity_rejections: state.route_capacity_rejections.load(Ordering::Relaxed),
+        },
+    };
+    let mut rendered =
+        serde_json::to_string(&status).expect("control status contains only JSON-safe values");
+    rendered.push('\n');
+    rendered
 }
 
 fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &str) -> String {
@@ -1435,6 +1961,7 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                     state.delivered_handoff_failures.load(Ordering::Relaxed),
             )
         }
+        "STATUS JSON" | "CHECK LIVE" | "CHECK READY" => render_json_control_status(state),
         "ROUTES" => {
             let profile = state.hosting_profile();
             let public_snapshot = profile.public_snapshot();
@@ -1512,6 +2039,23 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 format!("{}\n", lines.join("\n"))
             }
         }
+        "RELOAD" => match reload_public_profile(state) {
+            ConfigReloadOutcome::NotPublic => {
+                "ERROR reload requires the public Hosting Profile\n".to_string()
+            }
+            ConfigReloadOutcome::Unchanged(generation) => {
+                format!("unchanged generation={generation}\n")
+            }
+            ConfigReloadOutcome::Accepted(generation) => {
+                format!("reloaded generation={generation}\n")
+            }
+            ConfigReloadOutcome::Rejected(generation) => {
+                format!("ERROR reload rejected generation={generation}\n")
+            }
+            ConfigReloadOutcome::Superseded(generation) => {
+                format!("unchanged generation={generation}\n")
+            }
+        },
         "STOP" => {
             shutdown.store(true, Ordering::Release);
             "stopping\n".to_string()
@@ -2632,19 +3176,21 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream, buffered: &[u8]) -> io:
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::bind_private_control_socket;
     use super::{
-        ActiveRoute, Backend, MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS,
-        MAX_VERIFIED_ROUTES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter,
-        ProbeMatch, ProxyState, WaitingClient, cache_negative, clear_conflict,
+        ActiveRoute, Backend, CONTROL_RESPONSE_LIMIT, MAX_PROBES, MAX_ROUTE_CONFLICTS,
+        MAX_ROUTE_DIAGNOSTICS, MAX_VERIFIED_ROUTES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL,
+        ProbeLimiter, ProbeMatch, ProxyState, WaitingClient, cache_negative, clear_conflict,
         collect_probe_matches, handle_connection, install_active_route, observe_workloads,
         prefer_https_per_project, reconcile_routes, reconcile_workloads, record_conflict,
         reload_public_profile, render_control_response, resolve_backend, supports_eager_discovery,
     };
+    #[cfg(unix)]
+    use super::{ControlAccess, ControlEndpointPolicy, ControlPeer, bind_private_control_socket};
     use crate::{
         admission::AdmissionRejection,
-        ingress_config::{HostingProfile, PublicIngressSnapshot, RouteDeclaration},
+        ingress_config::{
+            HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot, RouteDeclaration,
+        },
         production_paths::{IntentOwner, ProductionPaths},
         route_cache, update_config,
     };
@@ -2712,7 +3258,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("control.sock");
 
-        let listener = bind_private_control_socket(&path).unwrap();
+        let listener =
+            bind_private_control_socket(&path, ControlEndpointPolicy::development()).unwrap();
         let metadata = fs::symlink_metadata(&path).unwrap();
         assert!(metadata.file_type().is_socket());
         assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
@@ -2721,6 +3268,40 @@ mod tests {
         let client = UnixStream::connect(&path).unwrap();
         let (server, _) = listener.accept().unwrap();
         drop((client, server, listener));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_authorization_is_peer_authenticated_and_command_aware() {
+        let public = ControlEndpointPolicy::public(2000);
+        let root = ControlPeer { uid: 0, gid: 0 };
+        let service = ControlPeer {
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: 3000,
+        };
+        let administrator = ControlPeer {
+            uid: u32::MAX - 1,
+            gid: 2000,
+        };
+        let outsider = ControlPeer {
+            uid: u32::MAX,
+            gid: 3000,
+        };
+
+        for peer in [root, service, administrator] {
+            assert!(public.authorizes(peer, ControlAccess::ReadOnly));
+        }
+        assert!(public.authorizes(root, ControlAccess::Mutation));
+        assert!(!public.authorizes(service, ControlAccess::Mutation));
+        assert!(!public.authorizes(administrator, ControlAccess::Mutation));
+        assert!(!public.authorizes(outsider, ControlAccess::ReadOnly));
+        assert!(!public.authorizes(outsider, ControlAccess::Mutation));
+
+        let development = ControlEndpointPolicy::development();
+        assert!(development.authorizes(service, ControlAccess::ReadOnly));
+        assert!(development.authorizes(service, ControlAccess::Mutation));
+        assert!(development.authorizes(root, ControlAccess::Mutation));
+        assert!(!development.authorizes(outsider, ControlAccess::ReadOnly));
     }
 
     #[derive(Clone)]
@@ -3705,6 +4286,45 @@ mod tests {
                 .last()
                 .is_some_and(|line| line.starts_with("truncated\t")),
             "{diagnostics}"
+        );
+    }
+
+    #[test]
+    fn machine_status_bounds_degraded_route_details_and_response_bytes() {
+        let directory = tempdir().unwrap();
+        let routes = (0..MAX_ROUTE_DECLARATIONS)
+            .map(|index| {
+                let hostname = format!("route-{index:04}.example.test");
+                (
+                    hostname.clone(),
+                    RouteDeclaration {
+                        hostname,
+                        workload: format!("workload-{index:04}"),
+                        role: "https".to_string(),
+                        required: true,
+                    },
+                )
+            })
+            .collect();
+        let profile = HostingProfile::Public(Arc::new(PublicIngressSnapshot {
+            ingress_config: directory.path().join("ingress.toml"),
+            intent_owner: IntentOwner::EffectiveUser,
+            generation: 1,
+            listeners: None,
+            routes,
+        }));
+        let state = ProxyState::new_with_profile(directory.path().join("ports.toml"), profile);
+
+        let rendered = render_control_response(&state, &AtomicBool::new(false), "STATUS JSON");
+        assert!(rendered.len() as u64 <= CONTROL_RESPONSE_LIMIT);
+        let status = serde_json::from_str::<serde_json::Value>(&rendered).unwrap();
+        assert_eq!(
+            status["degraded_routes"].as_array().unwrap().len(),
+            MAX_ROUTE_DIAGNOSTICS
+        );
+        assert_eq!(
+            status["degraded_routes_omitted"],
+            MAX_ROUTE_DECLARATIONS - MAX_ROUTE_DIAGNOSTICS
         );
     }
 

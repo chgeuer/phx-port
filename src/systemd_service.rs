@@ -177,9 +177,11 @@ mod tests {
         for expected in [
             "User=phx-port",
             "Group=phx-port",
+            "SupplementaryGroups=phx-port-admin",
             "Sockets=phx-port-ipv4.socket phx-port-ipv6.socket",
             "Environment=PHX_PORT_CONFIG=/var/lib/phx-port/ports.toml",
             "Environment=PHX_PORT_RUNTIME_DIR=/run/phx-port",
+            "ExecStartPre=/usr/bin/chgrp phx-port-admin /run/phx-port",
             "ExecStart=/usr/local/bin/phx-port daemon --ingress-config /etc/phx-port/ingress.toml --listen 0.0.0.0:443 --listen [::]:443",
             "Restart=on-failure",
             "RestartSec=2s",

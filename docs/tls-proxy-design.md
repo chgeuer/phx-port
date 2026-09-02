@@ -352,24 +352,38 @@ speculative TLS traffic and warnings on ordinary clear-HTTP `main` listeners.
 Matching roles in different projects still invoke the hostname-conflict
 policy.
 
-The daemon exposes a current-user-only Unix control socket and supports:
+The daemon exposes a local Unix control socket and supports:
 
 ```text
 phx-port proxy status
+phx-port proxy status --json
+phx-port proxy check --live
+phx-port proxy check --ready
 phx-port proxy routes
+phx-port proxy reload
 phx-port proxy stop
 ```
 
-The socket is `$XDG_RUNTIME_DIR/phx-port/control.sock` when
-`XDG_RUNTIME_DIR` is set, and otherwise lives under a private
-`phx-port-runtime` directory beside the registry. The directory mode is
-`0700`; the socket mode is `0600`. Startup removes a stale socket but refuses
-to replace one whose daemon responds.
+In the development Hosting Profile, the socket is
+`$XDG_RUNTIME_DIR/phx-port/control.sock` when `XDG_RUNTIME_DIR` is set and
+otherwise lives under a private `phx-port-runtime` directory beside the
+registry. Its directory is mode `0700`, its socket is mode `0600`, and the
+current user retains full authority. Public ingress uses
+`$PHX_PORT_RUNTIME_DIR/control/control.sock`, with a service-owned,
+`phx-port-admin`-grouped mode `0750` directory and mode `0660` socket.
+Kernel peer credentials are checked for every connection. UID 0, the service
+UID, and `phx-port-admin` may read status, routes, and health; only UID 0 may
+reload or stop public ingress. Startup removes a stale socket only after its
+type, owner, group, and mode pass no-follow validation, and refuses to replace
+one whose daemon responds.
 
 `status` reports listener addresses, route and conflict counts, current and
 configured admission capacity, fixed worker and queue bounds, bounded
 rejection-reason counters, discovery resource usage, connection/discovery
 counters, handoff capacity skips, and handoff outcomes.
+`status --json`, `check --live`, and `check --ready` emit bounded schema-version
+1 JSON. Health checks exit 0 when the selected condition is true and 1 when it
+is false or cannot be queried.
 Admission saturation writes fixed-schema `event=ingress_overload` records to
 stderr at most once per bounded reason every ten seconds. Repeated rejections
 within the interval are counted and suppressed, then reported as one aggregate

@@ -51,8 +51,12 @@ USAGE:
     phx-port discover           Open a browser page to pick a running project
     phx-port daemon [--listen ADDRESS]... [--ingress-config PATH] [--run-as USER] [CAPACITY OPTIONS]
                                 Route TLS by SNI to live https/main workloads
-    phx-port proxy status       Show live daemon state and counters
+    phx-port proxy status [--json]
+                                Show live daemon state and counters
+    phx-port proxy check --live|--ready
+                                Check machine-readable daemon health
     phx-port proxy routes       Show persistently discovered TLS routes
+    phx-port proxy reload       Reload public ingress declarations
     phx-port proxy stop         Gracefully stop the running daemon
     phx-port proxy config check --file PATH
                                 Validate public intent, state, and runtime paths
@@ -1020,6 +1024,40 @@ fn main() {
                     process::exit(1);
                 }
             },
+            Some("status")
+                if args.get(2).map(String::as_str) == Some("--json") && args.len() == 3 =>
+            {
+                match proxy::query_control("STATUS JSON") {
+                    Ok(response) => print!("{response}"),
+                    Err(error) => {
+                        eprintln!("{error}");
+                        process::exit(1);
+                    }
+                }
+            }
+            Some("check")
+                if matches!(args.get(2).map(String::as_str), Some("--live" | "--ready"))
+                    && args.len() == 3 =>
+            {
+                let check = if args[2] == "--live" {
+                    proxy::HealthCheck::Live
+                } else {
+                    proxy::HealthCheck::Ready
+                };
+                match proxy::query_health(check) {
+                    Ok((response, satisfied)) => {
+                        print!("{response}");
+                        let _ = std::io::stdout().flush();
+                        if !satisfied {
+                            process::exit(1);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        process::exit(1);
+                    }
+                }
+            }
             Some("routes") if args.len() == 2 => match proxy::query_control("ROUTES") {
                 Ok(response) => print!("{response}"),
                 Err(_) => {
@@ -1035,6 +1073,13 @@ fn main() {
                         None => (config.clone(), route_cache::Storage::CombinedRegistry),
                     };
                     route_cache::print(&path, storage).unwrap_or_else(exit_registry_error);
+                }
+            },
+            Some("reload") if args.len() == 2 => match proxy::query_control("RELOAD") {
+                Ok(response) => print!("{response}"),
+                Err(error) => {
+                    eprintln!("{error}");
+                    process::exit(1);
                 }
             },
             Some("stop") if args.len() == 2 => match proxy::query_control("STOP") {
@@ -1064,6 +1109,10 @@ fn main() {
                     )
                     .unwrap_or_else(exit_registry_error);
                 paths.validate().unwrap_or_else(exit_registry_error);
+                #[cfg(unix)]
+                paths
+                    .validate_control_group()
+                    .unwrap_or_else(exit_registry_error);
                 println!(
                     "Valid public ingress config: {}\nPort Registry: {}\nDerived routes: {}\nRuntime root: {}",
                     args[4],
@@ -1105,7 +1154,7 @@ fn main() {
             },
             _ => {
                 eprintln!(
-                    "Usage: phx-port proxy <status|routes|stop|config|install-service|uninstall-service>"
+                    "Usage: phx-port proxy <status|check|routes|reload|stop|config|install-service|uninstall-service>"
                 );
                 process::exit(1);
             }

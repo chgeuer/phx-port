@@ -55,7 +55,6 @@ struct LaunchdJob {
 
 impl Drop for LaunchdJob {
     fn drop(&mut self) {
-        let _ = request(&self.control, "STOP");
         let _ = Command::new("launchctl")
             .args(["bootout", &self.target])
             .output();
@@ -183,6 +182,7 @@ fn real_launchd_job_adopts_named_socket_and_runs_as_owner() {
                </dict>\n\
                <key>RunAtLoad</key><true/>\n\
                <key>Umask</key><integer>63</integer>\n\
+               <key>InitGroups</key><true/>\n\
                <key>StandardOutPath</key><string>{stdout}</string>\n\
                <key>StandardErrorPath</key><string>{stderr}</string>\n\
              </dict>\n\
@@ -247,7 +247,7 @@ fn real_launchd_job_adopts_named_socket_and_runs_as_owner() {
             .permissions()
             .mode()
             & 0o7777,
-        0o600
+        0o660
     );
     assert!(
         fs::read_to_string(&stderr)
