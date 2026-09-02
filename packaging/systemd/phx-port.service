@@ -1,0 +1,50 @@
+[Unit]
+Description=phx-port public TLS ingress
+Documentation=https://github.com/chgeuer/phx-port
+Wants=network-online.target
+After=network-online.target phx-port-ipv4.socket phx-port-ipv6.socket
+Requires=phx-port-ipv4.socket phx-port-ipv6.socket
+
+[Service]
+Type=simple
+User=phx-port
+Group=phx-port
+Sockets=phx-port-ipv4.socket phx-port-ipv6.socket
+Environment=PHX_PORT_CONFIG=/var/lib/phx-port/ports.toml
+Environment=PHX_PORT_RUNTIME_DIR=/run/phx-port
+ExecStartPre=/usr/bin/install --directory --mode=0700 /run/phx-port/handoff
+ExecStart=/usr/local/bin/phx-port daemon --ingress-config /etc/phx-port/ingress.toml --listen 0.0.0.0:443 --listen [::]:443
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=65s
+LimitNOFILE=65536
+TasksMax=1024
+MemoryMax=70%
+UMask=0077
+RuntimeDirectory=phx-port
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
+StateDirectory=phx-port
+StateDirectoryMode=0700
+ConfigurationDirectory=phx-port
+ConfigurationDirectoryMode=0755
+ReadOnlyPaths=/etc/phx-port
+ReadWritePaths=/var/lib/phx-port /run/phx-port
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

@@ -262,7 +262,39 @@ and registry. It then runs `systemctl --user daemon-reload` and
 `systemctl --user enable --now phx-port.service`. The unit uses
 `Restart=on-failure` and allows 35 seconds for the daemon's bounded shutdown
 drain. `phx-port proxy uninstall-service` disables and stops the service,
-removes the unit, and reloads the user manager.
+removes the unit, and reloads the user manager. This command remains the
+development-profile user service and does not silently install or activate the
+public system service.
+
+The public Hosting Profile ships a system service plus separately named IPv4
+and IPv6 socket units under `packaging/systemd/`. The sockets own
+`0.0.0.0:443` and `[::]:443` and pass `tls-ipv4` and `tls-ipv6` descriptors.
+On Linux, daemon startup consumes activation metadata only when `LISTEN_PID`
+matches the current process and, when supplied, `LISTEN_PIDFDID` matches its
+pidfd identity. The descriptor/name counts must exactly match the configured
+listeners, and each name occurs once. Every descriptor must be a listening TCP
+socket on its configured address; the IPv6 descriptor must also be IPv6-only.
+Adopted descriptors become nonblocking and close-on-exec, and no direct bind
+occurs.
+
+The system service runs as the non-login `phx-port` identity with no effective
+capabilities. It uses systemd state, runtime, and configuration directory
+ownership; preserves the runtime root across service restart; creates the
+private handoff directory without deleting Workload endpoints; and grants
+writes only under `/var/lib/phx-port` and `/run/phx-port`. The accepted
+`LimitNOFILE=65536`, `TasksMax=1024`, restart delay, 65-second stop deadline,
+finite memory ceiling, address-family restriction, and filesystem/kernel
+sandbox are encoded in the shipped unit. The `MemoryMax=70%` value is a
+finite host guardrail, not a load-support claim, and should be tightened from
+measured ingress and Workload budgets.
+
+The ignored `real_systemd_unit_routes_writes_state_and_restarts_rootlessly`
+integration test installs uniquely named temporary system units on a Linux
+host. It exercises a certificate-verified relay through a real activated
+socket, persisted derived route state, the local control endpoint, a
+zero-capability non-root data-plane process, service restart, and routing after
+restart. It requires a system manager and noninteractive administrative access
+and removes only its own temporary unit and runtime paths.
 
 HTTPS workloads use a conventional named role:
 
@@ -318,8 +350,9 @@ string.
 `routes` returns the live active and conflicting route table while the daemon
 is reachable, then falls back to cached registry state for offline diagnostics.
 `stop` requests graceful shutdown: listeners and reconciliation stop accepting
-new work, existing relays receive up to 30 seconds to finish, and the control
-socket is removed.
+new work, existing relays receive up to 60 seconds in the public Hosting
+Profile or the existing 30 seconds in development, and the control socket is
+removed.
 
 ## Workload discovery
 

@@ -8,6 +8,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::DocumentMut;
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
@@ -489,40 +491,14 @@ fn ensure_directory_chain(path: &Path, description: &str, final_mode: u32) -> Re
         }
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    return Err(format!(
-                        "refusing symbolic link in {description} path: {}",
-                        current.display()
-                    ));
-                }
-                if !metadata.is_dir() {
-                    return Err(format!(
-                        "{description} path component {} is not a directory",
-                        current.display()
-                    ));
-                }
-                let owner = metadata.uid();
-                if owner != 0 && owner != expected_uid {
-                    return Err(format!(
-                        "{description} path component {} is owned by unexpected UID {owner}",
-                        current.display()
-                    ));
-                }
-                let mode = metadata.mode() & 0o7777;
-                let root_owned_sticky_directory = owner == 0 && mode & 0o1000 != 0;
-                if mode & 0o022 != 0 && !root_owned_sticky_directory {
-                    return Err(format!(
-                        "{description} path component {} is writable by group or other users",
-                        current.display()
-                    ));
-                }
+                validate_ensure_directory_component(&current, description, expected_uid, &metadata)?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mode = if current == path { final_mode } else { 0o700 };
                 let mut builder = fs::DirBuilder::new();
                 builder.mode(mode);
                 match builder.create(&current) {
-                    Ok(()) => {}
+                    Ok(()) => set_directory_mode_no_follow(&current, description, mode)?,
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                     Err(error) => {
                         return Err(format!(
@@ -531,6 +507,18 @@ fn ensure_directory_chain(path: &Path, description: &str, final_mode: u32) -> Re
                         ));
                     }
                 }
+                let metadata = fs::symlink_metadata(&current).map_err(|error| {
+                    format!(
+                        "cannot inspect newly created {description} path component {}: {error}",
+                        current.display()
+                    )
+                })?;
+                validate_ensure_directory_component(
+                    &current,
+                    description,
+                    expected_uid,
+                    &metadata,
+                )?;
             }
             Err(error) => {
                 return Err(format!(
@@ -539,6 +527,65 @@ fn ensure_directory_chain(path: &Path, description: &str, final_mode: u32) -> Re
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_directory_mode_no_follow(path: &Path, description: &str, mode: u32) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW);
+    let directory = options.open(path).map_err(|error| {
+        format!(
+            "cannot open newly created {description} path component {} without following links: {error}",
+            path.display()
+        )
+    })?;
+    if unsafe { nix::libc::fchmod(directory.as_raw_fd(), mode as nix::libc::mode_t) } == -1 {
+        return Err(format!(
+            "cannot set {description} path component {} to mode {mode:04o}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_ensure_directory_component(
+    path: &Path,
+    description: &str,
+    expected_uid: u32,
+    metadata: &fs::Metadata,
+) -> Result<(), String> {
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing symbolic link in {description} path: {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "{description} path component {} is not a directory",
+            path.display()
+        ));
+    }
+    let owner = metadata.uid();
+    if owner != 0 && owner != expected_uid {
+        return Err(format!(
+            "{description} path component {} is owned by unexpected UID {owner}",
+            path.display()
+        ));
+    }
+    let mode = metadata.mode() & 0o7777;
+    let root_owned_sticky_directory = owner == 0 && mode & 0o1000 != 0;
+    if mode & 0o022 != 0 && !root_owned_sticky_directory {
+        return Err(format!(
+            "{description} path component {} is writable by group or other users",
+            path.display()
+        ));
     }
     Ok(())
 }

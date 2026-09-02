@@ -1,0 +1,12 @@
+[Unit]
+Description=phx-port public IPv4 TLS listener
+
+[Socket]
+ListenStream=0.0.0.0:443
+FileDescriptorName=tls-ipv4
+Service=phx-port.service
+Backlog=1024
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

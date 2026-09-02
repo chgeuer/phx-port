@@ -1,6 +1,7 @@
 #[cfg(test)]
 use crate::ingress_limits::{IngressLimits, SystemCapacity};
 use crate::{
+    activated_listener::{self, ListenerOrigin},
     admission::{AdmissionController, AdmissionRejection, PreRoutingAdmission, RelayPermit},
     config_path, handoff,
     ingress_config::{
@@ -14,10 +15,9 @@ use crate::{
 };
 use native_tls::TlsConnector;
 use sha2::{Digest, Sha256};
-use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
@@ -45,7 +45,8 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(30);
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 const TLS_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 const TCP_FAILURE_THRESHOLD: u8 = 3;
-const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const DEVELOPMENT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const PUBLIC_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECTION_QUEUE_CAPACITY: usize = 1;
 const OVERLOAD_EVENT_INTERVAL: Duration = Duration::from_secs(10);
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
@@ -774,6 +775,12 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     } else {
         None
     };
+    let shutdown_drain_timeout = if production_paths.is_some() {
+        PUBLIC_SHUTDOWN_DRAIN_TIMEOUT
+    } else {
+        DEVELOPMENT_SHUTDOWN_DRAIN_TIMEOUT
+    };
+    let acquired_listeners = activated_listener::acquire(&listen_addresses)?;
     let registry = production_paths
         .as_ref()
         .map(|paths| paths.port_registry.clone())
@@ -791,13 +798,21 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         None,
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let mut listeners = Vec::new();
+    let mut listeners = Vec::with_capacity(acquired_listeners.len());
 
-    for address in &listen_addresses {
-        let listener = bind_listener(address)
-            .map_err(|error| format!("cannot listen on {address}: {error}"))?;
-        eprintln!("TLS proxy listening on {}", listener.local_addr().unwrap());
-        listeners.push(listener);
+    for acquired in acquired_listeners {
+        let address = acquired
+            .listener
+            .local_addr()
+            .map_err(|error| format!("cannot read listener address: {error}"))?;
+        match acquired.origin {
+            ListenerOrigin::Direct => eprintln!("TLS proxy listening on {address}"),
+            #[cfg(target_os = "linux")]
+            ListenerOrigin::Systemd(name) => {
+                eprintln!("Adopted systemd listener {name} on {address}")
+            }
+        }
+        listeners.push(acquired.listener);
     }
     *state
         .listeners
@@ -839,9 +854,6 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
 
     let mut listener_threads = Vec::new();
     for listener in listeners {
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| format!("cannot configure listener: {error}"))?;
         let state = Arc::clone(&state);
         let shutdown = Arc::clone(&shutdown);
         let connection_sender = connection_workers.sender();
@@ -913,7 +925,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     let _ = control_thread.join();
     let _ = reconciler_thread.join();
 
-    let drain_deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    let drain_deadline = Instant::now() + shutdown_drain_timeout;
     while state.admission.snapshot().global.in_use > 0 && Instant::now() < drain_deadline {
         thread::sleep(Duration::from_millis(50));
     }
@@ -936,27 +948,6 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     }
     eprintln!("TLS proxy stopped");
     Ok(())
-}
-
-fn bind_listener(address: &str) -> io::Result<TcpListener> {
-    let address: SocketAddr = address.parse().map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid socket address: {error}"),
-        )
-    })?;
-    let socket = Socket::new(
-        Domain::for_address(address),
-        Type::STREAM,
-        Some(Protocol::TCP),
-    )?;
-    socket.set_reuse_address(true)?;
-    if address.is_ipv6() {
-        socket.set_only_v6(true)?;
-    }
-    socket.bind(&address.into())?;
-    socket.listen(1024)?;
-    Ok(socket.into())
 }
 
 pub fn query_control(command: &str) -> Result<String, String> {
@@ -2595,7 +2586,7 @@ mod tests {
     use super::{
         ActiveRoute, Backend, MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS,
         MAX_VERIFIED_ROUTES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter,
-        ProbeMatch, ProxyState, WaitingClient, bind_listener, cache_negative, clear_conflict,
+        ProbeMatch, ProxyState, WaitingClient, cache_negative, clear_conflict,
         collect_probe_matches, handle_connection, install_active_route, observe_workloads,
         prefer_https_per_project, reconcile_routes, reconcile_workloads, record_conflict,
         reload_public_profile, render_control_response, resolve_backend, supports_eager_discovery,
@@ -3354,18 +3345,6 @@ mod tests {
 
         clear_conflict(&state, "www.example.com");
         assert!(state.conflicts.read().unwrap().is_empty());
-    }
-
-    #[test]
-    fn ipv6_listener_is_v6_only_so_ipv4_can_share_its_port() {
-        let Ok(ipv6) = bind_listener("[::]:0") else {
-            return;
-        };
-        let port = ipv6.local_addr().unwrap().port();
-        let ipv4 = bind_listener(&format!("0.0.0.0:{port}")).unwrap();
-
-        assert!(ipv6.local_addr().unwrap().is_ipv6());
-        assert!(ipv4.local_addr().unwrap().is_ipv4());
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::process;
 use std::time::{Duration, Instant};
 use toml_edit::DocumentMut;
 
+mod activated_listener;
 mod admission;
 #[cfg(test)]
 mod config_tests;

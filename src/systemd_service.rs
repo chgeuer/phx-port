@@ -6,6 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SERVICE_NAME: &str = "phx-port.service";
+#[cfg(test)]
+const PRODUCTION_SERVICE_UNIT: &str = include_str!("../packaging/systemd/phx-port.service");
+#[cfg(test)]
+const PRODUCTION_IPV4_SOCKET_UNIT: &str = include_str!("../packaging/systemd/phx-port-ipv4.socket");
+#[cfg(test)]
+const PRODUCTION_IPV6_SOCKET_UNIT: &str = include_str!("../packaging/systemd/phx-port-ipv6.socket");
 
 pub fn install(config: &Path) -> Result<PathBuf, String> {
     ensure_linux()?;
@@ -135,7 +141,10 @@ fn systemctl(args: &[&str]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{quote_unit_value, render_unit};
+    use super::{
+        PRODUCTION_IPV4_SOCKET_UNIT, PRODUCTION_IPV6_SOCKET_UNIT, PRODUCTION_SERVICE_UNIT,
+        quote_unit_value, render_unit,
+    };
     use std::path::Path;
 
     #[test]
@@ -160,6 +169,78 @@ mod tests {
         assert_eq!(
             quote_unit_value(Path::new("/tmp/a b/100%/a\"b\\c"), "test").unwrap(),
             "/tmp/a b/100%%/a\\\"b\\\\c"
+        );
+    }
+
+    #[test]
+    fn production_units_own_named_port_443_sockets_without_root_data_plane_privileges() {
+        for expected in [
+            "User=phx-port",
+            "Group=phx-port",
+            "Sockets=phx-port-ipv4.socket phx-port-ipv6.socket",
+            "Environment=PHX_PORT_CONFIG=/var/lib/phx-port/ports.toml",
+            "Environment=PHX_PORT_RUNTIME_DIR=/run/phx-port",
+            "ExecStart=/usr/local/bin/phx-port daemon --ingress-config /etc/phx-port/ingress.toml --listen 0.0.0.0:443 --listen [::]:443",
+            "Restart=on-failure",
+            "RestartSec=2s",
+            "TimeoutStopSec=65s",
+            "LimitNOFILE=65536",
+            "TasksMax=1024",
+            "MemoryMax=70%",
+            "RuntimeDirectory=phx-port",
+            "RuntimeDirectoryMode=0750",
+            "RuntimeDirectoryPreserve=restart",
+            "StateDirectory=phx-port",
+            "StateDirectoryMode=0700",
+            "ReadOnlyPaths=/etc/phx-port",
+            "ReadWritePaths=/var/lib/phx-port /run/phx-port",
+            "NoNewPrivileges=true",
+            "CapabilityBoundingSet=",
+            "AmbientCapabilities=",
+            "PrivateTmp=true",
+            "PrivateDevices=true",
+            "ProtectSystem=strict",
+            "ProtectHome=true",
+            "ProtectKernelTunables=true",
+            "ProtectKernelModules=true",
+            "ProtectControlGroups=true",
+            "RestrictSUIDSGID=true",
+            "LockPersonality=true",
+            "RestrictRealtime=true",
+            "SystemCallArchitectures=native",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        ] {
+            assert!(
+                PRODUCTION_SERVICE_UNIT.lines().any(|line| line == expected),
+                "production service is missing {expected:?}"
+            );
+        }
+        assert!(
+            !PRODUCTION_SERVICE_UNIT.contains("CAP_NET_BIND_SERVICE"),
+            "socket activation must not leave a bind capability in the service"
+        );
+
+        for (unit, address, name) in [
+            (
+                PRODUCTION_IPV4_SOCKET_UNIT,
+                "ListenStream=0.0.0.0:443",
+                "FileDescriptorName=tls-ipv4",
+            ),
+            (
+                PRODUCTION_IPV6_SOCKET_UNIT,
+                "ListenStream=[::]:443",
+                "FileDescriptorName=tls-ipv6",
+            ),
+        ] {
+            assert!(unit.lines().any(|line| line == address));
+            assert!(unit.lines().any(|line| line == name));
+            assert!(unit.lines().any(|line| line == "Service=phx-port.service"));
+            assert!(unit.lines().any(|line| line == "Backlog=1024"));
+        }
+        assert!(
+            PRODUCTION_IPV6_SOCKET_UNIT
+                .lines()
+                .any(|line| line == "BindIPv6Only=ipv6-only")
         );
     }
 }

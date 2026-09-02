@@ -41,8 +41,19 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd target/${{ matrix.target }}/release
+          mkdir systemd
+          cp ../../../packaging/systemd/phx-port.service \
+             ../../../packaging/systemd/phx-port-ipv4.socket \
+             ../../../packaging/systemd/phx-port-ipv6.socket systemd/
+          tar czf ../../../phx-port-${{ matrix.target }}.tar.gz \
+            ${{ matrix.artifact }} systemd
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../phx-port-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}

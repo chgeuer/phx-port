@@ -1,0 +1,13 @@
+[Unit]
+Description=phx-port public IPv6 TLS listener
+
+[Socket]
+ListenStream=[::]:443
+BindIPv6Only=ipv6-only
+FileDescriptorName=tls-ipv6
+Service=phx-port.service
+Backlog=1024
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

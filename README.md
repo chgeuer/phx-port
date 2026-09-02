@@ -347,9 +347,56 @@ On Linux, `install-service` writes
 `$XDG_CONFIG_HOME/systemd/user/phx-port.service` (or
 `~/.config/systemd/user/phx-port.service`), records absolute executable and
 registry paths, reloads the user manager, and enables and starts the service.
-The unit runs the daemon in the foreground with `Restart=on-failure`,
-`LimitNOFILE=65536`, and `TasksMax=1024`. `uninstall-service` disables and
-stops the service before removing the unit.
+This remains a development-profile user service that binds listeners directly;
+it does not activate production or replace a machine service. The unit runs the
+daemon in the foreground with `Restart=on-failure`, `LimitNOFILE=65536`,
+`TasksMax=1024`, and the existing 35-second service-manager stop deadline.
+`uninstall-service` disables and stops the service before removing the unit.
+
+The explicit public Hosting Profile ships separate system units in
+`packaging/systemd/` and in the Linux release archive's `systemd/` directory.
+Provision the non-login `phx-port` user and group, install the binary at
+`/usr/local/bin/phx-port`, install the root-owned ingress intent, then install
+and start all three units:
+
+```bash
+sudo install -o root -g root -m 0755 target/release/phx-port \
+  /usr/local/bin/phx-port
+sudo install -d -o root -g phx-port -m 0755 /etc/phx-port
+sudo install -o root -g phx-port -m 0640 ingress.toml \
+  /etc/phx-port/ingress.toml
+sudo install -o root -g root -m 0644 packaging/systemd/phx-port.service \
+  packaging/systemd/phx-port-ipv4.socket \
+  packaging/systemd/phx-port-ipv6.socket /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now phx-port-ipv4.socket phx-port-ipv6.socket \
+  phx-port.service
+```
+
+The IPv4 and IPv6 socket units own port 443 and pass descriptors named
+`tls-ipv4` and `tls-ipv6`. The unprivileged service accepts only the exact
+configured listening TCP sockets, sets them nonblocking and close-on-exec, and
+does not bind again. systemd creates private state/runtime roots; the service
+creates the mode `0700` handoff directory without removing Workload endpoints
+on restart. Its sandbox has no capabilities, restricts address families and
+writable paths, uses `LimitNOFILE=65536`, `TasksMax=1024`, a finite
+`MemoryMax=70%` ceiling, and allows five seconds beyond the public profile's
+60-second drain. Tune the memory ceiling downward for the measured host and
+Workload budget; it is a resource boundary, not a capacity claim. Development
+retains its existing 30-second daemon drain.
+
+The real system-manager regression uses an isolated loopback socket and
+temporary unit names so it does not disturb port 443:
+
+```bash
+cargo test --test systemd_socket_activation \
+  real_systemd_unit_routes_writes_state_and_restarts_rootlessly \
+  -- --ignored --exact
+```
+
+It requires a Linux system manager and noninteractive `sudo`; it proves
+certificate-verified routing, derived-state writes, local control, sandboxed
+non-root identity with no effective capabilities, and routing after restart.
 
 The daemon revalidates a persisted mapping before activating it in a new
 process. Newly active `https` workloads that present a no-SNI default
