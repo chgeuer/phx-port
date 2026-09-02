@@ -1770,8 +1770,7 @@ mod tests {
         accept, bind, listen, recv, recvmsg, send, socket,
     };
     use rcgen::{
-        BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
-        KeyPair, KeyUsagePurpose, PKCS_RSA_SHA256,
+        CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_RSA_SHA256,
     };
     use std::fs;
     #[cfg(target_os = "linux")]
@@ -1811,43 +1810,37 @@ mod tests {
     struct TestCertificate {
         certificate_pem: String,
         private_key_pem: String,
-        root_certificate_pem: String,
     }
 
     // Security.framework cannot import rcgen's unencrypted ECDSA PKCS#8 keys.
     const TEST_RSA_PRIVATE_KEY: &str = include_str!("../tests/fixtures/proxy-test-rsa-key.pem");
 
     impl TestCertificate {
-        fn for_hostname(hostname: &str) -> Self {
-            let mut issuer_params = CertificateParams::default();
-            issuer_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-            issuer_params.key_usages = vec![
-                KeyUsagePurpose::DigitalSignature,
-                KeyUsagePurpose::KeyCertSign,
-                KeyUsagePurpose::CrlSign,
-            ];
-            let issuer =
-                CertifiedIssuer::self_signed(issuer_params, KeyPair::generate().unwrap()).unwrap();
-
-            let signing_key =
-                KeyPair::from_pkcs8_pem_and_sign_algo(TEST_RSA_PRIVATE_KEY, &PKCS_RSA_SHA256)
-                    .unwrap();
+        fn parameters_for_hostname(hostname: &str) -> CertificateParams {
             let mut certificate_params =
                 CertificateParams::new(vec![hostname.to_string()]).unwrap();
             let now = SystemTime::now();
             certificate_params.not_before = (now - Duration::from_secs(24 * 60 * 60)).into();
             certificate_params.not_after = (now + Duration::from_secs(30 * 24 * 60 * 60)).into();
+            certificate_params.is_ca = IsCa::ExplicitNoCa;
             certificate_params.key_usages = vec![
                 KeyUsagePurpose::DigitalSignature,
                 KeyUsagePurpose::KeyEncipherment,
             ];
             certificate_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-            let cert = certificate_params.signed_by(&signing_key, &issuer).unwrap();
-            let root_certificate_pem = issuer.pem();
+            certificate_params
+        }
+
+        fn for_hostname(hostname: &str) -> Self {
+            let signing_key =
+                KeyPair::from_pkcs8_pem_and_sign_algo(TEST_RSA_PRIVATE_KEY, &PKCS_RSA_SHA256)
+                    .unwrap();
+            let cert = Self::parameters_for_hostname(hostname)
+                .self_signed(&signing_key)
+                .unwrap();
             Self {
                 certificate_pem: cert.pem(),
                 private_key_pem: TEST_RSA_PRIVATE_KEY.to_string(),
-                root_certificate_pem,
             }
         }
 
@@ -1855,13 +1848,20 @@ mod tests {
             let mut builder = TlsConnector::builder();
             builder.disable_built_in_roots(true);
             builder.add_root_certificate(
-                Certificate::from_pem(self.root_certificate_pem.as_bytes()).unwrap(),
+                Certificate::from_pem(self.certificate_pem.as_bytes()).unwrap(),
             );
             builder.build().unwrap()
         }
 
         fn unrelated_connector(hostname: &str) -> TlsConnector {
-            Self::for_hostname(hostname).connector()
+            let signing_key = KeyPair::generate().unwrap();
+            let cert = Self::parameters_for_hostname(hostname)
+                .self_signed(&signing_key)
+                .unwrap();
+            let mut builder = TlsConnector::builder();
+            builder.disable_built_in_roots(true);
+            builder.add_root_certificate(Certificate::from_pem(cert.pem().as_bytes()).unwrap());
+            builder.build().unwrap()
         }
     }
 
