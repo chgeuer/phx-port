@@ -13,6 +13,7 @@ const DEFAULT_ROLE: &str = "main";
 const FIRST_ASSIGNED_PORT: i64 = 4001;
 const LAST_ASSIGNED_PORT: i64 = u16::MAX as i64;
 const MAX_ROLE_LENGTH: usize = 128;
+const MAX_PRIVATE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 pub type LogicalAssignments = BTreeMap<(String, String), u16>;
 
@@ -20,6 +21,21 @@ pub type LogicalAssignments = BTreeMap<(String, String), u16>;
 pub enum RegistrySecurity {
     Development,
     LogicalWorkload,
+    DerivedState,
+}
+
+impl RegistrySecurity {
+    fn is_private(self) -> bool {
+        self != Self::Development
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Development => "development registry",
+            Self::LogicalWorkload => "logical Workload registry",
+            Self::DerivedState => "derived route state",
+        }
+    }
 }
 
 pub fn validate_workload_id(workload_id: &str) -> Result<(), String> {
@@ -74,6 +90,17 @@ pub fn read_logical_assignments(path: &Path) -> Result<LogicalAssignments, Strin
     logical_assignments(&document)
 }
 
+pub fn read_existing_logical_registry(path: &Path) -> Result<DocumentMut, String> {
+    let security = RegistrySecurity::LogicalWorkload;
+    let path = prepare_existing_private_path(path, security.description())?;
+    require_existing_private_file(&path, security.description())?;
+    let lock = open_lock(&path, security)?;
+    FileExt::lock_shared(&lock)
+        .map_err(|error| format!("cannot lock {} for reading: {error}", path.display()))?;
+    let result = load_required(&path, security);
+    unlock(lock, &path, result)
+}
+
 pub fn update<R>(
     path: &Path,
     security: RegistrySecurity,
@@ -92,6 +119,47 @@ pub fn update<R>(
         }
         write_atomic(&path, &document, security)?;
         Ok(result)
+    })();
+    unlock(lock, &path, result)
+}
+
+pub fn write_new(
+    path: &Path,
+    security: RegistrySecurity,
+    document: &DocumentMut,
+) -> Result<(), String> {
+    let path = prepare_path(path, security)?;
+    reject_existing(&path, security.description())?;
+    let lock = open_lock(&path, security)?;
+    FileExt::lock_exclusive(&lock)
+        .map_err(|error| format!("cannot lock {} for creation: {error}", path.display()))?;
+    let result = (|| {
+        reject_existing(&path, security.description())?;
+        if security == RegistrySecurity::LogicalWorkload {
+            validate_logical_assignments(document)?;
+        }
+        write_atomic(&path, document, security)
+    })();
+    unlock(lock, &path, result)
+}
+
+pub fn replace(
+    path: &Path,
+    security: RegistrySecurity,
+    document: &DocumentMut,
+) -> Result<(), String> {
+    let path = prepare_path(path, security)?;
+    let lock = open_lock(&path, security)?;
+    FileExt::lock_exclusive(&lock)
+        .map_err(|error| format!("cannot lock {} for replacement: {error}", path.display()))?;
+    let result = (|| {
+        if security.is_private() {
+            validate_existing_private_file(&path, security.description())?;
+        }
+        if security == RegistrySecurity::LogicalWorkload {
+            validate_logical_assignments(document)?;
+        }
+        write_atomic(&path, document, security)
     })();
     unlock(lock, &path, result)
 }
@@ -135,11 +203,11 @@ pub fn allocate(
 }
 
 fn prepare_path(path: &Path, security: RegistrySecurity) -> Result<PathBuf, String> {
-    if security == RegistrySecurity::Development {
+    if !security.is_private() {
         ensure_development_parent(path)?;
         return Ok(path.to_path_buf());
     }
-    prepare_logical_registry_path(path)
+    prepare_private_path(path, security.description())
 }
 
 fn ensure_development_parent(path: &Path) -> Result<(), String> {
@@ -150,35 +218,76 @@ fn ensure_development_parent(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn prepare_logical_registry_path(path: &Path) -> Result<PathBuf, String> {
+fn prepare_private_path(path: &Path, kind: &str) -> Result<PathBuf, String> {
+    let absolute = resolve_private_path(path, kind)?;
+    let parent = absolute
+        .parent()
+        .expect("resolved private state path has a parent");
+    secure_directory_path(parent, kind, true)?;
+    Ok(absolute)
+}
+
+fn prepare_existing_private_path(path: &Path, kind: &str) -> Result<PathBuf, String> {
+    let absolute = resolve_private_path(path, kind)?;
+    let parent = absolute
+        .parent()
+        .expect("resolved private state path has a parent");
+    secure_directory_path(parent, kind, false)?;
+    Ok(absolute)
+}
+
+fn resolve_private_path(path: &Path, kind: &str) -> Result<PathBuf, String> {
     if path.file_name().is_none() {
-        return Err("logical Workload registry path must name a file".to_string());
+        return Err(format!("{kind} path must name a file"));
     }
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
-            .map_err(|error| format!("cannot resolve registry path: {error}"))?
+            .map_err(|error| format!("cannot resolve {kind} path: {error}"))?
             .join(path)
     };
+    let absolute = normalize_private_path(&absolute, kind)?;
     let parent = absolute
         .parent()
-        .ok_or_else(|| "logical Workload registry path must have a parent directory".to_string())?;
-    ensure_secure_directory_path(parent)?;
+        .ok_or_else(|| format!("{kind} path must have a parent directory"))?;
+    if parent == Path::new(std::path::MAIN_SEPARATOR_STR) {
+        return Err(format!(
+            "{kind} path must use a private directory below the filesystem root"
+        ));
+    }
     Ok(absolute)
 }
 
-fn ensure_secure_directory_path(path: &Path) -> Result<(), String> {
+fn normalize_private_path(path: &Path, kind: &str) -> Result<PathBuf, String> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(format!(
+                    "{kind} path must not contain '..': {}",
+                    path.display()
+                ));
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
+}
+
+fn secure_directory_path(path: &Path, kind: &str, create_missing: bool) -> Result<(), String> {
     let mut current = PathBuf::new();
-    let components = path.components().collect::<Vec<_>>();
-    for (index, component) in components.iter().enumerate() {
+    for component in path.components() {
         match component {
             Component::Prefix(prefix) => current.push(prefix.as_os_str()),
             Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
             Component::CurDir => continue,
             Component::ParentDir => {
                 return Err(format!(
-                    "logical Workload registry path must not contain '..': {}",
+                    "{kind} path must not contain '..': {}",
                     path.display()
                 ));
             }
@@ -189,28 +298,20 @@ fn ensure_secure_directory_path(path: &Path) -> Result<(), String> {
         }
 
         match fs::symlink_metadata(&current) {
-            Ok(metadata) => validate_directory(
-                &current,
-                &metadata,
-                index == components.len().saturating_sub(1),
-            )?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                create_private_directory(&current)?;
+            Ok(metadata) => validate_directory(&current, &metadata, current == path, kind)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && create_missing => {
+                create_private_directory(&current, kind)?;
                 let metadata = fs::symlink_metadata(&current).map_err(|error| {
                     format!(
-                        "cannot inspect newly created registry directory {}: {error}",
+                        "cannot inspect newly created {kind} directory {}: {error}",
                         current.display()
                     )
                 })?;
-                validate_directory(
-                    &current,
-                    &metadata,
-                    index == components.len().saturating_sub(1),
-                )?;
+                validate_directory(&current, &metadata, current == path, kind)?;
             }
             Err(error) => {
                 return Err(format!(
-                    "cannot inspect registry directory {}: {error}",
+                    "cannot inspect {kind} directory {}: {error}",
                     current.display()
                 ));
             }
@@ -220,26 +321,26 @@ fn ensure_secure_directory_path(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn create_private_directory(path: &Path) -> Result<(), String> {
+fn create_private_directory(path: &Path, kind: &str) -> Result<(), String> {
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
     match builder.create(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(format!(
-            "cannot create private registry directory {}: {error}",
+            "cannot create private {kind} directory {}: {error}",
             path.display()
         )),
     }
 }
 
 #[cfg(not(unix))]
-fn create_private_directory(path: &Path) -> Result<(), String> {
+fn create_private_directory(path: &Path, kind: &str) -> Result<(), String> {
     match fs::create_dir(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(format!(
-            "cannot create registry directory {}: {error}",
+            "cannot create {kind} directory {}: {error}",
             path.display()
         )),
     }
@@ -250,16 +351,17 @@ fn validate_directory(
     path: &Path,
     metadata: &fs::Metadata,
     final_parent: bool,
+    kind: &str,
 ) -> Result<(), String> {
     if metadata.file_type().is_symlink() {
         return Err(format!(
-            "refusing symbolic link in logical Workload registry path: {}",
+            "refusing symbolic link in {kind} path: {}",
             path.display()
         ));
     }
     if !metadata.is_dir() {
         return Err(format!(
-            "logical Workload registry path component is not a directory: {}",
+            "{kind} path component is not a directory: {}",
             path.display()
         ));
     }
@@ -270,14 +372,14 @@ fn validate_directory(
     if final_parent {
         if owner != effective_uid {
             return Err(format!(
-                "logical Workload registry directory {} must be owned by effective UID {}",
+                "{kind} directory {} must be owned by effective UID {}",
                 path.display(),
                 effective_uid
             ));
         }
         if mode != 0o700 {
             return Err(format!(
-                "logical Workload registry directory {} must have mode 0700, got {mode:04o}",
+                "{kind} directory {} must have mode 0700, got {mode:04o}",
                 path.display()
             ));
         }
@@ -286,14 +388,14 @@ fn validate_directory(
 
     if owner != 0 && owner != effective_uid {
         return Err(format!(
-            "registry path ancestor {} is owned by unexpected UID {owner}",
+            "{kind} path ancestor {} is owned by unexpected UID {owner}",
             path.display()
         ));
     }
     let root_owned_sticky_directory = owner == 0 && mode & 0o1000 != 0;
     if mode & 0o022 != 0 && !root_owned_sticky_directory {
         return Err(format!(
-            "registry path ancestor {} is writable by group or other users",
+            "{kind} path ancestor {} is writable by group or other users",
             path.display()
         ));
     }
@@ -305,16 +407,17 @@ fn validate_directory(
     path: &Path,
     metadata: &fs::Metadata,
     _final_parent: bool,
+    kind: &str,
 ) -> Result<(), String> {
     if metadata.file_type().is_symlink() {
         return Err(format!(
-            "refusing symbolic link in logical Workload registry path: {}",
+            "refusing symbolic link in {kind} path: {}",
             path.display()
         ));
     }
     if !metadata.is_dir() {
         return Err(format!(
-            "logical Workload registry path component is not a directory: {}",
+            "{kind} path component is not a directory: {}",
             path.display()
         ));
     }
@@ -327,14 +430,15 @@ fn open_lock(path: &Path, security: RegistrySecurity) -> Result<File, String> {
         .and_then(|name| name.to_str())
         .unwrap_or("phx-ports.toml");
     let lock_path = path.with_file_name(format!("{file_name}.lock"));
-    if security == RegistrySecurity::LogicalWorkload {
-        reject_symlink(&lock_path, "registry lock")?;
+    let lock_kind = format!("{} lock", security.description());
+    if security.is_private() {
+        reject_symlink(&lock_path, &lock_kind)?;
     }
 
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]
-    if security == RegistrySecurity::LogicalWorkload {
+    if security.is_private() {
         options
             .mode(0o600)
             .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
@@ -342,22 +446,44 @@ fn open_lock(path: &Path, security: RegistrySecurity) -> Result<File, String> {
     let file = options
         .open(&lock_path)
         .map_err(|error| format!("cannot open registry lock {}: {error}", lock_path.display()))?;
-    if security == RegistrySecurity::LogicalWorkload {
-        validate_private_file(&file, &lock_path, "registry lock")?;
+    if security.is_private() {
+        validate_private_file(&file, &lock_path, &lock_kind)?;
     }
     Ok(file)
 }
 
 fn load(path: &Path, security: RegistrySecurity) -> Result<DocumentMut, String> {
+    load_with_policy(path, security, false)
+}
+
+fn load_required(path: &Path, security: RegistrySecurity) -> Result<DocumentMut, String> {
+    load_with_policy(path, security, true)
+}
+
+fn load_with_policy(
+    path: &Path,
+    security: RegistrySecurity,
+    require_existing: bool,
+) -> Result<DocumentMut, String> {
     let mut document = match read_content(path, security)? {
         Some(content) => content
             .parse::<DocumentMut>()
             .map_err(|error| format!("cannot parse {}: {error}", path.display()))?,
+        None if require_existing => {
+            return Err(format!(
+                "{} {} does not exist",
+                security.description(),
+                path.display()
+            ));
+        }
+        None if security == RegistrySecurity::DerivedState => DocumentMut::new(),
         None => "[ports]\n"
             .parse::<DocumentMut>()
             .expect("the empty registry document is valid TOML"),
     };
-
+    if security == RegistrySecurity::DerivedState {
+        return Ok(document);
+    }
     if security == RegistrySecurity::LogicalWorkload
         && document.get("ports").is_some()
         && !document.contains_table("ports")
@@ -373,7 +499,7 @@ fn load(path: &Path, security: RegistrySecurity) -> Result<DocumentMut, String> 
 }
 
 fn read_content(path: &Path, security: RegistrySecurity) -> Result<Option<String>, String> {
-    if security == RegistrySecurity::Development {
+    if !security.is_private() {
         return match fs::read_to_string(path) {
             Ok(content) => Ok(Some(content)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -381,7 +507,8 @@ fn read_content(path: &Path, security: RegistrySecurity) -> Result<Option<String
         };
     }
 
-    reject_symlink(path, "logical Workload registry")?;
+    let kind = security.description();
+    reject_symlink(path, kind)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -390,13 +517,21 @@ fn read_content(path: &Path, security: RegistrySecurity) -> Result<Option<String
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(format!(
-                "cannot open logical Workload registry {}: {error}",
-                path.display()
-            ));
+            return Err(format!("cannot open {kind} {}: {error}", path.display()));
         }
     };
-    validate_private_file(&file, path, "logical Workload registry")?;
+    validate_private_file(&file, path, kind)?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {kind} {}: {error}", path.display()))?
+        .len();
+    if length > MAX_PRIVATE_FILE_BYTES {
+        return Err(format!(
+            "{kind} {} exceeds the {} byte limit",
+            path.display(),
+            MAX_PRIVATE_FILE_BYTES
+        ));
+    }
     let mut content = String::new();
     file.read_to_string(&mut content)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
@@ -412,6 +547,45 @@ fn reject_symlink(path: &Path, kind: &str) -> Result<(), String> {
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("cannot inspect {kind} {}: {error}", path.display())),
+    }
+}
+
+fn reject_existing(path: &Path, kind: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(format!(
+            "refusing to overwrite existing {kind}: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot inspect {kind} {}: {error}", path.display())),
+    }
+}
+
+fn validate_existing_private_file(path: &Path, kind: &str) -> Result<(), String> {
+    reject_symlink(path, kind)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    match options.open(path) {
+        Ok(file) => validate_private_file(&file, path, kind),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot open {kind} {}: {error}", path.display())),
+    }
+}
+
+fn require_existing_private_file(path: &Path, kind: &str) -> Result<(), String> {
+    reject_symlink(path, kind)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    match options.open(path) {
+        Ok(file) => validate_private_file(&file, path, kind),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(format!("{kind} {} does not exist", path.display()))
+        }
+        Err(error) => Err(format!("cannot open {kind} {}: {error}", path.display())),
     }
 }
 
@@ -549,26 +723,27 @@ fn write_atomic(
     AtomicFile::new(path, AllowOverwrite)
         .write(|file| {
             #[cfg(unix)]
-            if security == RegistrySecurity::LogicalWorkload {
+            if security.is_private() {
                 file.set_permissions(fs::Permissions::from_mode(0o600))?;
             }
             file.write_all(content.as_bytes())
         })
         .map_err(|error| format!("cannot atomically write {}: {error}", path.display()))?;
 
-    if security == RegistrySecurity::LogicalWorkload {
-        reject_symlink(path, "logical Workload registry")?;
+    if security.is_private() {
+        let kind = security.description();
+        reject_symlink(path, kind)?;
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
         options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
         let file = options.open(path).map_err(|error| {
             format!(
-                "cannot validate logical Workload registry {} after write: {error}",
+                "cannot validate {kind} {} after write: {error}",
                 path.display()
             )
         })?;
-        validate_private_file(&file, path, "logical Workload registry")?;
+        validate_private_file(&file, path, kind)?;
     }
     Ok(())
 }
@@ -583,5 +758,21 @@ fn unlock<R>(lock: File, path: &Path, result: Result<R, String>) -> Result<R, St
             unlock_result?;
             Ok(value)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_private_path;
+    use std::path::Path;
+
+    #[test]
+    fn private_paths_are_lexically_normalized_before_validation() {
+        let raw = Path::new("/var/lib/phx-port/./ports.toml");
+        let normalized = resolve_private_path(raw, "logical Workload registry").unwrap();
+        assert_eq!(
+            normalized.as_os_str(),
+            Path::new("/var/lib/phx-port/ports.toml").as_os_str()
+        );
     }
 }

@@ -19,6 +19,9 @@ fn tempdir() -> std::io::Result<tempfile::TempDir> {
 struct RunningDaemon {
     child: Option<std::process::Child>,
     home: tempfile::TempDir,
+    ingress_config: Option<std::path::PathBuf>,
+    public_registry: Option<std::path::PathBuf>,
+    public_runtime: Option<std::path::PathBuf>,
 }
 
 #[cfg(unix)]
@@ -32,6 +35,19 @@ impl RunningDaemon {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let home = tempdir().unwrap();
+        let (public_registry, public_runtime) = if ingress_config.is_some() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let state = home.path().join("state");
+            fs::create_dir(&state).unwrap();
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+            let runtime = home.path().join("runtime");
+            fs::create_dir(&runtime).unwrap();
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o750)).unwrap();
+            (Some(state.join("ports.toml")), Some(runtime))
+        } else {
+            (None, None)
+        };
         let mut command = Command::new(env!("CARGO_BIN_EXE_phx-port"));
         command
             .args([
@@ -59,6 +75,9 @@ impl RunningDaemon {
             .stderr(Stdio::piped());
         if let Some(path) = ingress_config {
             command.args(["--ingress-config", path.to_str().unwrap()]);
+            command
+                .env("PHX_PORT_CONFIG", public_registry.as_ref().unwrap())
+                .env("PHX_PORT_RUNTIME_DIR", public_runtime.as_ref().unwrap());
         }
         if let Some(workload_id) = workload_id {
             command.env("PHX_PORT_WORKLOAD_ID", workload_id);
@@ -69,6 +88,9 @@ impl RunningDaemon {
         let mut daemon = Self {
             child: Some(child),
             home,
+            ingress_config: ingress_config.map(Path::to_path_buf),
+            public_registry,
+            public_runtime,
         };
 
         let control = daemon.control_path();
@@ -87,20 +109,35 @@ impl RunningDaemon {
     }
 
     fn control_path(&self) -> std::path::PathBuf {
+        if let Some(runtime) = &self.public_runtime {
+            return runtime.join("control/control.sock");
+        }
         self.home
             .path()
             .join(".config/phx-port-runtime/control.sock")
     }
 
     fn control(&self, command: &str) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_phx-port"))
+        let mut process = Command::new(env!("CARGO_BIN_EXE_phx-port"));
+        process
             .args(["proxy", command])
             .env("HOME", self.home.path())
-            .env_remove("PHX_PORT_CONFIG")
-            .env_remove("PHX_PORT_INGRESS_CONFIG")
-            .env_remove("XDG_RUNTIME_DIR")
-            .output()
-            .unwrap()
+            .env_remove("XDG_RUNTIME_DIR");
+        if let Some(ingress_config) = &self.ingress_config {
+            process
+                .env("PHX_PORT_INGRESS_CONFIG", ingress_config)
+                .env("PHX_PORT_CONFIG", self.public_registry.as_ref().unwrap())
+                .env(
+                    "PHX_PORT_RUNTIME_DIR",
+                    self.public_runtime.as_ref().unwrap(),
+                );
+        } else {
+            process
+                .env_remove("PHX_PORT_CONFIG")
+                .env_remove("PHX_PORT_INGRESS_CONFIG")
+                .env_remove("PHX_PORT_RUNTIME_DIR");
+        }
+        process.output().unwrap()
     }
 
     fn status(&self) -> String {
@@ -527,6 +564,145 @@ fn logical_registry_rejects_unsafe_modes_and_duplicate_ports() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn production_migration_splits_derived_state_and_preserves_rollback_source() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().unwrap();
+    let source_directory = directory.path().join("legacy");
+    fs::create_dir(&source_directory).unwrap();
+    fs::set_permissions(&source_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let missing_source = source_directory.join("missing.toml");
+    let missing_output = directory.path().join("missing-output");
+    let missing = Command::new(env!("CARGO_BIN_EXE_phx-port"))
+        .args([
+            "proxy",
+            "config",
+            "migrate",
+            "--from",
+            missing_source.to_str().unwrap(),
+            "--output",
+            missing_output.to_str().unwrap(),
+        ])
+        .env_remove("PHX_PORT_CONFIG")
+        .env_remove("PHX_PORT_INGRESS_CONFIG")
+        .env_remove("PHX_PORT_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("does not exist"),
+        "unexpected missing source error: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert!(!missing_output.exists());
+    assert!(!source_directory.join("missing.toml.lock").exists());
+
+    let source = source_directory.join("combined.toml");
+    let original = "\
+[ports]
+
+[ports.contoso-web]
+https = 4401
+
+[discovered_routes.\"www.contoso.test\"]
+project = \"contoso-web\"
+role = \"https\"
+certificate_fingerprint = \"AA:BB\"
+last_verified_unix = 1788321600
+";
+    fs::write(&source, original).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+    let output_directory = directory.path().join("production-state");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_phx-port"))
+        .args([
+            "proxy",
+            "config",
+            "migrate",
+            "--from",
+            source.to_str().unwrap(),
+            "--output",
+            output_directory.to_str().unwrap(),
+        ])
+        .env_remove("PHX_PORT_CONFIG")
+        .env_remove("PHX_PORT_INGRESS_CONFIG")
+        .env_remove("PHX_PORT_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "migration failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(fs::read_to_string(&source).unwrap(), original);
+    assert_eq!(
+        fs::metadata(&source).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&output_directory)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o700
+    );
+
+    let ports_path = output_directory.join("ports.toml");
+    let routes_path = output_directory.join("routes.toml");
+    for path in [&ports_path, &routes_path] {
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+            0o600,
+            "{} was not private",
+            path.display()
+        );
+    }
+
+    let ports = fs::read_to_string(&ports_path)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        ports["ports"]["contoso-web"]["https"].as_integer(),
+        Some(4401)
+    );
+    assert!(ports.get("discovered_routes").is_none());
+
+    let routes = fs::read_to_string(&routes_path)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        routes["discovered_routes"]["www.contoso.test"]["project"].as_str(),
+        Some("contoso-web")
+    );
+    assert!(routes.get("ports").is_none());
+
+    let repeated = Command::new(env!("CARGO_BIN_EXE_phx-port"))
+        .args([
+            "proxy",
+            "config",
+            "migrate",
+            "--from",
+            source.to_str().unwrap(),
+            "--output",
+            output_directory.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!repeated.status.success());
+    assert!(
+        String::from_utf8_lossy(&repeated.stderr).contains("refusing to overwrite"),
+        "unexpected repeated migration error: {}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    assert_eq!(fs::read_to_string(&source).unwrap(), original);
+}
+
 #[test]
 fn ingress_config_requires_public_mode_for_cli_and_environment_activation() {
     let directory = tempdir().unwrap();
@@ -546,6 +722,8 @@ fn ingress_config_requires_public_mode_for_cli_and_environment_activation() {
             "daemon",
             "--ingress-config",
             public_config.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
             "--active-connections",
             "0",
         ])
@@ -561,7 +739,13 @@ fn ingress_config_requires_public_mode_for_cli_and_environment_activation() {
     );
 
     let accepted_environment = Command::new(env!("CARGO_BIN_EXE_phx-port"))
-        .args(["daemon", "--active-connections", "0"])
+        .args([
+            "daemon",
+            "--listen",
+            "127.0.0.1:0",
+            "--active-connections",
+            "0",
+        ])
         .env("PHX_PORT_INGRESS_CONFIG", &public_config)
         .output()
         .unwrap();
@@ -578,6 +762,8 @@ fn ingress_config_requires_public_mode_for_cli_and_environment_activation() {
             "daemon",
             "--ingress-config",
             non_public_config.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
             "--active-connections",
             "0",
         ])
@@ -590,6 +776,39 @@ fn ingress_config_requires_public_mode_for_cli_and_environment_activation() {
             .contains("must declare [ingress] mode = \"public\""),
         "non-public ingress config did not fail closed: {}",
         String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_loopback_public_listener_requires_root_owned_intent() {
+    let directory = tempdir().unwrap();
+    let public_config = directory.path().join("public.toml");
+    fs::write(
+        &public_config,
+        "[ingress]\nmode = \"public\"\n\
+         [ingress.hosts.\"www.example.com\"]\n\
+         workload = \"contoso-web\"\nrole = \"https\"\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_phx-port"))
+        .args([
+            "daemon",
+            "--listen",
+            "0.0.0.0:0",
+            "--ingress-config",
+            public_config.to_str().unwrap(),
+        ])
+        .env_remove("PHX_PORT_INGRESS_CONFIG")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("owned by unexpected UID"),
+        "unexpected intent ownership error: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

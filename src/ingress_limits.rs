@@ -1,6 +1,6 @@
 use crate::ingress_config::HostingProfile;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -260,7 +260,12 @@ impl DaemonConfig {
         if listen_addresses.is_empty() {
             listen_addresses.extend(["0.0.0.0:443".to_string(), "[::]:443".to_string()]);
         }
-        let hosting_profile = HostingProfile::load(ingress_config)?;
+        let loopback_only = listen_addresses.iter().all(|address| {
+            address
+                .parse::<SocketAddr>()
+                .is_ok_and(|address| address.ip().is_loopback())
+        });
+        let hosting_profile = HostingProfile::load_for_daemon(ingress_config, loopback_only)?;
 
         Ok(Self {
             listen_addresses,

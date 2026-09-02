@@ -1,7 +1,10 @@
-use crate::{port_registry, tls_client_hello};
+use crate::{
+    port_registry,
+    production_paths::{IntentOwner, read_ingress_intent},
+    tls_client_hello,
+};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use toml_edit::DocumentMut;
@@ -20,6 +23,7 @@ pub struct RouteDeclaration {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicIngressSnapshot {
     pub ingress_config: PathBuf,
+    pub intent_owner: IntentOwner,
     pub generation: u64,
     pub routes: BTreeMap<String, RouteDeclaration>,
 }
@@ -31,13 +35,35 @@ pub enum HostingProfile {
 }
 
 impl HostingProfile {
+    #[cfg(test)]
     pub fn load(explicit_path: Option<PathBuf>) -> Result<Self, String> {
-        Self::load_with_env(explicit_path, std::env::var_os(INGRESS_CONFIG_ENV))
+        Self::load_with_owner(explicit_path, IntentOwner::EffectiveUser)
+    }
+
+    pub fn load_for_daemon(
+        explicit_path: Option<PathBuf>,
+        loopback_only: bool,
+    ) -> Result<Self, String> {
+        let owner = if loopback_only {
+            IntentOwner::EffectiveUser
+        } else {
+            IntentOwner::Root
+        };
+        Self::load_with_owner(explicit_path, owner)
+    }
+
+    pub fn load_for_check(path: PathBuf) -> Result<Self, String> {
+        Self::load_with_env(Some(path), None, IntentOwner::Root)
+    }
+
+    fn load_with_owner(explicit_path: Option<PathBuf>, owner: IntentOwner) -> Result<Self, String> {
+        Self::load_with_env(explicit_path, std::env::var_os(INGRESS_CONFIG_ENV), owner)
     }
 
     fn load_with_env(
         explicit_path: Option<PathBuf>,
         environment_path: Option<OsString>,
+        owner: IntentOwner,
     ) -> Result<Self, String> {
         let path = match explicit_path {
             Some(path) => path,
@@ -53,12 +79,11 @@ impl HostingProfile {
             return Err("ingress config path must not be empty".to_string());
         }
 
-        Self::load_public(path, 1)
+        Self::load_public(path, 1, owner)
     }
 
-    fn load_public(path: PathBuf, generation: u64) -> Result<Self, String> {
-        let content = fs::read_to_string(&path)
-            .map_err(|error| format!("cannot read ingress config {}: {error}", path.display()))?;
+    fn load_public(path: PathBuf, generation: u64, owner: IntentOwner) -> Result<Self, String> {
+        let content = read_ingress_intent(&path, owner)?;
         let document = content
             .parse::<DocumentMut>()
             .map_err(|error| format!("cannot parse ingress config {}: {error}", path.display()))?;
@@ -205,6 +230,7 @@ impl HostingProfile {
 
         Ok(Self::Public(Arc::new(PublicIngressSnapshot {
             ingress_config: path,
+            intent_owner: owner,
             generation,
             routes,
         })))
@@ -218,7 +244,11 @@ impl HostingProfile {
             .generation
             .checked_add(1)
             .ok_or_else(|| "ingress config generation overflowed".to_string())?;
-        let candidate = Self::load_public(current.ingress_config.clone(), generation)?;
+        let candidate = Self::load_public(
+            current.ingress_config.clone(),
+            generation,
+            current.intent_owner,
+        )?;
         let Self::Public(candidate_snapshot) = &candidate else {
             unreachable!("loading an explicit public config returns a public snapshot");
         };
@@ -254,6 +284,7 @@ impl HostingProfile {
 #[cfg(test)]
 mod tests {
     use super::{HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot, RouteDeclaration};
+    use crate::production_paths::IntentOwner;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::fs;
@@ -285,7 +316,7 @@ mod tests {
     #[test]
     fn development_is_the_default_without_an_explicit_ingress_config() {
         assert_eq!(
-            HostingProfile::load_with_env(None, None).unwrap(),
+            HostingProfile::load_with_env(None, None, IntentOwner::EffectiveUser).unwrap(),
             HostingProfile::Development
         );
     }
@@ -296,7 +327,9 @@ mod tests {
         let public = directory.path().join("public.toml");
         write_public_config(&public, "WWW.Example.COM.", "contoso-web");
 
-        let from_cli = HostingProfile::load_with_env(Some(public.clone()), None).unwrap();
+        let from_cli =
+            HostingProfile::load_with_env(Some(public.clone()), None, IntentOwner::EffectiveUser)
+                .unwrap();
         let mut routes = BTreeMap::new();
         routes.insert(
             "www.example.com".to_string(),
@@ -306,6 +339,7 @@ mod tests {
             from_cli,
             HostingProfile::Public(Arc::new(PublicIngressSnapshot {
                 ingress_config: public.clone(),
+                intent_owner: IntentOwner::EffectiveUser,
                 generation: 1,
                 routes,
             }))
@@ -315,13 +349,19 @@ mod tests {
             Some(&route("www.example.com", "contoso-web", true))
         );
         assert!(from_cli.route("undeclared.example.com").is_none());
-        let from_environment =
-            HostingProfile::load_with_env(None, Some(public.clone().into_os_string())).unwrap();
+        let from_environment = HostingProfile::load_with_env(
+            None,
+            Some(public.clone().into_os_string()),
+            IntentOwner::EffectiveUser,
+        )
+        .unwrap();
         assert_eq!(from_environment, from_cli);
 
         let development = directory.path().join("development.toml");
         fs::write(&development, "[ingress]\nmode = \"development\"\n").unwrap();
-        let error = HostingProfile::load_with_env(Some(development), None).unwrap_err();
+        let error =
+            HostingProfile::load_with_env(Some(development), None, IntentOwner::EffectiveUser)
+                .unwrap_err();
         assert!(error.contains("must declare [ingress] mode = \"public\""));
     }
 
@@ -332,7 +372,7 @@ mod tests {
 
         fs::write(&config, "[ingress]\nmode = \"public\"\n").unwrap();
         assert!(
-            HostingProfile::load_with_env(Some(config.clone()), None)
+            HostingProfile::load_with_env(Some(config.clone()), None, IntentOwner::EffectiveUser,)
                 .unwrap_err()
                 .contains("[ingress.hosts] Route Declarations")
         );
@@ -344,7 +384,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            HostingProfile::load_with_env(Some(config.clone()), None)
+            HostingProfile::load_with_env(Some(config.clone()), None, IntentOwner::EffectiveUser,)
                 .unwrap_err()
                 .contains("unknown_sni = \"reject\"")
         );
@@ -356,7 +396,8 @@ mod tests {
              [ingress.hosts.\"api.example.com\"]\nworkload = \"api-web\"\nrole = \"https\"\n",
         )
         .unwrap();
-        let profile = HostingProfile::load_with_env(Some(config), None).unwrap();
+        let profile =
+            HostingProfile::load_with_env(Some(config), None, IntentOwner::EffectiveUser).unwrap();
         let snapshot = profile.public_snapshot().unwrap();
         assert_eq!(snapshot.routes.len(), 2);
         assert!(snapshot.routes["www.example.com"].required);
@@ -375,7 +416,9 @@ mod tests {
              [ingress.hosts.\"www.example.com\"]\nworkload = \"second-web\"\nrole = \"https\"\n",
         )
         .unwrap();
-        let error = HostingProfile::load_with_env(Some(config.clone()), None).unwrap_err();
+        let error =
+            HostingProfile::load_with_env(Some(config.clone()), None, IntentOwner::EffectiveUser)
+                .unwrap_err();
         assert!(
             error.contains("both normalize to \"www.example.com\""),
             "{error}"
@@ -388,7 +431,9 @@ mod tests {
              [ingress.hosts.\"www.example.com\"]\nworkload = \"second-web\"\nrole = \"https\"\n",
         )
         .unwrap();
-        let error = HostingProfile::load_with_env(Some(config.clone()), None).unwrap_err();
+        let error =
+            HostingProfile::load_with_env(Some(config.clone()), None, IntentOwner::EffectiveUser)
+                .unwrap_err();
         assert!(error.contains("cannot parse ingress config"), "{error}");
 
         let mut content = String::from("[ingress]\nmode = \"public\"\n");
@@ -399,7 +444,8 @@ mod tests {
             ));
         }
         fs::write(&config, content).unwrap();
-        let error = HostingProfile::load_with_env(Some(config), None).unwrap_err();
+        let error = HostingProfile::load_with_env(Some(config), None, IntentOwner::EffectiveUser)
+            .unwrap_err();
         assert!(
             error.contains("exceeding the limit of 1000"),
             "unexpected declaration bound error: {error}"
@@ -435,7 +481,12 @@ mod tests {
                 ),
             )
             .unwrap();
-            let error = HostingProfile::load_with_env(Some(config.clone()), None).unwrap_err();
+            let error = HostingProfile::load_with_env(
+                Some(config.clone()),
+                None,
+                IntentOwner::EffectiveUser,
+            )
+            .unwrap_err();
             assert!(error.contains(expected), "unexpected error: {error}");
         }
 
@@ -447,7 +498,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            HostingProfile::load_with_env(Some(config), None)
+            HostingProfile::load_with_env(Some(config), None, IntentOwner::EffectiveUser)
                 .unwrap_err()
                 .contains("required must be a boolean")
         );
@@ -458,7 +509,9 @@ mod tests {
         let directory = tempdir().unwrap();
         let config = directory.path().join("ingress.toml");
         write_public_config(&config, "www.example.com", "contoso-web");
-        let profile = HostingProfile::load_with_env(Some(config.clone()), None).unwrap();
+        let profile =
+            HostingProfile::load_with_env(Some(config.clone()), None, IntentOwner::EffectiveUser)
+                .unwrap();
 
         fs::write(
             &config,
@@ -483,7 +536,9 @@ mod tests {
 
     #[test]
     fn an_empty_environment_path_fails_instead_of_falling_back_to_development() {
-        let error = HostingProfile::load_with_env(None, Some(OsString::new())).unwrap_err();
+        let error =
+            HostingProfile::load_with_env(None, Some(OsString::new()), IntentOwner::EffectiveUser)
+                .unwrap_err();
         assert_eq!(error, "PHX_PORT_INGRESS_CONFIG must not be empty");
     }
 }

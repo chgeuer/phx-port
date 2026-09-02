@@ -19,6 +19,7 @@ mod handoff_stream;
 mod ingress_config;
 mod ingress_limits;
 mod port_registry;
+mod production_paths;
 mod proxy;
 mod route_cache;
 mod systemd_service;
@@ -51,6 +52,10 @@ USAGE:
     phx-port proxy status       Show live daemon state and counters
     phx-port proxy routes       Show persistently discovered TLS routes
     phx-port proxy stop         Gracefully stop the running daemon
+    phx-port proxy config check --file PATH
+                                Validate public intent, state, and runtime paths
+    phx-port proxy config migrate --from FILE --output DIRECTORY
+                                Split a combined registry without modifying it
     phx-port proxy install-service
                                 Install and start the systemd user service
     phx-port proxy uninstall-service
@@ -1015,7 +1020,20 @@ fn main() {
             },
             Some("routes") if args.len() == 2 => match proxy::query_control("ROUTES") {
                 Ok(response) => print!("{response}"),
-                Err(_) => route_cache::print(&config),
+                Err(_) => {
+                    let (path, storage) = match env::var_os("PHX_PORT_INGRESS_CONFIG") {
+                        Some(value) if value.is_empty() => exit_registry_error(
+                            "PHX_PORT_INGRESS_CONFIG must not be empty".to_string(),
+                        ),
+                        Some(_) => {
+                            let paths = production_paths::ProductionPaths::from_environment()
+                                .unwrap_or_else(exit_registry_error);
+                            (paths.route_cache, route_cache::Storage::SeparateState)
+                        }
+                        None => (config.clone(), route_cache::Storage::CombinedRegistry),
+                    };
+                    route_cache::print(&path, storage).unwrap_or_else(exit_registry_error);
+                }
             },
             Some("stop") if args.len() == 2 => match proxy::query_control("STOP") {
                 Ok(response) => print!("{response}"),
@@ -1024,6 +1042,51 @@ fn main() {
                     process::exit(1);
                 }
             },
+            Some("config")
+                if args.get(2).map(String::as_str) == Some("check")
+                    && args.get(3).map(String::as_str) == Some("--file")
+                    && args.len() == 5 =>
+            {
+                let profile =
+                    ingress_config::HostingProfile::load_for_check(PathBuf::from(&args[4]))
+                        .unwrap_or_else(exit_registry_error);
+                debug_assert!(profile.public_snapshot().is_some());
+                let paths = production_paths::ProductionPaths::from_environment()
+                    .unwrap_or_else(exit_registry_error);
+                paths
+                    .validate_intent_separation(
+                        &profile
+                            .public_snapshot()
+                            .expect("checked config is public")
+                            .ingress_config,
+                    )
+                    .unwrap_or_else(exit_registry_error);
+                paths.validate().unwrap_or_else(exit_registry_error);
+                println!(
+                    "Valid public ingress config: {}\nPort Registry: {}\nDerived routes: {}\nRuntime root: {}",
+                    args[4],
+                    paths.port_registry.display(),
+                    paths.route_cache.display(),
+                    paths.runtime_root.display()
+                );
+            }
+            Some("config")
+                if args.get(2).map(String::as_str) == Some("migrate")
+                    && args.get(3).map(String::as_str) == Some("--from")
+                    && args.get(5).map(String::as_str) == Some("--output")
+                    && args.len() == 7 =>
+            {
+                let migrated = production_paths::migrate_combined_registry(
+                    Path::new(&args[4]),
+                    Path::new(&args[6]),
+                )
+                .unwrap_or_else(exit_registry_error);
+                println!(
+                    "Port Registry: {}\nDerived routes: {}",
+                    migrated.port_registry.display(),
+                    migrated.route_cache.display()
+                );
+            }
             Some("install-service") if args.len() == 2 => match systemd_service::install(&config) {
                 Ok(path) => println!("Installed and started {}", path.display()),
                 Err(error) => {
@@ -1040,7 +1103,7 @@ fn main() {
             },
             _ => {
                 eprintln!(
-                    "Usage: phx-port proxy <status|routes|stop|install-service|uninstall-service>"
+                    "Usage: phx-port proxy <status|routes|stop|config|install-service|uninstall-service>"
                 );
                 process::exit(1);
             }

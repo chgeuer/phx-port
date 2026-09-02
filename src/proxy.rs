@@ -7,7 +7,9 @@ use crate::{
         HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot, RouteDeclaration,
     },
     ingress_limits::{DaemonConfig, ValidatedIngressLimits},
-    is_port_open, port_registry, read_config, route_cache, tls_client_hello,
+    is_port_open, port_registry,
+    production_paths::ProductionPaths,
+    read_config, route_cache, tls_client_hello,
     worker_pool::BoundedWorkerPool,
 };
 use native_tls::TlsConnector;
@@ -25,9 +27,11 @@ use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(250);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
@@ -248,6 +252,7 @@ impl std::fmt::Display for OverloadEvent {
 
 struct ProxyState {
     config: PathBuf,
+    production_paths: Option<ProductionPaths>,
     hosting_profile: RwLock<HostingProfile>,
     handoff_runtime: Option<PathBuf>,
     limits: ValidatedIngressLimits,
@@ -292,6 +297,7 @@ struct ProxyState {
 impl ProxyState {
     fn with_limits(
         config: PathBuf,
+        production_paths: Option<ProductionPaths>,
         hosting_profile: HostingProfile,
         handoff_runtime: Option<PathBuf>,
         limits: ValidatedIngressLimits,
@@ -300,6 +306,7 @@ impl ProxyState {
         let admission = AdmissionController::new(&limits);
         Self {
             config,
+            production_paths,
             hosting_profile: RwLock::new(hosting_profile),
             handoff_runtime,
             limits,
@@ -353,6 +360,37 @@ impl ProxyState {
         self.hosting_profile().public_snapshot()
     }
 
+    fn route_cache(&self) -> Option<(&Path, route_cache::Storage)> {
+        let profile = self
+            .hosting_profile
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.route_cache_for_profile(&profile)
+    }
+
+    fn route_cache_for_profile(
+        &self,
+        profile: &HostingProfile,
+    ) -> Option<(&Path, route_cache::Storage)> {
+        match (&self.production_paths, profile) {
+            (Some(paths), HostingProfile::Public(_)) => {
+                Some((&paths.route_cache, route_cache::Storage::SeparateState))
+            }
+            (None, HostingProfile::Public(_)) => None,
+            (_, HostingProfile::Development) => {
+                Some((&self.config, route_cache::Storage::CombinedRegistry))
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn control_socket_path(&self) -> PathBuf {
+        self.production_paths
+            .as_ref()
+            .map(ProductionPaths::control_socket)
+            .unwrap_or_else(development_control_socket_path)
+    }
+
     #[cfg(test)]
     fn new(config: PathBuf) -> Self {
         Self::new_with_profile(config, HostingProfile::Development)
@@ -369,7 +407,7 @@ impl ProxyState {
                 2,
             )
             .unwrap();
-        Self::with_limits(config, hosting_profile, None, limits, None)
+        Self::with_limits(config, None, hosting_profile, None, limits, None)
     }
 
     #[cfg(test)]
@@ -387,7 +425,14 @@ impl ProxyState {
                 2,
             )
             .unwrap();
-        Self::with_limits(config, hosting_profile, None, limits, Some(tls_connector))
+        Self::with_limits(
+            config,
+            None,
+            hosting_profile,
+            None,
+            limits,
+            Some(tls_connector),
+        )
     }
 
     #[cfg(test)]
@@ -408,10 +453,37 @@ impl ProxyState {
             .unwrap();
         Self::with_limits(
             config,
+            None,
             hosting_profile,
             Some(handoff_runtime),
             limits,
             Some(tls_connector),
+        )
+    }
+
+    #[cfg(test)]
+    fn new_with_production_paths(
+        hosting_profile: HostingProfile,
+        production_paths: ProductionPaths,
+    ) -> Self {
+        let limits = IngressLimits::default()
+            .validate(
+                SystemCapacity {
+                    file_descriptors: None,
+                    tasks: None,
+                },
+                2,
+            )
+            .unwrap();
+        let config = production_paths.port_registry.clone();
+        let handoff_runtime = production_paths.runtime_root.clone();
+        Self::with_limits(
+            config,
+            Some(production_paths),
+            hosting_profile,
+            Some(handoff_runtime),
+            limits,
+            None,
         )
     }
 
@@ -624,6 +696,21 @@ fn reload_public_profile(state: &ProxyState) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
+    if let Some((route_cache_path, route_cache_storage)) = state.route_cache() {
+        let targets = replacement_snapshot
+            .routes
+            .iter()
+            .map(|(hostname, declaration)| {
+                (
+                    hostname.clone(),
+                    (declaration.workload.clone(), declaration.role.clone()),
+                )
+            })
+            .collect();
+        if route_cache::retain_targets(route_cache_path, route_cache_storage, &targets).is_err() {
+            eprintln!("event=route_state_update result=failed");
+        }
+    }
     clear_config_reload_failure(state);
     eprintln!(
         "event=ingress_config_reload result=accepted generation={} declared_routes={}",
@@ -676,10 +763,30 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         hosting_profile,
     } = config;
     let limits = limits.validate_for_startup(task_budget, listen_addresses.len())?;
+    let production_paths = if hosting_profile.public_snapshot().is_some() {
+        let paths = ProductionPaths::from_environment()?;
+        let snapshot = hosting_profile
+            .public_snapshot()
+            .expect("public profile has an ingress snapshot");
+        paths.validate_intent_separation(&snapshot.ingress_config)?;
+        paths.prepare_for_startup()?;
+        Some(paths)
+    } else {
+        None
+    };
+    let registry = production_paths
+        .as_ref()
+        .map(|paths| paths.port_registry.clone())
+        .unwrap_or_else(config_path);
+    let handoff_runtime = production_paths
+        .as_ref()
+        .map(|paths| paths.runtime_root.clone())
+        .or_else(handoff::runtime_override);
     let state = Arc::new(ProxyState::with_limits(
-        config_path(),
+        registry,
+        production_paths,
         hosting_profile,
-        handoff::runtime_override(),
+        handoff_runtime,
         limits,
         None,
     ));
@@ -855,7 +962,7 @@ fn bind_listener(address: &str) -> io::Result<TcpListener> {
 pub fn query_control(command: &str) -> Result<String, String> {
     #[cfg(unix)]
     {
-        let mut stream = UnixStream::connect(control_socket_path())
+        let mut stream = UnixStream::connect(client_control_socket_path()?)
             .map_err(|error| format!("TLS proxy daemon is not reachable: {error}"))?;
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -879,7 +986,18 @@ pub fn query_control(command: &str) -> Result<String, String> {
 }
 
 #[cfg(unix)]
-fn control_socket_path() -> PathBuf {
+fn client_control_socket_path() -> Result<PathBuf, String> {
+    if let Some(value) = std::env::var_os("PHX_PORT_INGRESS_CONFIG") {
+        if value.is_empty() {
+            return Err("PHX_PORT_INGRESS_CONFIG must not be empty".to_string());
+        }
+        return ProductionPaths::from_environment().map(|paths| paths.control_socket());
+    }
+    Ok(development_control_socket_path())
+}
+
+#[cfg(unix)]
+fn development_control_socket_path() -> PathBuf {
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(runtime).join("phx-port").join("control.sock");
     }
@@ -891,20 +1009,174 @@ fn control_socket_path() -> PathBuf {
 }
 
 #[cfg(unix)]
+fn bind_private_control_socket(path: &Path) -> Result<UnixListener, String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "control socket has no parent directory".to_string())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    for attempt in 0..16_u8 {
+        let staging = directory.join(format!(
+            ".p{:x}{:04x}{attempt:x}",
+            std::process::id(),
+            nonce & 0xffff
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&staging) {
+            Ok(()) => {
+                std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|error| {
+                        let _ = std::fs::remove_dir(&staging);
+                        format!(
+                            "cannot secure control socket staging directory {}: {error}",
+                            staging.display()
+                        )
+                    })?;
+                return publish_control_socket(path, &staging);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot create control socket staging directory {}: {error}",
+                    staging.display()
+                ));
+            }
+        }
+    }
+
+    Err("cannot allocate a private control socket staging directory".to_string())
+}
+
+#[cfg(unix)]
+fn publish_control_socket(path: &Path, staging: &Path) -> Result<UnixListener, String> {
+    let staged_path = staging.join("s");
+    let listener = match UnixListener::bind(&staged_path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            let _ = std::fs::remove_dir(staging);
+            return Err(format!(
+                "cannot bind staged control socket {}: {error}",
+                staged_path.display()
+            ));
+        }
+    };
+    if let Err(error) =
+        std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o600))
+    {
+        remove_staged_control_socket(&staged_path, staging);
+        return Err(format!("cannot secure staged control socket: {error}"));
+    }
+    let metadata = std::fs::symlink_metadata(&staged_path)
+        .map_err(|error| format!("cannot inspect staged control socket: {error}"));
+    match metadata {
+        Ok(metadata)
+            if metadata.file_type().is_socket()
+                && metadata.uid() == nix::unistd::geteuid().as_raw()
+                && metadata.mode() & 0o7777 == 0o600 => {}
+        Ok(_) => {
+            remove_staged_control_socket(&staged_path, staging);
+            return Err("staged control socket has unsafe ownership or mode".to_string());
+        }
+        Err(error) => {
+            remove_staged_control_socket(&staged_path, staging);
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = std::fs::hard_link(&staged_path, path) {
+        remove_staged_control_socket(&staged_path, staging);
+        return Err(format!(
+            "cannot atomically publish control socket {}: {error}",
+            path.display()
+        ));
+    }
+    if let Err(error) = std::fs::remove_file(&staged_path) {
+        let _ = std::fs::remove_file(path);
+        remove_staged_control_socket(&staged_path, staging);
+        return Err(format!(
+            "cannot remove staged control socket {}: {error}",
+            staged_path.display()
+        ));
+    }
+    if let Err(error) = std::fs::remove_dir(staging) {
+        let _ = std::fs::remove_file(path);
+        return Err(format!(
+            "cannot remove control socket staging directory {}: {error}",
+            staging.display()
+        ));
+    }
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect published control socket: {error}"))?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        let _ = std::fs::remove_file(path);
+        return Err(format!(
+            "published control socket {} has unsafe ownership or mode",
+            path.display()
+        ));
+    }
+
+    Ok(listener)
+}
+
+#[cfg(unix)]
+fn remove_staged_control_socket(path: &Path, directory: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir(directory);
+}
+
+#[cfg(unix)]
 fn start_control_server(
     state: Arc<ProxyState>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(PathBuf, thread::JoinHandle<()>), String> {
-    let path = control_socket_path();
+    let path = state.control_socket_path();
     let directory = path
         .parent()
         .ok_or_else(|| "control socket has no parent directory".to_string())?;
-    std::fs::create_dir_all(directory)
-        .map_err(|error| format!("cannot create control directory: {error}"))?;
-    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("cannot secure control directory: {error}"))?;
+    if let Some(paths) = &state.production_paths {
+        paths.ensure_control_directory()?;
+    } else {
+        crate::production_paths::ensure_owned_directory(
+            directory,
+            "development control directory",
+            0o700,
+        )?;
+    }
 
-    if path.exists() {
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+                return Err(format!(
+                    "refusing unsafe existing control socket path {}",
+                    path.display()
+                ));
+            }
+            if metadata.uid() != nix::unistd::geteuid().as_raw()
+                || metadata.mode() & 0o7777 != 0o600
+            {
+                return Err(format!(
+                    "existing control socket {} has unsafe ownership or mode",
+                    path.display()
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect control socket {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    if std::fs::symlink_metadata(&path).is_ok() {
         if UnixStream::connect(&path).is_ok() {
             return Err(format!(
                 "another TLS proxy daemon is already using {}",
@@ -915,10 +1187,18 @@ fn start_control_server(
             .map_err(|error| format!("cannot remove stale control socket: {error}"))?;
     }
 
-    let listener = UnixListener::bind(&path)
-        .map_err(|error| format!("cannot bind control socket {}: {error}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("cannot secure control socket: {error}"))?;
+    let listener = bind_private_control_socket(&path)?;
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| format!("cannot inspect control socket after publication: {error}"))?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err(format!(
+            "bound control socket {} has unsafe ownership or mode",
+            path.display()
+        ));
+    }
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("cannot configure control socket: {error}"))?;
@@ -1373,7 +1653,10 @@ fn resolve_backend(hostname: &str, state: &ProxyState) -> Result<Backend, String
             activate_declared_route(hostname, &declaration, snapshot.generation, backend, state)
         });
     }
-    let cached = route_cache::load(&state.config, hostname);
+    let (route_cache_path, route_cache_storage) = state
+        .route_cache()
+        .expect("development mode has combined route storage");
+    let cached = route_cache::load(route_cache_path, hostname, route_cache_storage)?;
     let candidates = candidate_backends(&state.config, cached.as_ref());
     observe_workloads(state, &candidates);
 
@@ -1658,7 +1941,16 @@ fn reconcile_workloads(state: &ProxyState) {
                 }
                 continue;
             }
-            let cached = route_cache::load(&state.config, &hostname);
+            let Some((route_cache_path, route_cache_storage)) = state.route_cache() else {
+                continue;
+            };
+            let cached = match route_cache::load(route_cache_path, &hostname, route_cache_storage) {
+                Ok(cached) => cached,
+                Err(_) => {
+                    eprintln!("event=route_state_read result=failed");
+                    continue;
+                }
+            };
             let candidates = candidate_backends(&state.config, cached.as_ref());
             let result =
                 state.discover_once(&hostname, || discover_backend(&hostname, state, candidates));
@@ -1915,7 +2207,16 @@ fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRou
         return;
     }
 
-    let cached = route_cache::load(&state.config, hostname);
+    let Some((route_cache_path, route_cache_storage)) = state.route_cache() else {
+        return;
+    };
+    let cached = match route_cache::load(route_cache_path, hostname, route_cache_storage) {
+        Ok(cached) => cached,
+        Err(_) => {
+            eprintln!("event=route_state_read result=failed");
+            return;
+        }
+    };
     let candidates = candidate_backends(&state.config, cached.as_ref())
         .into_iter()
         .filter(|backend| backend != &incumbent.backend)
@@ -1996,6 +2297,7 @@ fn install_active_route(
         }
         (None, HostingProfile::Development) => {}
     }
+    let route_cache = state.route_cache_for_profile(&profile);
 
     let mut routes = state
         .routes
@@ -2011,6 +2313,16 @@ fn install_active_route(
             "verified route capacity of {MAX_VERIFIED_ROUTES} is exhausted"
         ));
     }
+    if let Some((route_cache_path, route_cache_storage)) = route_cache {
+        route_cache::store(
+            route_cache_path,
+            route_cache_storage,
+            hostname,
+            &matched.backend.project,
+            &matched.backend.role,
+            &matched.certificate_fingerprint,
+        )?;
+    }
     routes.insert(
         hostname.to_string(),
         ActiveRoute {
@@ -2024,15 +2336,6 @@ fn install_active_route(
     drop(routes);
     drop(profile);
 
-    if declaration_generation.is_none() {
-        route_cache::store(
-            &state.config,
-            hostname,
-            &matched.backend.project,
-            &matched.backend.role,
-            &matched.certificate_fingerprint,
-        );
-    }
     Ok(())
 }
 
@@ -2079,8 +2382,11 @@ fn deactivate_route(state: &ProxyState, hostname: &str, remove_cached: bool, rea
     if removed {
         eprintln!("Deactivated TLS route {hostname}: {reason}");
     }
-    if remove_cached {
-        route_cache::remove(&state.config, hostname);
+    if remove_cached
+        && let Some((route_cache_path, route_cache_storage)) = state.route_cache()
+        && route_cache::remove(route_cache_path, route_cache_storage, hostname).is_err()
+    {
+        eprintln!("event=route_state_update result=failed");
     }
 }
 
@@ -2284,6 +2590,8 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream, buffered: &[u8]) -> io:
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::bind_private_control_socket;
     use super::{
         ActiveRoute, Backend, MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS,
         MAX_VERIFIED_ROUTES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter,
@@ -2295,6 +2603,7 @@ mod tests {
     use crate::{
         admission::AdmissionRejection,
         ingress_config::{HostingProfile, PublicIngressSnapshot, RouteDeclaration},
+        production_paths::{IntentOwner, ProductionPaths},
         route_cache, update_config,
     };
     #[cfg(target_os = "linux")]
@@ -2318,7 +2627,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
@@ -2343,6 +2654,23 @@ mod tests {
             last_tls_check: Instant::now(),
             tcp_failures: 0,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_is_private_when_published() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("control.sock");
+
+        let listener = bind_private_control_socket(&path).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+
+        let client = UnixStream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        drop((client, server, listener));
     }
 
     #[derive(Clone)]
@@ -2509,6 +2837,7 @@ mod tests {
         };
         HostingProfile::Public(Arc::new(PublicIngressSnapshot {
             ingress_config: PathBuf::from("ingress.toml"),
+            intent_owner: IntentOwner::EffectiveUser,
             generation: 1,
             routes: BTreeMap::from([(hostname.to_string(), declaration)]),
         }))
@@ -2585,6 +2914,7 @@ mod tests {
         .collect();
         let profile = HostingProfile::Public(Arc::new(PublicIngressSnapshot {
             ingress_config: PathBuf::from("ingress.toml"),
+            intent_owner: IntentOwner::EffectiveUser,
             generation: 1,
             routes,
         }));
@@ -3126,6 +3456,76 @@ mod tests {
         assert!(status.contains("undeclared_registrations=1"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn public_route_state_is_private_and_never_modifies_stable_assignments() {
+        const HOSTNAME: &str = "www.example.test";
+
+        let directory = tempdir().unwrap();
+        let state_directory = directory.path().join("state");
+        fs::create_dir(&state_directory).unwrap();
+        let registry = write_logical_registry(&state_directory, &[("contoso-web", 4401)]);
+        let runtime = directory.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o750)).unwrap();
+        let route_state = state_directory.join("routes.toml");
+        let paths = ProductionPaths {
+            port_registry: registry.clone(),
+            route_cache: route_state.clone(),
+            runtime_root: runtime,
+        };
+        let state =
+            ProxyState::new_with_production_paths(public_profile(HOSTNAME, "contoso-web"), paths);
+        let assignments_before = fs::read(&registry).unwrap();
+        let profile = state.hosting_profile.read().unwrap();
+        let (selected_cache, storage) = state.route_cache_for_profile(&profile).unwrap();
+        assert_eq!(selected_cache, route_state);
+        assert_eq!(storage, route_cache::Storage::SeparateState);
+        drop(profile);
+
+        install_active_route(
+            &state,
+            HOSTNAME,
+            ProbeMatch {
+                backend: Backend {
+                    project: "contoso-web".to_string(),
+                    role: "https".to_string(),
+                    port: 4401,
+                },
+                certificate_fingerprint: "AA:BB".to_string(),
+            },
+            Some(1),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&registry).unwrap(), assignments_before);
+        assert!(
+            fs::read_to_string(&registry)
+                .unwrap()
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap()
+                .get("discovered_routes")
+                .is_none()
+        );
+        let cached = route_cache::load(&route_state, HOSTNAME, route_cache::Storage::SeparateState)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.project, "contoso-web");
+        assert_eq!(cached.role, "https");
+        assert_eq!(
+            fs::metadata(&route_state).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(state_directory.join("routes.toml.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+    }
+
     #[test]
     fn reload_is_atomic_and_stale_certificate_results_cannot_cross_generations() {
         let directory = tempdir().unwrap();
@@ -3394,12 +3794,28 @@ mod tests {
             .write()
             .unwrap()
             .insert("www.example.com".to_string(), active_route(backend()));
-        route_cache::store(&path, "www.example.com", "/project", "https", "AA:BB");
+        route_cache::store(
+            &path,
+            route_cache::Storage::CombinedRegistry,
+            "www.example.com",
+            "/project",
+            "https",
+            "AA:BB",
+        )
+        .unwrap();
 
         reconcile_routes(&state);
 
         assert!(state.routes.read().unwrap().is_empty());
-        assert!(route_cache::load(&path, "www.example.com").is_none());
+        assert!(
+            route_cache::load(
+                &path,
+                "www.example.com",
+                route_cache::Storage::CombinedRegistry
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -3414,7 +3830,15 @@ mod tests {
             document["ports"]["/project"] = toml_edit::table();
             document["ports"]["/project"]["https"] = value(i64::from(port));
         });
-        route_cache::store(&path, "www.example.com", "/project", "https", "AA:BB");
+        route_cache::store(
+            &path,
+            route_cache::Storage::CombinedRegistry,
+            "www.example.com",
+            "/project",
+            "https",
+            "AA:BB",
+        )
+        .unwrap();
 
         let state = ProxyState::new(path.clone());
         let mut backend = backend();
@@ -3431,6 +3855,14 @@ mod tests {
         reconcile_routes(&state);
 
         assert!(state.routes.read().unwrap().is_empty());
-        assert!(route_cache::load(&path, "www.example.com").is_some());
+        assert!(
+            route_cache::load(
+                &path,
+                "www.example.com",
+                route_cache::Storage::CombinedRegistry
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 }

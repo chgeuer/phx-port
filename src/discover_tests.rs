@@ -22,14 +22,24 @@ fn joins_confirmed_hostnames_to_the_matching_live_registration() {
         document["ports"]["/srv/fabrikam"] = toml_edit::table();
         document["ports"]["/srv/fabrikam"]["https"] = value(closed_port);
     });
-    route_cache::store(&config, "www.contoso.com", "/srv/contoso", "https", "AA:BB");
     route_cache::store(
         &config,
+        route_cache::Storage::CombinedRegistry,
+        "www.contoso.com",
+        "/srv/contoso",
+        "https",
+        "AA:BB",
+    )
+    .unwrap();
+    route_cache::store(
+        &config,
+        route_cache::Storage::CombinedRegistry,
         "www.fabrikam.com",
         "/srv/fabrikam",
         "https",
         "CC:DD",
-    );
+    )
+    .unwrap();
     assert_eq!(
         read_config(&config)["ports"]["/srv/contoso"]["https"].as_integer(),
         Some(port)

@@ -173,9 +173,10 @@ aggregate bounded diagnostic. Ingress reconciles Workloads that register and
 bind after daemon startup, connects only to registered loopback ports, and
 activates each route only after system-trusted TLS verification succeeds for
 the exact declared hostname. Undeclared SNI is rejected before registry lookup,
-route-cache lookup, or certificate probing. Public verified routes are kept in
-memory and periodically revalidated against the same declaration; they never
-modify the stable Port Registry.
+route-cache lookup, or certificate probing. Public verified routes are
+periodically revalidated against the same declaration. Their bounded
+persistence is written only to disposable `routes.toml`; it never modifies
+the stable Port Registry and is never route authority.
 
 Changed declaration files load as immutable numbered generations. Structural
 validation completes before the snapshot is swapped; a failed reload keeps the
@@ -197,7 +198,16 @@ endpoint remains Workload-owned across ingress restart. Missing, incompatible,
 or safely pre-delivery-failing handoff falls back to encrypted loopback relay;
 every post-delivery failure closes without relay. Linux `SO_PEERCRED`, macOS
 `getpeereid`, and the existing descriptor ownership state machine remain
-authoritative. Distinct derived-state storage remains a later milestone.
+authoritative.
+
+Public mode defaults to root-owned `/etc/phx-port/ingress.toml`,
+service-owned `/var/lib/phx-port/ports.toml`, disposable
+`/var/lib/phx-port/routes.toml`, and service-owned `/run/phx-port`.
+`PHX_PORT_CONFIG` and `PHX_PORT_RUNTIME_DIR` are explicit absolute overrides
+and do not activate public mode. A non-loopback listener requires root-owned
+intent; effective-user-owned intent is limited to loopback-only exercises.
+Security-sensitive files, locks, runtime, handoff, and control paths use
+no-follow ownership and mode validation before listeners bind.
 
 The transitional threaded configuration defaults to 256 active connections,
 128 pre-routing connections, 128 relays, 64 handoff negotiations, 200 accepts
@@ -427,10 +437,12 @@ error page.
 
 ## Route persistence
 
-Discovered routes are stored in a clearly separated
-`[discovered_routes]` table within the existing phx-port TOML registry. The
-`[ports]` table remains authoritative configuration; discovered routes remain
-derived, disposable state.
+Development discoveries remain in a clearly separated `[discovered_routes]`
+table within the existing per-user phx-port TOML registry. In the public
+Hosting Profile, the same bounded derived schema lives instead in private
+`/var/lib/phx-port/routes.toml` (or sibling `routes.toml` beside an explicit
+`PHX_PORT_CONFIG`). Stable `ports.toml` contains assignments only. Discovered
+or verified routes remain derived, disposable state in both layouts.
 
 Conceptual cache entry:
 
@@ -444,7 +456,8 @@ last_verified_unix = 1788114730
 
 The cache stores a project identity and role rather than only a socket address.
 Stable port allocation remains authoritative for resolving the current
-backend address.
+backend address. In public state, the compatibility field name `project`
+contains the logical Workload ID rather than a filesystem path.
 
 Cached entries are hints, not authorization. On daemon startup or workload
 restart, a cached route remains inactive until an SNI-specific probe verifies
@@ -454,8 +467,20 @@ entries and evicts the oldest verification timestamp before storing a new
 hostname.
 
 Every daemon and CLI read-modify-write operation takes an advisory lock on a
-sibling lock file. Writes use a temporary file, `fsync`, and atomic rename so a
-route discovery cannot overwrite a simultaneous port registration or deletion.
+sibling lock file. Public assignment and route state use distinct private
+locks. Writes use a temporary file, `fsync`, and atomic rename so route-state
+updates cannot overwrite simultaneous port registration. Invalid public route
+state is discarded and rebuilt only from Route Declarations, stable
+registrations, and fresh certificate verification.
+
+`phx-port proxy config migrate --from FILE --output DIRECTORY` splits a
+private combined logical registry into `ports.toml` and `routes.toml`. It
+publishes the two-file snapshot with one atomic directory rename, refuses an
+existing output path, and leaves the source byte-for-byte available for
+rollback. The assignment schema is unchanged, so the preceding binary may
+consume the retained or split Port Registry. Only ingress intent and stable
+assignments are backup inputs; derived state, locks, and runtime endpoints are
+recreated.
 
 A positive route remains cached while its project and role remain registered,
 even when the workload is stopped. Removing that registration removes its
@@ -578,7 +603,7 @@ A wildcard certificate may validate a concrete hostname during lazy
 discovery, but the daemon caches only that observed hostname. It never creates
 an implicit wildcard route from the certificate.
 
-A bound on positive persisted routes remains separate hardening work.
+Positive persisted routes retain the fixed 1,024-entry bound.
 
 ## Failure behavior
 
@@ -613,12 +638,15 @@ hostname. The implementation consists of:
 - `proxy.rs` for listeners, reconciliation, discovery, route health, control,
   handoff selection, and relay.
 - `tls_client_hello.rs` for bounded, non-consuming ClientHello inspection.
-- `route_cache.rs` for atomically persisted derived routes.
+- `route_cache.rs` for bounded combined-development and split-public derived
+  routes.
 - `handoff.rs` and `handoff_protocol.rs` for the optional Linux descriptor
   transfer path.
 - `ingress_config.rs` for explicit Hosting Profile activation.
 - `port_registry.rs` for locked stable development path/role and logical
   Workload/role assignments.
+- `production_paths.rs` for canonical public paths, no-follow validation,
+  migration, and rollback-safe file separation.
 
 ```text
 src/
@@ -627,6 +655,7 @@ src/
   proxy.rs
   tls_client_hello.rs
   route_cache.rs
+  production_paths.rs
   handoff.rs
   handoff_protocol.rs
   worker_pool.rs

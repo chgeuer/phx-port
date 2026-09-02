@@ -169,16 +169,39 @@ role = "https"
 required = false
 ```
 
-Set `PHX_PORT_CONFIG` to the private logical Workload registry populated by
-`PHX_PORT_WORKLOAD_ID`. Public ingress reads one validated registry snapshot,
-rejects malformed assignments and ports shared by different Workload/role
-keys, and resolves only each declaration's exact assignment. Undeclared
-registry entries remain inactive and are reported only as a bounded aggregate.
-Each route becomes active only after its registered loopback listener presents
-a system-trusted certificate valid for the exact declared hostname.
-Undeclared SNI never reads the dynamic route cache or probes any registered
-Workload. A Workload that allocates and binds after ingress starts is
-reconciled in the background and becomes active only after the same
+The public Hosting Profile keeps operator intent, stable assignments, derived
+state, and runtime endpoints in separate ownership domains:
+
+| Purpose | Default | Ownership and mode |
+|---|---|---|
+| Route Declarations and policy | `/etc/phx-port/ingress.toml` | root-owned regular file, not group/other writable |
+| Stable Workload/role assignments | `/var/lib/phx-port/ports.toml` | service-owned `0600`; parent and sibling lock are private |
+| Disposable verified-route state | `/var/lib/phx-port/routes.toml` | service-owned `0600`; separate private lock |
+| Runtime endpoints | `/run/phx-port/` | service-owned `0750` root, `0700` handoff directory, `0750` control directory |
+
+`PHX_PORT_CONFIG` explicitly overrides the public Port Registry; derived route
+state remains the sibling `routes.toml`. `PHX_PORT_RUNTIME_DIR` explicitly
+overrides the runtime root. Public overrides must be absolute. These variables
+do not activate public mode by themselves, and development keeps its existing
+per-user combined registry and runtime paths.
+
+Before binding a non-loopback listener, ingress requires every component of the
+intent path and the intent file itself to be root-owned and free of unsafe
+links or write permissions. An effective-user-owned intent file is accepted
+only for an explicitly loopback-only public-profile exercise. Stable and
+derived files and their locks require service ownership, private modes,
+single-link regular files, bounded content, and no symlinks. Runtime, handoff,
+and control directories receive the same no-symlink ownership/mode checks.
+
+Public ingress reads one validated Port Registry snapshot populated by
+`PHX_PORT_WORKLOAD_ID`, rejects malformed assignments and ports shared by
+different Workload/role keys, and resolves only each declaration's exact
+assignment. Undeclared registry entries remain inactive and are reported only
+as a bounded aggregate. Each route becomes active only after its registered
+loopback listener presents a system-trusted certificate valid for the exact
+declared hostname. Undeclared SNI never reads the dynamic route cache or probes
+any registered Workload. A Workload that allocates and binds after ingress
+starts is reconciled in the background and becomes active only after the same
 reachability and certificate proof.
 
 A compatible production Workload explicitly gives its PHXP adapter the same
@@ -196,16 +219,41 @@ directory remains service-owned mode `0700`; same-UID peer authentication and
 the irreversible post-delivery no-relay boundary are unchanged on Linux and
 macOS.
 
-Verified public routes stay in memory rather than modifying the stable Port
-Registry, and are revalidated against the same declaration and certificate.
+Verified public routes are persisted only to disposable `routes.toml`, never to
+the stable Port Registry, and are revalidated against the same declaration and
+certificate before every process activates them. Corrupt disposable state is
+discarded and rebuilt from declarations, registrations, and certificate
+proofs.
 The daemon reloads a structurally valid changed declaration snapshot as one
 generation; an invalid reload keeps the preceding generation active, and a
 late certificate result cannot cross generations. A missing required route
 makes `ready=false`; an inactive optional route contributes degraded detail
 without changing readiness. `proxy status` reports generation, declaration,
 readiness, bounded registry/reload diagnostics, and distinct handoff,
-fallback, and relay counters. Split derived-state storage remains a later
-milestone, so this is not yet a production-ready ingress claim.
+fallback, and relay counters. This file split is not a production-readiness
+claim; service activation, authorization, load qualification, and canary gates
+remain separate milestones.
+
+Validate the complete public file/runtime boundary, or split an existing
+private logical registry that still contains `[discovered_routes]`:
+
+```bash
+PHX_PORT_CONFIG=/var/lib/phx-port/ports.toml \
+  PHX_PORT_RUNTIME_DIR=/run/phx-port \
+  phx-port proxy config check --file /etc/phx-port/ingress.toml
+
+phx-port proxy config migrate \
+  --from /var/lib/phx-port/combined.toml \
+  --output /var/lib/phx-port/migrated
+```
+
+Migration publishes `ports.toml` and `routes.toml` together by atomic directory
+rename, refuses an existing output path, and never changes the source file.
+The retained source is the permission-preserving rollback snapshot. The split
+`ports.toml` keeps the preceding logical-assignment schema, so the preceding
+binary can use it directly if its `PHX_PORT_CONFIG` is pointed there. Back up
+the root-owned ingress file and stable `ports.toml` with their ownership and
+modes; do not back up disposable `routes.toml`, locks, or runtime sockets.
 
 The threaded daemon has explicit startup capacity options:
 
@@ -274,8 +322,9 @@ one backend completes a system-trusted, hostname-valid TLS handshake. The
 original ClientHello is then relayed unchanged, so the backend remains the TLS
 endpoint and retains its own certificate and private key.
 
-Successful discoveries are cached in the registry as derived state and can be
-inspected alongside live daemon health:
+Successful development discoveries remain cached in the per-user registry.
+Public verified-route state is stored only in the separate disposable
+`routes.toml`. Both can be inspected alongside live daemon health:
 
 ```bash
 phx-port proxy status
@@ -286,9 +335,13 @@ phx-port proxy uninstall-service
 ```
 
 `proxy routes` uses the daemon's live route table when it is running and falls
-back to persisted routes otherwise. The control socket is available only to the
-current user at `$XDG_RUNTIME_DIR/phx-port/control.sock`, or under the
-configuration directory when `XDG_RUNTIME_DIR` is unavailable.
+back to persisted routes otherwise. Development keeps its current-user control
+socket at `$XDG_RUNTIME_DIR/phx-port/control.sock`, or under the configuration
+directory when `XDG_RUNTIME_DIR` is unavailable. Public mode uses
+`$PHX_PORT_RUNTIME_DIR/control/control.sock`, defaulting to
+`/run/phx-port/control/control.sock`; public CLI queries must receive the same
+`PHX_PORT_INGRESS_CONFIG`, `PHX_PORT_CONFIG`, and `PHX_PORT_RUNTIME_DIR`
+selection as the daemon.
 
 On Linux, `install-service` writes
 `$XDG_CONFIG_HOME/systemd/user/phx-port.service` (or
