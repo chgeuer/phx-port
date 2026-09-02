@@ -1769,7 +1769,9 @@ mod tests {
         AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr,
         accept, bind, listen, recv, recvmsg, send, socket,
     };
-    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rcgen::{
+        CertificateParams, CertifiedKey, KeyPair, PKCS_RSA_SHA256, generate_simple_self_signed,
+    };
     use std::fs;
     #[cfg(target_os = "linux")]
     use std::io::IoSliceMut;
@@ -1810,13 +1812,21 @@ mod tests {
         private_key_pem: String,
     }
 
+    // Security.framework cannot import rcgen's unencrypted ECDSA PKCS#8 keys.
+    const TEST_RSA_PRIVATE_KEY: &str = include_str!("../tests/fixtures/proxy-test-rsa-key.pem");
+
     impl TestCertificate {
         fn for_hostname(hostname: &str) -> Self {
-            let CertifiedKey { cert, signing_key } =
-                generate_simple_self_signed(vec![hostname.to_string()]).unwrap();
+            let signing_key =
+                KeyPair::from_pkcs8_pem_and_sign_algo(TEST_RSA_PRIVATE_KEY, &PKCS_RSA_SHA256)
+                    .unwrap();
+            let cert = CertificateParams::new(vec![hostname.to_string()])
+                .unwrap()
+                .self_signed(&signing_key)
+                .unwrap();
             Self {
                 certificate_pem: cert.pem(),
-                private_key_pem: signing_key.serialize_pem(),
+                private_key_pem: TEST_RSA_PRIVATE_KEY.to_string(),
             }
         }
 
@@ -1826,6 +1836,15 @@ mod tests {
             builder.add_root_certificate(
                 Certificate::from_pem(self.certificate_pem.as_bytes()).unwrap(),
             );
+            builder.build().unwrap()
+        }
+
+        fn unrelated_connector(hostname: &str) -> TlsConnector {
+            let CertifiedKey { cert, .. } =
+                generate_simple_self_signed(vec![hostname.to_string()]).unwrap();
+            let mut builder = TlsConnector::builder();
+            builder.disable_built_in_roots(true);
+            builder.add_root_certificate(Certificate::from_pem(cert.pem().as_bytes()).unwrap());
             builder.build().unwrap()
         }
     }
@@ -2211,11 +2230,10 @@ mod tests {
             untrusted_directory.path(),
             &[("contoso-web", untrusted_backend.port())],
         );
-        let unrelated_trust_anchor = TestCertificate::for_hostname(HOSTNAME);
         let untrusted_state = ProxyState::new_with_profile_and_connector(
             untrusted_registry,
             public_profile(HOSTNAME, "contoso-web"),
-            unrelated_trust_anchor.connector(),
+            TestCertificate::unrelated_connector(HOSTNAME),
         );
 
         let error = resolve_backend(HOSTNAME, &untrusted_state).unwrap_err();
