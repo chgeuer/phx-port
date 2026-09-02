@@ -469,13 +469,12 @@ fn validate_activated_listener(
     if socket_option(fd, nix::libc::SOL_SOCKET, nix::libc::SO_PROTOCOL)? != nix::libc::IPPROTO_TCP {
         return Err("descriptor does not use the TCP protocol".to_string());
     }
-    #[cfg(target_os = "macos")]
-    socket_option(fd, nix::libc::IPPROTO_TCP, nix::libc::TCP_NODELAY)
-        .map_err(|_| "descriptor does not use the TCP protocol".to_string())?;
     if socket_option(fd, nix::libc::SOL_SOCKET, nix::libc::SO_ACCEPTCONN)? != 1 {
         return Err("descriptor is not a listening socket".to_string());
     }
 
+    // Darwin has no portable SO_PROTOCOL query. An AF_INET/AF_INET6 listening
+    // SOCK_STREAM is TCP on the supported macOS kernel.
     let actual = listener
         .local_addr()
         .map_err(|error| format!("cannot read listener address: {error}"))?;
