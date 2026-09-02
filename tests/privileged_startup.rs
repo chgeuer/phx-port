@@ -194,7 +194,7 @@ fn manual_privileged_startup_drops_before_public_files_and_input() {
     };
     daemon.wait_until_ready();
 
-    let (status, peer_uid, peer_pid) = request(&daemon.control, "STATUS").unwrap();
+    let (status, peer_uid, _peer_pid) = request(&daemon.control, "STATUS").unwrap();
     assert!(status.contains("hosting_profile=public"), "{status}");
     assert!(
         status.contains(&format!("listeners={listener}")),
@@ -205,7 +205,7 @@ fn manual_privileged_startup_drops_before_public_files_and_input() {
     #[cfg(target_os = "linux")]
     {
         let process_status =
-            fs::read_to_string(format!("/proc/{}/status", peer_pid.unwrap())).unwrap();
+            fs::read_to_string(format!("/proc/{}/status", _peer_pid.unwrap())).unwrap();
         assert!(
             process_status.contains(&format!(
                 "Uid:\t{uid}\t{uid}\t{uid}\t{uid}",
