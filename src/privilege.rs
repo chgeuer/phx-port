@@ -70,7 +70,7 @@ impl PreparedPrivilegeDrop {
     }
 
     pub fn apply(self) -> Result<(), String> {
-        nix::unistd::setgroups(&self.groups).map_err(|error| {
+        set_supplementary_groups(&self.groups).map_err(|error| {
             format!(
                 "cannot initialize supplementary groups for --run-as user {:?}: {error}",
                 self.name
@@ -112,7 +112,7 @@ fn resolve_groups(
     primary_gid: nix::libc::gid_t,
 ) -> Result<Vec<nix::unistd::Gid>, String> {
     let primary_gid = nix::unistd::Gid::from_raw(primary_gid);
-    let mut groups = nix::unistd::getgrouplist(name, primary_gid).map_err(|error| {
+    let mut groups = supplementary_groups_for_user(name, primary_gid).map_err(|error| {
         format!(
             "cannot resolve supplementary groups for --run-as user {:?}: {error}",
             name
@@ -153,7 +153,7 @@ fn verify_identity(
         ));
     }
 
-    let mut groups = nix::unistd::getgroups().map_err(|error| {
+    let mut groups = current_supplementary_groups().map_err(|error| {
         format!("cannot inspect supplementary groups after privilege drop: {error}")
     })?;
     groups.sort_unstable_by_key(|group| group.as_raw());
@@ -164,6 +164,112 @@ fn verify_identity(
         ));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn supplementary_groups_for_user(
+    name: &CString,
+    primary_gid: nix::unistd::Gid,
+) -> Result<Vec<nix::unistd::Gid>, String> {
+    nix::unistd::getgrouplist(name, primary_gid).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn supplementary_groups_for_user(
+    name: &CString,
+    primary_gid: nix::unistd::Gid,
+) -> Result<Vec<nix::unistd::Gid>, String> {
+    let primary_gid = nix::libc::c_int::try_from(primary_gid.as_raw())
+        .map_err(|_| "primary GID does not fit the Darwin group API".to_string())?;
+    let mut groups = vec![primary_gid];
+    loop {
+        let mut count = nix::libc::c_int::try_from(groups.len())
+            .map_err(|_| "supplementary group count overflowed".to_string())?;
+        let result = unsafe {
+            nix::libc::getgrouplist(name.as_ptr(), primary_gid, groups.as_mut_ptr(), &mut count)
+        };
+        if result >= 0 {
+            let count = usize::try_from(count)
+                .map_err(|_| "supplementary group count was negative".to_string())?;
+            groups.truncate(count);
+            return groups
+                .into_iter()
+                .map(|group| {
+                    u32::try_from(group)
+                        .map(nix::unistd::Gid::from_raw)
+                        .map_err(|_| "Darwin returned a negative supplementary GID".to_string())
+                })
+                .collect();
+        }
+
+        let required = usize::try_from(count)
+            .map_err(|_| "supplementary group count was negative".to_string())?;
+        if required <= groups.len() || required > MAX_SUPPLEMENTARY_GROUPS {
+            return Err(format!(
+                "supplementary group count exceeds the safety limit of {MAX_SUPPLEMENTARY_GROUPS}"
+            ));
+        }
+        groups.resize(required, primary_gid);
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn supplementary_groups_for_user(
+    _name: &CString,
+    _primary_gid: nix::unistd::Gid,
+) -> Result<Vec<nix::unistd::Gid>, String> {
+    Err("--run-as is supported only on Linux and macOS".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn set_supplementary_groups(groups: &[nix::unistd::Gid]) -> Result<(), String> {
+    nix::unistd::setgroups(groups).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn set_supplementary_groups(groups: &[nix::unistd::Gid]) -> Result<(), String> {
+    let count = nix::libc::c_int::try_from(groups.len())
+        .map_err(|_| "supplementary group count overflowed".to_string())?;
+    let raw = groups
+        .iter()
+        .map(|group| group.as_raw())
+        .collect::<Vec<_>>();
+    if unsafe { nix::libc::setgroups(count, raw.as_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn set_supplementary_groups(_groups: &[nix::unistd::Gid]) -> Result<(), String> {
+    Err("--run-as is supported only on Linux and macOS".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn current_supplementary_groups() -> Result<Vec<nix::unistd::Gid>, String> {
+    nix::unistd::getgroups().map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn current_supplementary_groups() -> Result<Vec<nix::unistd::Gid>, String> {
+    let count = unsafe { nix::libc::getgroups(0, std::ptr::null_mut()) };
+    if count == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let mut groups = vec![
+        0;
+        usize::try_from(count)
+            .map_err(|_| "supplementary group count was negative".to_string())?
+    ];
+    if count > 0 && unsafe { nix::libc::getgroups(count, groups.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(groups.into_iter().map(nix::unistd::Gid::from_raw).collect())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn current_supplementary_groups() -> Result<Vec<nix::unistd::Gid>, String> {
+    Err("--run-as is supported only on Linux and macOS".to_string())
 }
 
 #[cfg(unix)]
