@@ -1845,7 +1845,7 @@ mod tests {
             let cert = certificate_params.signed_by(&signing_key, &issuer).unwrap();
             let root_certificate_pem = issuer.pem();
             Self {
-                certificate_pem: format!("{}{}", cert.pem(), root_certificate_pem),
+                certificate_pem: cert.pem(),
                 private_key_pem: TEST_RSA_PRIVATE_KEY.to_string(),
                 root_certificate_pem,
             }
