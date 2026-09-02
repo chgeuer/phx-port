@@ -157,20 +157,35 @@ phx-port daemon --listen 0.0.0.0:443 --listen '[::]:443'
 Without an explicit ingress configuration, the daemon uses the development
 Hosting Profile described by this document. `--ingress-config PATH` or
 `PHX_PORT_INGRESS_CONFIG` selects the public profile only when the referenced
-file declares `[ingress] mode = "public"`. The current typed schema requires
-exactly one `[ingress.hosts."<hostname>"]` Route Declaration with a valid
-logical `workload`, a bounded lowercase `role`, and an optional boolean
-`required`; `unknown_sni`, when present, must be `"reject"`.
+file declares `[ingress] mode = "public"`. The typed schema requires from one
+through 1,000 `[ingress.hosts."<hostname>"]` Route Declarations with unique
+normalized exact hostnames, a valid logical `workload`, a bounded lowercase
+`role`, and an optional boolean `required` that defaults to `false`;
+`unknown_sni`, when present, must be `"reject"`.
 `PHX_PORT_WORKLOAD_ID` is not a profile selector.
 
-The declaration resolves only its exact logical Workload/role assignment from
-the private `PHX_PORT_CONFIG` Port Registry. Ingress reconciles a matching
-Workload that registers and binds after daemon startup, connects only to that
-registered loopback port, and activates the route only after system-trusted TLS
-verification succeeds for the exact declared hostname. Undeclared SNI is
-rejected before registry lookup, route-cache lookup, or certificate probing.
-Public verified routes are kept in memory and periodically revalidated against
-the same declaration; they never modify the stable Port Registry.
+Each declaration resolves only its exact logical Workload/role assignment from
+one validated snapshot of the private `PHX_PORT_CONFIG` Port Registry.
+Malformed keys, invalid assignments, and a port shared by different
+Workload/role keys reject that registry snapshot before any new route can
+activate. Undeclared assignments remain inactive and contribute only an
+aggregate bounded diagnostic. Ingress reconciles Workloads that register and
+bind after daemon startup, connects only to registered loopback ports, and
+activates each route only after system-trusted TLS verification succeeds for
+the exact declared hostname. Undeclared SNI is rejected before registry lookup,
+route-cache lookup, or certificate probing. Public verified routes are kept in
+memory and periodically revalidated against the same declaration; they never
+modify the stable Port Registry.
+
+Changed declaration files load as immutable numbered generations. Structural
+validation completes before the snapshot is swapped; a failed reload keeps the
+last valid generation, unchanged verified routes carry forward, and changed or
+removed routes stop serving until the new declaration is verified. Probe
+results include their originating generation and cannot install into a newer
+snapshot. Readiness is false while any `required = true` declaration is
+inactive. An inactive optional declaration appears as degraded detail without
+making the ingress unready. Status exposes fixed-cardinality counts and reason
+labels; route detail is capped at 64 rows.
 
 After verification, public delivery prefers PHXP at
 `/run/phx-port/handoff/<sha256(workload-id NUL role)>.sock`. The
@@ -182,8 +197,7 @@ endpoint remains Workload-owned across ingress restart. Missing, incompatible,
 or safely pre-delivery-failing handoff falls back to encrypted loopback relay;
 every post-delivery failure closes without relay. Linux `SO_PEERCRED`, macOS
 `getpeereid`, and the existing descriptor ownership state machine remain
-authoritative. Multi-route reconciliation, required-route readiness, reload,
-and distinct derived state remain later milestones.
+authoritative. Distinct derived-state storage remains a later milestone.
 
 The transitional threaded configuration defaults to 256 active connections,
 128 pre-routing connections, 128 relays, 64 handoff negotiations, 200 accepts
@@ -435,7 +449,9 @@ backend address.
 Cached entries are hints, not authorization. On daemon startup or workload
 restart, a cached route remains inactive until an SNI-specific probe verifies
 it again. If revalidation fails, the cache entry may remain available for
-diagnostics but cannot receive connections.
+diagnostics but cannot receive connections. The cache retains at most 1,024
+entries and evicts the oldest verification timestamp before storing a new
+hostname.
 
 Every daemon and CLI read-modify-write operation takes an advisory lock on a
 sibling lock file. Writes use a temporary file, `fsync`, and atomic rename so a
@@ -547,6 +563,8 @@ requires strict bounds. The implementation currently:
 - Permits at most 64 waiting clients and 32 concurrent backend probes.
 - Probes at most 32 live candidate registrations per discovery.
 - Uses one single-flight operation per normalized hostname.
+- Keeps at most 1,024 verified routes and 1,024 conflict diagnostics.
+- Returns at most 64 live route-detail rows per control request.
 - Keeps at most 1,024 negative entries for 30 seconds.
 - Invalidates negative entries when the live workload set changes.
 - Performs only loopback TCP/TLS probes; it does not follow redirects or make

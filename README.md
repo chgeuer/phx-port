@@ -75,13 +75,14 @@ phx-port --workload-id contoso-web https
 
 Logical IDs contain 1-128 lowercase ASCII characters, start and end with a
 letter or digit, and may contain `.`, `_`, and `-`. Use a separate logical
-registry rather than mixing production IDs with development paths. Its parent
-directory must be owned by the effective user with mode `0700`; the registry
-and sibling lock are regular, single-link files with mode `0600`. Allocation
-uses the same exclusive lock and atomic replacement as development, is
-idempotent under concurrent workload starts, and does not contact a running
-ingress process. `PHX_PORT_WORKLOAD_ID` selects only allocator identity; it
-does not activate public ingress.
+registry rather than mixing production IDs with development paths. Logical
+roles follow the same lowercase ASCII character set and are limited to 128
+characters. The registry's parent directory must be owned by the effective
+user with mode `0700`; the registry and sibling lock are regular, single-link
+files with mode `0600`. Allocation uses the same exclusive lock and atomic
+replacement as development, is idempotent under concurrent workload starts,
+and does not contact a running ingress process. `PHX_PORT_WORKLOAD_ID` selects
+only allocator identity; it does not activate public ingress.
 
 ## Usage
 
@@ -149,8 +150,8 @@ phx-port daemon --listen 0.0.0.0:443 --listen '[::]:443'
 
 Development is the default Hosting Profile and retains dynamic certificate
 discovery. Public mode is selected only by `--ingress-config PATH` or
-`PHX_PORT_INGRESS_CONFIG`. The current public-routing milestone accepts exactly
-one Route Declaration:
+`PHX_PORT_INGRESS_CONFIG`. Public configuration accepts from one through 1,000
+exact Route Declarations:
 
 ```toml
 [ingress]
@@ -161,16 +162,24 @@ unknown_sni = "reject"
 workload = "contoso-web"
 role = "https"
 required = true
+
+[ingress.hosts."api.contoso.com"]
+workload = "contoso-api"
+role = "https"
+required = false
 ```
 
 Set `PHX_PORT_CONFIG` to the private logical Workload registry populated by
-`PHX_PORT_WORKLOAD_ID`. Public ingress resolves only the declaration's exact
-`(Workload ID, role)` assignment and probes only that loopback listener. The
-route becomes active only after the listener presents a system-trusted
-certificate valid for the exact declared hostname. Undeclared SNI never reads
-the dynamic route cache or probes any registered Workload. A Workload that
-allocates and binds after ingress starts is reconciled in the background and
-becomes active only after the same reachability and certificate proof.
+`PHX_PORT_WORKLOAD_ID`. Public ingress reads one validated registry snapshot,
+rejects malformed assignments and ports shared by different Workload/role
+keys, and resolves only each declaration's exact assignment. Undeclared
+registry entries remain inactive and are reported only as a bounded aggregate.
+Each route becomes active only after its registered loopback listener presents
+a system-trusted certificate valid for the exact declared hostname.
+Undeclared SNI never reads the dynamic route cache or probes any registered
+Workload. A Workload that allocates and binds after ingress starts is
+reconciled in the background and becomes active only after the same
+reachability and certificate proof.
 
 A compatible production Workload explicitly gives its PHXP adapter the same
 logical ID as `PHX_PORT_WORKLOAD_ID` and the declared role, then listens at
@@ -189,10 +198,14 @@ macOS.
 
 Verified public routes stay in memory rather than modifying the stable Port
 Registry, and are revalidated against the same declaration and certificate.
-Multi-route reconciliation, readiness semantics for `required`, reload, and
-split derived state are later milestones, so this is not yet a
-production-ready ingress claim. `proxy status` reports the active
-`hosting_profile` and distinct handoff, fallback, and relay counters.
+The daemon reloads a structurally valid changed declaration snapshot as one
+generation; an invalid reload keeps the preceding generation active, and a
+late certificate result cannot cross generations. A missing required route
+makes `ready=false`; an inactive optional route contributes degraded detail
+without changing readiness. `proxy status` reports generation, declaration,
+readiness, bounded registry/reload diagnostics, and distinct handoff,
+fallback, and relay counters. Split derived-state storage remains a later
+milestone, so this is not yet a production-ready ingress claim.
 
 The threaded daemon has explicit startup capacity options:
 

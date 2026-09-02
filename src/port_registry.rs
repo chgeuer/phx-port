@@ -12,6 +12,9 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 const DEFAULT_ROLE: &str = "main";
 const FIRST_ASSIGNED_PORT: i64 = 4001;
 const LAST_ASSIGNED_PORT: i64 = u16::MAX as i64;
+const MAX_ROLE_LENGTH: usize = 128;
+
+pub type LogicalAssignments = BTreeMap<(String, String), u16>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistrySecurity {
@@ -43,6 +46,20 @@ pub fn validate_workload_id(workload_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn validate_role(role: &str) -> Result<(), String> {
+    if role.is_empty()
+        || role.len() > MAX_ROLE_LENGTH
+        || !role.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        })
+    {
+        return Err(format!(
+            "role must contain 1 through {MAX_ROLE_LENGTH} lowercase ASCII letters, digits, '.', '_', or '-'"
+        ));
+    }
+    Ok(())
+}
+
 pub fn read(path: &Path, security: RegistrySecurity) -> Result<DocumentMut, String> {
     let path = prepare_path(path, security)?;
     let lock = open_lock(&path, security)?;
@@ -50,6 +67,11 @@ pub fn read(path: &Path, security: RegistrySecurity) -> Result<DocumentMut, Stri
         .map_err(|error| format!("cannot lock {} for reading: {error}", path.display()))?;
     let result = load(&path, security);
     unlock(lock, &path, result)
+}
+
+pub fn read_logical_assignments(path: &Path) -> Result<LogicalAssignments, String> {
+    let document = read(path, RegistrySecurity::LogicalWorkload)?;
+    logical_assignments(&document)
 }
 
 pub fn update<R>(
@@ -82,6 +104,7 @@ pub fn allocate(
 ) -> Result<(i64, bool), String> {
     let security = if logical_workload {
         validate_workload_id(workload)?;
+        validate_role(role)?;
         RegistrySecurity::LogicalWorkload
     } else {
         RegistrySecurity::Development
@@ -458,11 +481,16 @@ fn migrate_legacy_assignments(document: &mut DocumentMut) {
 }
 
 fn validate_logical_assignments(document: &DocumentMut) -> Result<(), String> {
+    logical_assignments(document).map(|_| ())
+}
+
+fn logical_assignments(document: &DocumentMut) -> Result<LogicalAssignments, String> {
     let ports = document
         .get("ports")
         .and_then(|ports| ports.as_table())
         .ok_or_else(|| "logical Workload registry must contain a [ports] table".to_string())?;
-    let mut assignments = BTreeMap::new();
+    let mut ports_by_assignment = BTreeMap::new();
+    let mut assignments_by_port = BTreeMap::new();
     for (workload, roles) in ports {
         validate_workload_id(workload)
             .map_err(|error| format!("invalid registry Workload {workload:?}: {error}"))?;
@@ -470,6 +498,8 @@ fn validate_logical_assignments(document: &DocumentMut) -> Result<(), String> {
             format!("registry Workload {workload:?} must contain a role-to-port table")
         })?;
         for (role, port) in roles {
+            validate_role(role)
+                .map_err(|error| format!("invalid registry role {workload:?}/{role:?}: {error}"))?;
             let port = port.as_integer().ok_or_else(|| {
                 format!("registry assignment {workload:?}/{role:?} must be an integer")
             })?;
@@ -478,14 +508,18 @@ fn validate_logical_assignments(document: &DocumentMut) -> Result<(), String> {
                     "registry assignment {workload:?}/{role:?} must be a TCP port from 1 through {LAST_ASSIGNED_PORT}, got {port}"
                 ));
             }
-            if let Some(previous) = assignments.insert(port, format!("{workload}/{role}")) {
+            if let Some(previous) = assignments_by_port.insert(port, format!("{workload}/{role}")) {
                 return Err(format!(
                     "registry port {port} is assigned to both {previous} and {workload}/{role}"
                 ));
             }
+            ports_by_assignment.insert(
+                (workload.to_string(), role.to_string()),
+                u16::try_from(port).expect("validated logical registry ports fit u16"),
+            );
         }
     }
-    Ok(())
+    Ok(ports_by_assignment)
 }
 
 fn next_port(document: &DocumentMut) -> Result<i64, String> {

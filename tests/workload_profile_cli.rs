@@ -614,3 +614,88 @@ fn explicit_ingress_config_activates_public_profile_but_workload_id_does_not() {
     assert!(development.status().contains("hosting_profile=development"));
     development.stop();
 }
+
+#[cfg(unix)]
+#[test]
+fn public_profile_reconciles_multiple_routes_and_preserves_valid_generation() {
+    use std::time::{Duration, Instant};
+
+    let directory = tempdir().unwrap();
+    let public_config = directory.path().join("public.toml");
+    fs::write(
+        &public_config,
+        "[ingress]\nmode = \"public\"\nunknown_sni = \"reject\"\n\
+         [ingress.hosts.\"required.example.test\"]\n\
+         workload = \"required-web\"\nrole = \"https\"\nrequired = true\n\
+         [ingress.hosts.\"optional.example.test\"]\n\
+         workload = \"optional-web\"\nrole = \"https\"\nrequired = false\n",
+    )
+    .unwrap();
+
+    let daemon = RunningDaemon::start(Some(&public_config), None);
+    let initial = daemon.status();
+    assert!(initial.contains("config_generation=1"), "{initial}");
+    assert!(initial.contains("declared_routes=2"), "{initial}");
+    assert!(initial.contains("required_routes=1"), "{initial}");
+    assert!(initial.contains("optional_routes=1"), "{initial}");
+    assert!(initial.contains("ready=false"), "{initial}");
+    assert!(initial.contains("degraded_routes=2"), "{initial}");
+
+    fs::write(
+        &public_config,
+        "[ingress]\nmode = \"public\"\nunknown_sni = \"reject\"\n\
+         [ingress.hosts.\"DUPLICATE.example.test.\"]\n\
+         workload = \"first-web\"\nrole = \"https\"\nrequired = true\n\
+         [ingress.hosts.\"duplicate.example.test\"]\n\
+         workload = \"second-web\"\nrole = \"https\"\nrequired = true\n",
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let rejected = loop {
+        let status = daemon.status();
+        if status.contains("last_reload_error=config_invalid") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not reject the invalid generation: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(rejected.contains("config_generation=1"), "{rejected}");
+    assert!(
+        rejected.contains("last_rejected_config_generation=2"),
+        "{rejected}"
+    );
+    assert!(rejected.contains("declared_routes=2"), "{rejected}");
+    assert!(rejected.contains("required_routes=1"), "{rejected}");
+
+    fs::write(
+        &public_config,
+        "[ingress]\nmode = \"public\"\nunknown_sni = \"reject\"\n\
+         [ingress.hosts.\"replacement.example.test\"]\n\
+         workload = \"replacement-web\"\nrole = \"https\"\nrequired = false\n",
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let replaced = loop {
+        let status = daemon.status();
+        if status.lines().any(|line| line == "config_generation=2") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not install the replacement generation: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(replaced.contains("declared_routes=1"), "{replaced}");
+    assert!(replaced.contains("required_routes=0"), "{replaced}");
+    assert!(replaced.contains("optional_routes=1"), "{replaced}");
+    assert!(replaced.contains("ready=true"), "{replaced}");
+    assert!(replaced.contains("degraded_routes=1"), "{replaced}");
+    assert!(replaced.contains("last_reload_error=none"), "{replaced}");
+    daemon.stop();
+}

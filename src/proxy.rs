@@ -3,7 +3,9 @@ use crate::ingress_limits::{IngressLimits, SystemCapacity};
 use crate::{
     admission::{AdmissionController, AdmissionRejection, PreRoutingAdmission, RelayPermit},
     config_path, handoff,
-    ingress_config::{HostingProfile, RouteDeclaration},
+    ingress_config::{
+        HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot, RouteDeclaration,
+    },
     ingress_limits::{DaemonConfig, ValidatedIngressLimits},
     is_port_open, port_registry, read_config, route_cache, tls_client_hello,
     worker_pool::BoundedWorkerPool,
@@ -11,7 +13,7 @@ use crate::{
 use native_tls::TlsConnector;
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -32,6 +34,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_PROBES: usize = 32;
 const MAX_WAITING_CLIENTS: usize = 64;
 const MAX_NEGATIVE_ROUTES: usize = 1024;
+const MAX_VERIFIED_ROUTES: usize = 1024;
+const MAX_ROUTE_CONFLICTS: usize = 1024;
+const MAX_ROUTE_DIAGNOSTICS: usize = 64;
 const NEGATIVE_TTL: Duration = Duration::from_secs(30);
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 const TLS_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
@@ -57,8 +62,48 @@ struct ProbeMatch {
 struct ActiveRoute {
     backend: Backend,
     certificate_fingerprint: String,
+    declaration_generation: Option<u64>,
     last_tls_check: Instant,
     tcp_failures: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteFailure {
+    MissingRegistration,
+    RegistryInvalid,
+    VerificationFailed,
+    CapacityUnavailable,
+}
+
+impl RouteFailure {
+    fn label(self) -> &'static str {
+        match self {
+            Self::MissingRegistration => "missing_registration",
+            Self::RegistryInvalid => "registry_invalid",
+            Self::VerificationFailed => "verification_failed",
+            Self::CapacityUnavailable => "capacity_unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigReloadError {
+    Invalid,
+}
+
+impl ConfigReloadError {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Invalid => "config_invalid",
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConfigReloadStatus {
+    last_error: Option<ConfigReloadError>,
+    rejected_reloads: u64,
+    last_rejected_generation: Option<u64>,
 }
 
 struct DiscoveryFlight {
@@ -203,13 +248,20 @@ impl std::fmt::Display for OverloadEvent {
 
 struct ProxyState {
     config: PathBuf,
-    hosting_profile: HostingProfile,
+    hosting_profile: RwLock<HostingProfile>,
     handoff_runtime: Option<PathBuf>,
     limits: ValidatedIngressLimits,
     admission: AdmissionController,
     listeners: RwLock<Vec<SocketAddr>>,
     routes: RwLock<HashMap<String, ActiveRoute>>,
-    conflicts: RwLock<HashMap<String, Vec<Backend>>>,
+    conflicts: RwLock<BTreeMap<String, Vec<Backend>>>,
+    conflict_capacity_drops: AtomicU64,
+    route_capacity_rejections: AtomicU64,
+    route_failures: RwLock<BTreeMap<String, RouteFailure>>,
+    undeclared_registrations: AtomicUsize,
+    registry_valid: AtomicBool,
+    rejected_registry_snapshots: AtomicU64,
+    config_reload_status: Mutex<ConfigReloadStatus>,
     flights: Mutex<HashMap<String, Arc<DiscoveryFlight>>>,
     negative: Mutex<HashMap<String, Instant>>,
     workloads: Mutex<Vec<Backend>>,
@@ -248,13 +300,20 @@ impl ProxyState {
         let admission = AdmissionController::new(&limits);
         Self {
             config,
-            hosting_profile,
+            hosting_profile: RwLock::new(hosting_profile),
             handoff_runtime,
             limits,
             admission,
             listeners: RwLock::new(Vec::new()),
             routes: RwLock::new(HashMap::new()),
-            conflicts: RwLock::new(HashMap::new()),
+            conflicts: RwLock::new(BTreeMap::new()),
+            conflict_capacity_drops: AtomicU64::new(0),
+            route_capacity_rejections: AtomicU64::new(0),
+            route_failures: RwLock::new(BTreeMap::new()),
+            undeclared_registrations: AtomicUsize::new(0),
+            registry_valid: AtomicBool::new(true),
+            rejected_registry_snapshots: AtomicU64::new(0),
+            config_reload_status: Mutex::new(ConfigReloadStatus::default()),
             flights: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
             workloads: Mutex::new(Vec::new()),
@@ -281,6 +340,17 @@ impl ProxyState {
             handoff_capacity_skips: AtomicU64::new(0),
             delivered_handoff_failures: AtomicU64::new(0),
         }
+    }
+
+    fn hosting_profile(&self) -> HostingProfile {
+        self.hosting_profile
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn public_snapshot(&self) -> Option<Arc<PublicIngressSnapshot>> {
+        self.hosting_profile().public_snapshot()
     }
 
     #[cfg(test)]
@@ -453,6 +523,150 @@ struct ConnectionJob {
     queued: QueuedConnection,
 }
 
+fn same_route_target(left: &RouteDeclaration, right: &RouteDeclaration) -> bool {
+    left.workload == right.workload && left.role == right.role
+}
+
+fn record_config_reload_failure(state: &ProxyState, rejected_generation: u64) {
+    let mut status = state
+        .config_reload_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    status.last_rejected_generation = Some(rejected_generation);
+    if status.last_error == Some(ConfigReloadError::Invalid) {
+        return;
+    }
+    status.last_error = Some(ConfigReloadError::Invalid);
+    status.rejected_reloads = status.rejected_reloads.saturating_add(1);
+    eprintln!("event=ingress_config_reload result=rejected reason=config_invalid");
+}
+
+fn clear_config_reload_failure(state: &ProxyState) {
+    state
+        .config_reload_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .last_error = None;
+}
+
+fn reload_public_profile(state: &ProxyState) {
+    let current = state.hosting_profile();
+    let Some(current_snapshot) = current.public_snapshot() else {
+        return;
+    };
+    let replacement = match current.reload() {
+        Ok(Some(replacement)) => replacement,
+        Ok(None) => {
+            clear_config_reload_failure(state);
+            return;
+        }
+        Err(_) => {
+            record_config_reload_failure(state, current_snapshot.generation.saturating_add(1));
+            return;
+        }
+    };
+    let replacement_snapshot = replacement
+        .public_snapshot()
+        .expect("a public config reload returns a public snapshot");
+
+    let mut profile = state
+        .hosting_profile
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(installed_snapshot) = profile.public_snapshot() else {
+        return;
+    };
+    if installed_snapshot.generation != current_snapshot.generation {
+        return;
+    }
+    let mut routes = state
+        .routes
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    routes.retain(|hostname, active| {
+        let Some(previous) = current_snapshot.routes.get(hostname) else {
+            return false;
+        };
+        let Some(next) = replacement_snapshot.routes.get(hostname) else {
+            return false;
+        };
+        if active.declaration_generation == Some(current_snapshot.generation)
+            && same_route_target(previous, next)
+        {
+            active.declaration_generation = Some(replacement_snapshot.generation);
+            true
+        } else {
+            false
+        }
+    });
+    *profile = replacement;
+    drop(routes);
+    drop(profile);
+
+    state
+        .route_failures
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|hostname, _| {
+            current_snapshot
+                .routes
+                .get(hostname)
+                .zip(replacement_snapshot.routes.get(hostname))
+                .is_some_and(|(previous, next)| same_route_target(previous, next))
+        });
+    state
+        .conflicts
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    state
+        .negative
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    clear_config_reload_failure(state);
+    eprintln!(
+        "event=ingress_config_reload result=accepted generation={} declared_routes={}",
+        replacement_snapshot.generation,
+        replacement_snapshot.routes.len()
+    );
+}
+
+fn record_registry_snapshot_failure(state: &ProxyState) {
+    if state.registry_valid.swap(false, Ordering::AcqRel) {
+        let _ = state.rejected_registry_snapshots.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |count| Some(count.saturating_add(1)),
+        );
+        eprintln!("event=port_registry_reload result=rejected reason=registry_invalid");
+    }
+}
+
+fn record_registry_snapshot_success(state: &ProxyState) {
+    if !state.registry_valid.swap(true, Ordering::AcqRel) {
+        eprintln!("event=port_registry_reload result=recovered");
+    }
+}
+
+fn set_route_failure(state: &ProxyState, hostname: &str, failure: RouteFailure) {
+    let mut failures = state
+        .route_failures
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if failures.contains_key(hostname) || failures.len() < MAX_ROUTE_DECLARATIONS {
+        failures.insert(hostname.to_string(), failure);
+    }
+}
+
+fn clear_route_failure(state: &ProxyState, hostname: &str) {
+    state
+        .route_failures
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(hostname);
+}
+
 pub fn run(config: DaemonConfig) -> Result<(), String> {
     PROCESS_START.get_or_init(Instant::now);
     let DaemonConfig {
@@ -574,6 +788,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         thread::spawn(move || {
             while !shutdown.load(Ordering::Acquire) {
                 thread::sleep(LIVENESS_INTERVAL);
+                reload_public_profile(&state);
                 reconcile_workloads(&state);
                 reconcile_routes(&state);
             }
@@ -734,10 +949,77 @@ fn start_control_server(
     Ok((path, thread))
 }
 
+struct RouteSummary {
+    hosting_profile: &'static str,
+    config_generation: u64,
+    declared_routes: usize,
+    required_routes: usize,
+    optional_routes: usize,
+    active_routes: usize,
+    degraded_routes: usize,
+    ready: bool,
+}
+
+fn route_summary(state: &ProxyState) -> RouteSummary {
+    let profile = state.hosting_profile();
+    let routes = state
+        .routes
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(snapshot) = profile.public_snapshot() else {
+        return RouteSummary {
+            hosting_profile: profile.name(),
+            config_generation: 0,
+            declared_routes: 0,
+            required_routes: 0,
+            optional_routes: 0,
+            active_routes: routes.len(),
+            degraded_routes: 0,
+            ready: true,
+        };
+    };
+
+    let active_hostnames = routes
+        .iter()
+        .filter_map(|(hostname, active)| {
+            let declaration = snapshot.routes.get(hostname)?;
+            (active.declaration_generation == Some(snapshot.generation)
+                && declaration.workload == active.backend.project
+                && declaration.role == active.backend.role)
+                .then_some(hostname)
+        })
+        .collect::<BTreeSet<_>>();
+    let required_routes = snapshot
+        .routes
+        .values()
+        .filter(|declaration| declaration.required)
+        .count();
+    let active_required_routes = snapshot
+        .routes
+        .iter()
+        .filter(|(hostname, declaration)| {
+            declaration.required && active_hostnames.contains(hostname)
+        })
+        .count();
+    let active_routes = active_hostnames.len();
+
+    RouteSummary {
+        hosting_profile: profile.name(),
+        config_generation: snapshot.generation,
+        declared_routes: snapshot.routes.len(),
+        required_routes,
+        optional_routes: snapshot.routes.len().saturating_sub(required_routes),
+        active_routes,
+        degraded_routes: snapshot.routes.len().saturating_sub(active_routes),
+        ready: active_required_routes == required_routes,
+    }
+}
+
 fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &str) -> String {
     match request {
         "STATUS" => {
             let admission = state.admission.snapshot();
+            let route_summary = route_summary(state);
             let listeners = state
                 .listeners
                 .read()
@@ -749,7 +1031,6 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                         .join(",")
                 })
                 .unwrap_or_default();
-            let active_routes = state.routes.read().map(|routes| routes.len()).unwrap_or(0);
             let conflicts = state
                 .conflicts
                 .read()
@@ -761,9 +1042,33 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 .map(|flights| flights.len())
                 .unwrap_or(0);
             let probes = state.probes.in_use.lock().map(|count| *count).unwrap_or(0);
+            let reload_status = state
+                .config_reload_status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let last_reload_error = reload_status
+                .last_error
+                .map(ConfigReloadError::label)
+                .unwrap_or("none");
+            let last_rejected_config_generation =
+                reload_status.last_rejected_generation.unwrap_or(0);
             format!(
-                "running\nhosting_profile={hosting_profile}\nlisteners={listeners}\nactive_routes={active_routes}\nconflicts={conflicts}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nsource_entries={source_entries}\nsource_entry_limit={source_entry_limit}\nsource_accepts_per_second_limit={source_accepts_per_second_limit}\nsource_accept_burst_limit={source_accept_burst_limit}\nsource_pre_routing_limit={source_pre_routing_limit}\nsource_ipv6_prefix={source_ipv6_prefix}\nsource_entry_ttl_seconds={source_entry_ttl_seconds}\nsource_policy_overrides={source_policy_overrides}\nqueued_connections={queued_connections}\nconnection_queue_limit={CONNECTION_QUEUE_CAPACITY}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_source_rate={rejected_source_rate}\nrejected_source_concurrency={rejected_source_concurrency}\nrejected_source_state_capacity={rejected_source_state_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
-                hosting_profile = state.hosting_profile.name(),
+                "running\nhosting_profile={hosting_profile}\nconfig_generation={config_generation}\ndeclared_routes={declared_routes}\nrequired_routes={required_routes}\noptional_routes={optional_routes}\nactive_routes={active_routes}\ndegraded_routes={degraded_routes}\nready={ready}\nregistry_valid={registry_valid}\nundeclared_registrations={undeclared_registrations}\nrejected_registry_snapshots={rejected_registry_snapshots}\nrejected_config_reloads={rejected_config_reloads}\nlast_rejected_config_generation={last_rejected_config_generation}\nlast_reload_error={last_reload_error}\nlisteners={listeners}\nconflicts={conflicts}\nconflict_capacity_drops={conflict_capacity_drops}\nroute_capacity_rejections={route_capacity_rejections}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nsource_entries={source_entries}\nsource_entry_limit={source_entry_limit}\nsource_accepts_per_second_limit={source_accepts_per_second_limit}\nsource_accept_burst_limit={source_accept_burst_limit}\nsource_pre_routing_limit={source_pre_routing_limit}\nsource_ipv6_prefix={source_ipv6_prefix}\nsource_entry_ttl_seconds={source_entry_ttl_seconds}\nsource_policy_overrides={source_policy_overrides}\nqueued_connections={queued_connections}\nconnection_queue_limit={CONNECTION_QUEUE_CAPACITY}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_source_rate={rejected_source_rate}\nrejected_source_concurrency={rejected_source_concurrency}\nrejected_source_state_capacity={rejected_source_state_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
+                hosting_profile = route_summary.hosting_profile,
+                config_generation = route_summary.config_generation,
+                declared_routes = route_summary.declared_routes,
+                required_routes = route_summary.required_routes,
+                optional_routes = route_summary.optional_routes,
+                active_routes = route_summary.active_routes,
+                degraded_routes = route_summary.degraded_routes,
+                ready = route_summary.ready,
+                registry_valid = state.registry_valid.load(Ordering::Acquire),
+                undeclared_registrations = state.undeclared_registrations.load(Ordering::Acquire),
+                rejected_registry_snapshots =
+                    state.rejected_registry_snapshots.load(Ordering::Acquire),
+                rejected_config_reloads = reload_status.rejected_reloads,
+                conflict_capacity_drops = state.conflict_capacity_drops.load(Ordering::Relaxed),
+                route_capacity_rejections = state.route_capacity_rejections.load(Ordering::Relaxed),
                 active_connections = admission.global.in_use,
                 active_connection_limit = admission.global.limit,
                 pre_routing_connections = admission.pre_routing.in_use,
@@ -809,9 +1114,24 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
             )
         }
         "ROUTES" => {
+            let profile = state.hosting_profile();
+            let public_snapshot = profile.public_snapshot();
             let mut lines = Vec::new();
+            let mut active_hostnames = BTreeSet::new();
             if let Ok(routes) = state.routes.read() {
                 for (hostname, route) in routes.iter() {
+                    if let Some(snapshot) = public_snapshot.as_ref() {
+                        let Some(declaration) = snapshot.routes.get(hostname) else {
+                            continue;
+                        };
+                        if route.declaration_generation != Some(snapshot.generation)
+                            || declaration.workload != route.backend.project
+                            || declaration.role != route.backend.role
+                        {
+                            continue;
+                        }
+                    }
+                    active_hostnames.insert(hostname.clone());
                     lines.push(format!(
                         "active\t{hostname}\t{}\t{}\t{}\t{}",
                         route.backend.project,
@@ -833,7 +1153,37 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                     lines.push(format!("conflict\t{hostname}\t{owners}"));
                 }
             }
+            if let Some(snapshot) = public_snapshot {
+                let failures = state
+                    .route_failures
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (hostname, declaration) in &snapshot.routes {
+                    if active_hostnames.contains(hostname) {
+                        continue;
+                    }
+                    let requirement = if declaration.required {
+                        "required"
+                    } else {
+                        "optional"
+                    };
+                    let reason = failures
+                        .get(hostname)
+                        .copied()
+                        .map(RouteFailure::label)
+                        .unwrap_or("pending");
+                    lines.push(format!(
+                        "inactive\t{hostname}\t{}\t{}\t{requirement}\t{reason}",
+                        declaration.workload, declaration.role
+                    ));
+                }
+            }
             lines.sort();
+            let omitted = lines.len().saturating_sub(MAX_ROUTE_DIAGNOSTICS);
+            lines.truncate(MAX_ROUTE_DIAGNOSTICS);
+            if omitted > 0 {
+                lines.push(format!("truncated\t{omitted}"));
+            }
             if lines.is_empty() {
                 "No active TLS routes.\n".to_string()
             } else {
@@ -891,13 +1241,14 @@ fn handle_connection(
     } else {
         resolve_backend(&hostname, &state)?
     };
+    let public_profile = state.public_snapshot().is_some();
 
     match state.admission.try_acquire_handoff() {
         Ok(_handoff_permit) => {
             let mut connection_id = [0_u8; 16];
             match getrandom::fill(&mut connection_id) {
                 Ok(()) => {
-                    let identity = if state.hosting_profile.is_public() {
+                    let identity = if public_profile {
                         handoff::EndpointIdentity::Production(&backend.project)
                     } else {
                         handoff::EndpointIdentity::Development(&backend.project)
@@ -1004,14 +1355,22 @@ fn acquire_relay_capacity(state: &ProxyState) -> Option<RelayPermit> {
 }
 
 fn resolve_backend(hostname: &str, state: &ProxyState) -> Result<Backend, String> {
-    if state.hosting_profile.is_public() {
-        let declaration = state
-            .hosting_profile
-            .route(hostname)
+    if let Some(snapshot) = state.public_snapshot() {
+        let declaration = snapshot
+            .routes
+            .get(hostname)
             .cloned()
             .ok_or_else(|| format!("public ingress has no Route Declaration for {hostname}"))?;
+        let assignments = load_public_registry(state, &snapshot)?;
+        let backend = match registered_declared_backend(&assignments, &declaration) {
+            Ok(backend) => backend,
+            Err(error) => {
+                set_route_failure(state, hostname, RouteFailure::MissingRegistration);
+                return Err(error);
+            }
+        };
         return state.discover_once(hostname, || {
-            activate_declared_route(hostname, &declaration, state)
+            activate_declared_route(hostname, &declaration, snapshot.generation, backend, state)
         });
     }
     let cached = route_cache::load(&state.config, hostname);
@@ -1038,15 +1397,29 @@ fn resolve_backend(hostname: &str, state: &ProxyState) -> Result<Backend, String
 fn activate_declared_route(
     hostname: &str,
     declaration: &RouteDeclaration,
+    generation: u64,
+    backend: Backend,
     state: &ProxyState,
 ) -> Result<Backend, String> {
-    let backend = registered_declared_backend(&state.config, declaration)?;
+    if declaration.hostname != hostname
+        || declaration.workload != backend.project
+        || declaration.role != backend.role
+    {
+        return Err("logical Workload registration does not match its declaration".to_string());
+    }
     let _permit = state
         .probes
         .acquire(Instant::now() + DISCOVERY_TIMEOUT)
-        .ok_or_else(|| "certificate probe capacity unavailable".to_string())?;
+        .ok_or_else(|| {
+            set_route_failure(state, hostname, RouteFailure::CapacityUnavailable);
+            "certificate probe capacity unavailable".to_string()
+        })?;
     let certificate_fingerprint =
-        probe_backend(hostname, &backend, state.probe_connector_override.as_ref())?;
+        probe_backend(hostname, &backend, state.probe_connector_override.as_ref()).inspect_err(
+            |_| {
+                set_route_failure(state, hostname, RouteFailure::VerificationFailed);
+            },
+        )?;
     install_active_route(
         state,
         hostname,
@@ -1054,7 +1427,14 @@ fn activate_declared_route(
             backend: backend.clone(),
             certificate_fingerprint,
         },
-    );
+        Some(generation),
+    )
+    .inspect_err(|error| {
+        if error.contains("capacity") {
+            set_route_failure(state, hostname, RouteFailure::CapacityUnavailable);
+        }
+    })?;
+    clear_route_failure(state, hostname);
     eprintln!(
         "Activated declared route {hostname} at 127.0.0.1:{} ({} {})",
         backend.port, backend.project, backend.role
@@ -1063,19 +1443,12 @@ fn activate_declared_route(
 }
 
 fn registered_declared_backend(
-    config: &Path,
+    assignments: &port_registry::LogicalAssignments,
     declaration: &RouteDeclaration,
 ) -> Result<Backend, String> {
-    let document = port_registry::read(config, port_registry::RegistrySecurity::LogicalWorkload)
-        .map_err(|error| format!("cannot read logical Workload Port Registry: {error}"))?;
-    let port = document
-        .get("ports")
-        .and_then(|item| item.as_table())
-        .and_then(|workloads| workloads.get(&declaration.workload))
-        .and_then(|item| item.as_table())
-        .and_then(|roles| roles.get(&declaration.role))
-        .and_then(|item| item.as_integer())
-        .and_then(|port| u16::try_from(port).ok())
+    let port = assignments
+        .get(&(declaration.workload.clone(), declaration.role.clone()))
+        .copied()
         .ok_or_else(|| {
             format!(
                 "declared Workload {}/{} has no registered loopback port",
@@ -1087,6 +1460,44 @@ fn registered_declared_backend(
         role: declaration.role.clone(),
         port,
     })
+}
+
+fn load_public_registry(
+    state: &ProxyState,
+    snapshot: &PublicIngressSnapshot,
+) -> Result<port_registry::LogicalAssignments, String> {
+    let assignments = match port_registry::read_logical_assignments(&state.config) {
+        Ok(assignments) => assignments,
+        Err(error) => {
+            record_registry_snapshot_failure(state);
+            for hostname in snapshot.routes.keys() {
+                set_route_failure(state, hostname, RouteFailure::RegistryInvalid);
+            }
+            return Err(format!(
+                "cannot read logical Workload Port Registry: {error}"
+            ));
+        }
+    };
+    record_registry_snapshot_success(state);
+
+    let declared_assignments = snapshot
+        .routes
+        .values()
+        .map(|declaration| (declaration.workload.clone(), declaration.role.clone()))
+        .collect::<BTreeSet<_>>();
+    let undeclared = assignments
+        .keys()
+        .filter(|assignment| !declared_assignments.contains(*assignment))
+        .count();
+    state
+        .undeclared_registrations
+        .store(undeclared, Ordering::Release);
+    state
+        .route_failures
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|_, failure| *failure != RouteFailure::RegistryInvalid);
+    Ok(assignments)
 }
 
 fn discover_backend(
@@ -1117,8 +1528,10 @@ fn discover_backend(
 
     let matched = matches.into_iter().next().unwrap();
     let backend = matched.backend.clone();
+    install_active_route(state, hostname, matched, None).inspect_err(|_| {
+        cache_negative(state, hostname);
+    })?;
     clear_conflict(state, hostname);
-    install_active_route(state, hostname, matched);
     state.successful_discoveries.fetch_add(1, Ordering::Relaxed);
     eprintln!(
         "Discovered {hostname} at 127.0.0.1:{} ({} {})",
@@ -1148,8 +1561,29 @@ fn cache_negative(state: &ProxyState, hostname: &str) {
 fn record_conflict(state: &ProxyState, hostname: &str, mut backends: Vec<Backend>) {
     backends.sort();
     backends.dedup();
-    if let Ok(mut conflicts) = state.conflicts.write() {
-        conflicts.insert(hostname.to_string(), backends.clone());
+    let mut capacity_exhausted = false;
+    let changed = if let Ok(mut conflicts) = state.conflicts.write() {
+        if !conflicts.contains_key(hostname) && conflicts.len() >= MAX_ROUTE_CONFLICTS {
+            capacity_exhausted = true;
+            false
+        } else if conflicts.get(hostname) == Some(&backends) {
+            false
+        } else {
+            conflicts.insert(hostname.to_string(), backends.clone());
+            true
+        }
+    } else {
+        false
+    };
+    if capacity_exhausted {
+        let _ = state.conflict_capacity_drops.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |count| Some(count.saturating_add(1)),
+        );
+    }
+    if !changed {
+        return;
     }
     let owners = backends
         .iter()
@@ -1186,32 +1620,8 @@ fn observe_workloads(state: &ProxyState, candidates: &[Backend]) -> Vec<Backend>
 }
 
 fn reconcile_workloads(state: &ProxyState) {
-    if let Some(declaration) = state.hosting_profile.declared_route().cloned() {
-        let inactive = match state.routes.read() {
-            Ok(routes) => !routes.contains_key(&declaration.hostname),
-            Err(_) => return,
-        };
-        if !inactive {
-            return;
-        }
-        let retry_suppressed = match state.negative.lock() {
-            Ok(mut negative) => {
-                let now = Instant::now();
-                negative.retain(|_, expires_at| *expires_at > now);
-                negative.contains_key(&declaration.hostname)
-            }
-            Err(_) => return,
-        };
-        if retry_suppressed {
-            return;
-        }
-        if let Err(error) = resolve_backend(&declaration.hostname, state) {
-            eprintln!(
-                "Declared route {} remains inactive: {error}",
-                declaration.hostname
-            );
-            cache_negative(state, &declaration.hostname);
-        }
+    if let Some(snapshot) = state.public_snapshot() {
+        reconcile_public_workloads(state, &snapshot);
         return;
     }
     let candidates = candidate_backends(&state.config, None);
@@ -1256,6 +1666,132 @@ fn reconcile_workloads(state: &ProxyState) {
                 eprintln!("Eager TLS discovery rejected {hostname}: {error}");
             }
         }
+    }
+}
+
+fn reconcile_public_workloads(state: &ProxyState, snapshot: &PublicIngressSnapshot) {
+    let assignments = match load_public_registry(state, snapshot) {
+        Ok(assignments) => assignments,
+        Err(_) => return,
+    };
+
+    for (hostname, declaration) in &snapshot.routes {
+        let desired = match registered_declared_backend(&assignments, declaration) {
+            Ok(backend) => backend,
+            Err(_) => {
+                deactivate_route(
+                    state,
+                    hostname,
+                    false,
+                    "logical Workload registration is unavailable",
+                );
+                set_route_failure(state, hostname, RouteFailure::MissingRegistration);
+                continue;
+            }
+        };
+        let active = state
+            .routes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(hostname)
+            .cloned();
+        let active = match active {
+            Some(active)
+                if active.declaration_generation == Some(snapshot.generation)
+                    && active.backend == desired =>
+            {
+                Some(active)
+            }
+            Some(_) => {
+                deactivate_route(
+                    state,
+                    hostname,
+                    false,
+                    "Route Declaration or logical Workload registration changed",
+                );
+                None
+            }
+            None => None,
+        };
+
+        if let Some(active) = active {
+            if !is_port_open(i64::from(active.backend.port)) {
+                record_tcp_failure(state, hostname);
+                continue;
+            }
+            let recovered = active.tcp_failures > 0;
+            let tls_due = active.last_tls_check.elapsed() >= TLS_REVALIDATION_INTERVAL;
+            if recovered || tls_due {
+                revalidate_declared_route(state, snapshot, hostname, &active);
+            } else {
+                if let Ok(mut routes) = state.routes.write()
+                    && let Some(route) = routes.get_mut(hostname)
+                {
+                    route.tcp_failures = 0;
+                }
+                clear_route_failure(state, hostname);
+            }
+            continue;
+        }
+
+        let retry_suppressed = match state.negative.lock() {
+            Ok(mut negative) => {
+                let now = Instant::now();
+                negative.retain(|_, expires_at| *expires_at > now);
+                negative.contains_key(hostname)
+            }
+            Err(_) => return,
+        };
+        if retry_suppressed {
+            continue;
+        }
+        if activate_declared_route(hostname, declaration, snapshot.generation, desired, state)
+            .is_err()
+        {
+            cache_negative(state, hostname);
+        }
+    }
+}
+
+fn revalidate_declared_route(
+    state: &ProxyState,
+    snapshot: &PublicIngressSnapshot,
+    hostname: &str,
+    route: &ActiveRoute,
+) {
+    let Some(_permit) = state.probes.acquire(Instant::now() + DISCOVERY_TIMEOUT) else {
+        set_route_failure(state, hostname, RouteFailure::CapacityUnavailable);
+        return;
+    };
+    let certificate_fingerprint = match probe_backend(
+        hostname,
+        &route.backend,
+        state.probe_connector_override.as_ref(),
+    ) {
+        Ok(certificate_fingerprint) => certificate_fingerprint,
+        Err(_) => {
+            deactivate_route(
+                state,
+                hostname,
+                false,
+                "declared Workload failed exact-hostname TLS revalidation",
+            );
+            set_route_failure(state, hostname, RouteFailure::VerificationFailed);
+            return;
+        }
+    };
+    if install_active_route(
+        state,
+        hostname,
+        ProbeMatch {
+            backend: route.backend.clone(),
+            certificate_fingerprint,
+        },
+        Some(snapshot.generation),
+    )
+    .is_ok()
+    {
+        clear_route_failure(state, hostname);
     }
 }
 
@@ -1318,6 +1854,9 @@ fn dns_names_from_certificate(der: &[u8]) -> Result<Vec<String>, String> {
 }
 
 fn reconcile_routes(state: &ProxyState) {
+    if state.public_snapshot().is_some() {
+        return;
+    }
     let routes: Vec<(String, ActiveRoute)> = match state.routes.read() {
         Ok(routes) => routes
             .iter()
@@ -1327,10 +1866,6 @@ fn reconcile_routes(state: &ProxyState) {
     };
 
     for (hostname, route) in routes {
-        if state.hosting_profile.is_public() {
-            reconcile_declared_route(state, &hostname, &route);
-            continue;
-        }
         if !registration_matches(&state.config, &route.backend) {
             deactivate_route(state, &hostname, true, "registration was removed");
             continue;
@@ -1353,60 +1888,6 @@ fn reconcile_routes(state: &ProxyState) {
     }
 }
 
-fn reconcile_declared_route(state: &ProxyState, hostname: &str, route: &ActiveRoute) {
-    let registered = state
-        .hosting_profile
-        .route(hostname)
-        .and_then(|declaration| registered_declared_backend(&state.config, declaration).ok());
-    if registered.as_ref() != Some(&route.backend) {
-        deactivate_route(
-            state,
-            hostname,
-            false,
-            "Route Declaration or logical Workload registration changed",
-        );
-        return;
-    }
-    if !is_port_open(i64::from(route.backend.port)) {
-        record_tcp_failure(state, hostname);
-        return;
-    }
-
-    let recovered = route.tcp_failures > 0;
-    let tls_due = route.last_tls_check.elapsed() >= TLS_REVALIDATION_INTERVAL;
-    if recovered || tls_due {
-        let verified = state
-            .probes
-            .acquire(Instant::now() + DISCOVERY_TIMEOUT)
-            .and_then(|_permit| {
-                probe_backend(
-                    hostname,
-                    &route.backend,
-                    state.probe_connector_override.as_ref(),
-                )
-                .ok()
-                .map(|certificate_fingerprint| ProbeMatch {
-                    backend: route.backend.clone(),
-                    certificate_fingerprint,
-                })
-            });
-        if let Some(verified) = verified {
-            install_active_route(state, hostname, verified);
-        } else {
-            deactivate_route(
-                state,
-                hostname,
-                false,
-                "declared Workload failed exact-hostname TLS revalidation",
-            );
-        }
-    } else if let Ok(mut routes) = state.routes.write()
-        && let Some(active) = routes.get_mut(hostname)
-    {
-        active.tcp_failures = 0;
-    }
-}
-
 fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRoute) {
     if let Some(_permit) = state.probes.acquire(Instant::now() + DISCOVERY_TIMEOUT)
         && let Ok(certificate_fingerprint) = probe_backend(
@@ -1422,13 +1903,14 @@ fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRou
                 incumbent.backend.port
             );
         }
-        install_active_route(
+        let _ = install_active_route(
             state,
             hostname,
             ProbeMatch {
                 backend: incumbent.backend.clone(),
                 certificate_fingerprint,
             },
+            None,
         );
         return;
     }
@@ -1457,7 +1939,7 @@ fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRou
                 replacement.backend.role,
                 replacement.backend.port
             );
-            install_active_route(state, hostname, replacement);
+            let _ = install_active_route(state, hostname, replacement, None);
         }
         _ => {
             record_conflict(
@@ -1475,19 +1957,74 @@ fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRou
     }
 }
 
-fn install_active_route(state: &ProxyState, hostname: &str, matched: ProbeMatch) {
-    if let Ok(mut routes) = state.routes.write() {
-        routes.insert(
-            hostname.to_string(),
-            ActiveRoute {
-                backend: matched.backend.clone(),
-                certificate_fingerprint: matched.certificate_fingerprint.clone(),
-                last_tls_check: Instant::now(),
-                tcp_failures: 0,
-            },
-        );
+fn install_active_route(
+    state: &ProxyState,
+    hostname: &str,
+    matched: ProbeMatch,
+    declaration_generation: Option<u64>,
+) -> Result<(), String> {
+    let profile = state
+        .hosting_profile
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match (declaration_generation, &*profile) {
+        (Some(generation), HostingProfile::Public(snapshot))
+            if snapshot.generation == generation =>
+        {
+            let declaration = snapshot.routes.get(hostname).ok_or_else(|| {
+                "Route Declaration changed while certificate proof was pending".to_string()
+            })?;
+            if declaration.hostname != hostname
+                || declaration.workload != matched.backend.project
+                || declaration.role != matched.backend.role
+            {
+                return Err(
+                    "Route Declaration changed while certificate proof was pending".to_string(),
+                );
+            }
+        }
+        (Some(_), HostingProfile::Public(_)) => {
+            return Err(
+                "ingress config generation changed while certificate proof was pending".to_string(),
+            );
+        }
+        (Some(_), HostingProfile::Development) => {
+            return Err("public Route Declaration is no longer active".to_string());
+        }
+        (None, HostingProfile::Public(_)) => {
+            return Err("dynamic route installation is disabled in public mode".to_string());
+        }
+        (None, HostingProfile::Development) => {}
     }
-    if !state.hosting_profile.is_public() {
+
+    let mut routes = state
+        .routes
+        .write()
+        .map_err(|_| "route table lock poisoned".to_string())?;
+    if !routes.contains_key(hostname) && routes.len() >= MAX_VERIFIED_ROUTES {
+        let _ = state.route_capacity_rejections.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |count| Some(count.saturating_add(1)),
+        );
+        return Err(format!(
+            "verified route capacity of {MAX_VERIFIED_ROUTES} is exhausted"
+        ));
+    }
+    routes.insert(
+        hostname.to_string(),
+        ActiveRoute {
+            backend: matched.backend.clone(),
+            certificate_fingerprint: matched.certificate_fingerprint.clone(),
+            declaration_generation,
+            last_tls_check: Instant::now(),
+            tcp_failures: 0,
+        },
+    );
+    drop(routes);
+    drop(profile);
+
+    if declaration_generation.is_none() {
         route_cache::store(
             &state.config,
             hostname,
@@ -1496,6 +2033,7 @@ fn install_active_route(state: &ProxyState, hostname: &str, matched: ProbeMatch)
             &matched.certificate_fingerprint,
         );
     }
+    Ok(())
 }
 
 fn registration_matches(config: &Path, backend: &Backend) -> bool {
@@ -1747,15 +2285,16 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream, buffered: &[u8]) -> io:
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL,
-        ProbeLimiter, ProbeMatch, ProxyState, WaitingClient, bind_listener, cache_negative,
-        clear_conflict, collect_probe_matches, handle_connection, observe_workloads,
+        ActiveRoute, Backend, MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS,
+        MAX_VERIFIED_ROUTES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter,
+        ProbeMatch, ProxyState, WaitingClient, bind_listener, cache_negative, clear_conflict,
+        collect_probe_matches, handle_connection, install_active_route, observe_workloads,
         prefer_https_per_project, reconcile_routes, reconcile_workloads, record_conflict,
-        render_control_response, resolve_backend, supports_eager_discovery,
+        reload_public_profile, render_control_response, resolve_backend, supports_eager_discovery,
     };
     use crate::{
         admission::AdmissionRejection,
-        ingress_config::{HostingProfile, RouteDeclaration},
+        ingress_config::{HostingProfile, PublicIngressSnapshot, RouteDeclaration},
         route_cache, update_config,
     };
     #[cfg(target_os = "linux")]
@@ -1770,6 +2309,7 @@ mod tests {
         accept, bind, listen, recv, recvmsg, send, socket,
     };
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_RSA_SHA256};
+    use std::collections::BTreeMap;
     use std::fs;
     #[cfg(target_os = "linux")]
     use std::io::IoSliceMut;
@@ -1799,6 +2339,7 @@ mod tests {
         ActiveRoute {
             backend,
             certificate_fingerprint: "AA:BB".to_string(),
+            declaration_generation: None,
             last_tls_check: Instant::now(),
             tcp_failures: 0,
         }
@@ -1814,9 +2355,8 @@ mod tests {
     const TEST_RSA_PRIVATE_KEY: &str = include_str!("../tests/fixtures/proxy-test-rsa-key.pem");
 
     impl TestCertificate {
-        fn parameters_for_hostname(hostname: &str) -> CertificateParams {
-            let mut certificate_params =
-                CertificateParams::new(vec![hostname.to_string()]).unwrap();
+        fn parameters_for_hostnames(hostnames: Vec<String>) -> CertificateParams {
+            let mut certificate_params = CertificateParams::new(hostnames).unwrap();
             let now = SystemTime::now();
             certificate_params.not_before = (now - Duration::from_secs(24 * 60 * 60)).into();
             certificate_params.not_after = (now + Duration::from_secs(30 * 24 * 60 * 60)).into();
@@ -1825,13 +2365,25 @@ mod tests {
             certificate_params
         }
 
+        fn parameters_for_hostname(hostname: &str) -> CertificateParams {
+            Self::parameters_for_hostnames(vec![hostname.to_string()])
+        }
+
         fn for_hostname(hostname: &str) -> Self {
+            Self::for_hostnames(&[hostname])
+        }
+
+        fn for_hostnames(hostnames: &[&str]) -> Self {
             let signing_key =
                 KeyPair::from_pkcs8_pem_and_sign_algo(TEST_RSA_PRIVATE_KEY, &PKCS_RSA_SHA256)
                     .unwrap();
-            let cert = Self::parameters_for_hostname(hostname)
-                .self_signed(&signing_key)
-                .unwrap();
+            let certificate_params = Self::parameters_for_hostnames(
+                hostnames
+                    .iter()
+                    .map(|hostname| hostname.to_string())
+                    .collect(),
+            );
+            let cert = certificate_params.self_signed(&signing_key).unwrap();
             Self {
                 certificate_pem: cert.pem(),
                 private_key_pem: TEST_RSA_PRIVATE_KEY.to_string(),
@@ -1949,14 +2501,17 @@ mod tests {
     }
 
     fn public_profile(hostname: &str, workload: &str) -> HostingProfile {
-        HostingProfile::Public {
+        let declaration = RouteDeclaration {
+            hostname: hostname.to_string(),
+            workload: workload.to_string(),
+            role: "https".to_string(),
+            required: true,
+        };
+        HostingProfile::Public(Arc::new(PublicIngressSnapshot {
             ingress_config: PathBuf::from("ingress.toml"),
-            route: RouteDeclaration {
-                hostname: hostname.to_string(),
-                workload: workload.to_string(),
-                role: "https".to_string(),
-            },
-        }
+            generation: 1,
+            routes: BTreeMap::from([(hostname.to_string(), declaration)]),
+        }))
     }
 
     #[cfg(unix)]
@@ -1992,6 +2547,65 @@ mod tests {
             }
         );
         assert_eq!(backend.accepted(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multiple_declared_routes_activate_only_their_exact_workloads() {
+        const FIRST_HOSTNAME: &str = "api.example.test";
+        const SECOND_HOSTNAME: &str = "www.example.test";
+
+        let directory = tempdir().unwrap();
+        let certificate = TestCertificate::for_hostnames(&[FIRST_HOSTNAME, SECOND_HOSTNAME]);
+        let first_backend = TestTlsBackend::start(&certificate, b"first");
+        let second_backend = TestTlsBackend::start(&certificate, b"second");
+        let registry = write_logical_registry(
+            directory.path(),
+            &[
+                ("api-web", first_backend.port()),
+                ("www-web", second_backend.port()),
+            ],
+        );
+        let routes = [
+            (FIRST_HOSTNAME, "api-web", true),
+            (SECOND_HOSTNAME, "www-web", false),
+        ]
+        .into_iter()
+        .map(|(hostname, workload, required)| {
+            (
+                hostname.to_string(),
+                RouteDeclaration {
+                    hostname: hostname.to_string(),
+                    workload: workload.to_string(),
+                    role: "https".to_string(),
+                    required,
+                },
+            )
+        })
+        .collect();
+        let profile = HostingProfile::Public(Arc::new(PublicIngressSnapshot {
+            ingress_config: PathBuf::from("ingress.toml"),
+            generation: 1,
+            routes,
+        }));
+        let state =
+            ProxyState::new_with_profile_and_connector(registry, profile, certificate.connector());
+
+        reconcile_workloads(&state);
+
+        let active = state.routes.read().unwrap();
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[FIRST_HOSTNAME].backend.project, "api-web");
+        assert_eq!(active[FIRST_HOSTNAME].backend.port, first_backend.port());
+        assert_eq!(active[SECOND_HOSTNAME].backend.project, "www-web");
+        assert_eq!(active[SECOND_HOSTNAME].backend.port, second_backend.port());
+        drop(active);
+        assert_eq!(first_backend.accepted(), 1);
+        assert_eq!(second_backend.accepted(), 1);
+        let status = render_control_response(&state, &AtomicBool::new(false), "STATUS");
+        assert!(status.contains("active_routes=2"), "{status}");
+        assert!(status.contains("ready=true"), "{status}");
+        assert!(status.contains("degraded_routes=0"), "{status}");
     }
 
     #[cfg(target_os = "linux")]
@@ -2176,6 +2790,7 @@ mod tests {
         assert_eq!(&client.join().unwrap(), b"declared");
         assert_eq!(declared_backend.accepted(), 2);
         assert_eq!(decoy_backend.accepted(), 0);
+        assert_eq!(state.undeclared_registrations.load(Ordering::Acquire), 1);
         let active_routes = state.routes.read().unwrap();
         assert_eq!(active_routes.len(), 1);
         assert_eq!(
@@ -2196,6 +2811,10 @@ mod tests {
         assert_eq!(state.handoff_attempts.load(Ordering::Relaxed), 1);
         assert_eq!(state.successful_handoffs.load(Ordering::Relaxed), 0);
         assert_eq!(state.handoff_fallbacks.load(Ordering::Relaxed), 1);
+        let status = render_control_response(&state, &AtomicBool::new(false), "STATUS");
+        assert!(status.contains("ready=true"), "{status}");
+        assert!(status.contains("degraded_routes=0"), "{status}");
+        assert!(status.contains("undeclared_registrations=1"), "{status}");
 
         let undeclared_frontend = TcpListener::bind("127.0.0.1:0").unwrap();
         let undeclared_address = undeclared_frontend.local_addr().unwrap();
@@ -2252,6 +2871,37 @@ mod tests {
         assert!(error.contains("TLS validation failed"), "{error}");
         assert_eq!(untrusted_backend.accepted(), 1);
         assert!(untrusted_state.routes.read().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_registry_port_conflict_never_probes_or_activates_a_declared_route() {
+        const HOSTNAME: &str = "declared.example.test";
+
+        let directory = tempdir().unwrap();
+        let certificate = TestCertificate::for_hostname(HOSTNAME);
+        let backend = TestTlsBackend::start(&certificate, b"never");
+        let registry = write_logical_registry(
+            directory.path(),
+            &[
+                ("declared-web", backend.port()),
+                ("conflicting-web", backend.port()),
+            ],
+        );
+        let state = ProxyState::new_with_profile_and_connector(
+            registry,
+            public_profile(HOSTNAME, "declared-web"),
+            certificate.connector(),
+        );
+
+        reconcile_workloads(&state);
+
+        assert_eq!(backend.accepted(), 0);
+        assert!(state.routes.read().unwrap().is_empty());
+        assert!(!state.registry_valid.load(Ordering::Acquire));
+        assert_eq!(state.rejected_registry_snapshots.load(Ordering::Acquire), 1);
+        let routes = render_control_response(&state, &AtomicBool::new(false), "ROUTES");
+        assert!(routes.contains("required\tregistry_invalid"), "{routes}");
     }
 
     #[test]
@@ -2442,23 +3092,17 @@ mod tests {
         assert!(shutdown.load(Ordering::Acquire));
     }
 
+    #[cfg(unix)]
     #[test]
     fn public_profile_is_observable_and_disables_dynamic_registry_discovery() {
         let directory = tempdir().unwrap();
-        let registry = directory.path().join("ports.toml");
-        update_config(&registry, |document| {
-            document["ports"]["contoso-web"]["https"] = value(4401);
-        });
+        let registry = write_logical_registry(
+            directory.path(),
+            &[("contoso-web", 4401), ("undeclared-web", 4402)],
+        );
         let state = ProxyState::new_with_profile(
             registry,
-            HostingProfile::Public {
-                ingress_config: directory.path().join("ingress.toml"),
-                route: RouteDeclaration {
-                    hostname: "declared.example.com".to_string(),
-                    workload: "contoso-web".to_string(),
-                    role: "https".to_string(),
-                },
-            },
+            public_profile("declared.example.com", "contoso-web"),
         );
 
         reconcile_workloads(&state);
@@ -2474,6 +3118,154 @@ mod tests {
         let status = render_control_response(&state, &shutdown, "STATUS");
         assert!(status.contains("hosting_profile=public"));
         assert!(status.contains("active_routes=0"));
+        assert!(status.contains("declared_routes=1"));
+        assert!(status.contains("required_routes=1"));
+        assert!(status.contains("ready=false"));
+        assert!(status.contains("degraded_routes=1"));
+        assert!(status.contains("registry_valid=true"));
+        assert!(status.contains("undeclared_registrations=1"));
+    }
+
+    #[test]
+    fn reload_is_atomic_and_stale_certificate_results_cannot_cross_generations() {
+        let directory = tempdir().unwrap();
+        let ingress_config = directory.path().join("ingress.toml");
+        fs::write(
+            &ingress_config,
+            "[ingress]\nmode = \"public\"\n\
+             [ingress.hosts.\"www.example.com\"]\n\
+             workload = \"contoso-web\"\nrole = \"https\"\nrequired = true\n",
+        )
+        .unwrap();
+        let profile = HostingProfile::load(Some(ingress_config.clone())).unwrap();
+        let state =
+            ProxyState::new_with_profile(directory.path().join("ports.toml"), profile.clone());
+        let declared_backend = Backend {
+            project: "contoso-web".to_string(),
+            role: "https".to_string(),
+            port: 4401,
+        };
+        let mut active = active_route(declared_backend.clone());
+        active.declaration_generation = Some(1);
+        state
+            .routes
+            .write()
+            .unwrap()
+            .insert("www.example.com".to_string(), active);
+
+        fs::write(
+            &ingress_config,
+            "[ingress]\nmode = \"public\"\n\
+             [ingress.hosts.\"DUPLICATE.example.com.\"]\nworkload = \"first-web\"\nrole = \"https\"\n\
+             [ingress.hosts.\"duplicate.example.com\"]\nworkload = \"second-web\"\nrole = \"https\"\n",
+        )
+        .unwrap();
+        reload_public_profile(&state);
+        assert_eq!(state.public_snapshot().unwrap().generation, 1);
+        assert_eq!(
+            state.routes.read().unwrap()["www.example.com"].declaration_generation,
+            Some(1)
+        );
+        let rejected = render_control_response(&state, &AtomicBool::new(false), "STATUS");
+        assert!(rejected.contains("last_reload_error=config_invalid"));
+        assert!(rejected.contains("last_rejected_config_generation=2"));
+
+        fs::write(
+            &ingress_config,
+            "[ingress]\nmode = \"public\"\n\
+             [ingress.hosts.\"www.example.com\"]\n\
+             workload = \"contoso-web\"\nrole = \"https\"\nrequired = false\n",
+        )
+        .unwrap();
+        reload_public_profile(&state);
+        assert_eq!(state.public_snapshot().unwrap().generation, 2);
+        assert_eq!(
+            state.routes.read().unwrap()["www.example.com"].declaration_generation,
+            Some(2)
+        );
+        assert!(
+            install_active_route(
+                &state,
+                "www.example.com",
+                ProbeMatch {
+                    backend: declared_backend,
+                    certificate_fingerprint: "stale".to_string(),
+                },
+                Some(1),
+            )
+            .unwrap_err()
+            .contains("generation changed")
+        );
+        assert_ne!(
+            state.routes.read().unwrap()["www.example.com"].certificate_fingerprint,
+            "stale"
+        );
+
+        fs::write(
+            &ingress_config,
+            "[ingress]\nmode = \"public\"\n\
+             [ingress.hosts.\"www.example.com\"]\n\
+             workload = \"replacement-web\"\nrole = \"https\"\nrequired = true\n",
+        )
+        .unwrap();
+        reload_public_profile(&state);
+        assert_eq!(state.public_snapshot().unwrap().generation, 3);
+        assert!(state.routes.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn verified_routes_and_conflict_diagnostics_stop_at_fixed_bounds() {
+        let directory = tempdir().unwrap();
+        let state = ProxyState::new(directory.path().join("ports.toml"));
+        {
+            let mut routes = state.routes.write().unwrap();
+            for index in 0..MAX_VERIFIED_ROUTES {
+                routes.insert(
+                    format!("route-{index}.example.com"),
+                    active_route(backend()),
+                );
+            }
+        }
+        let error = install_active_route(
+            &state,
+            "overflow.example.com",
+            ProbeMatch {
+                backend: backend(),
+                certificate_fingerprint: "AA:BB".to_string(),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("verified route capacity"), "{error}");
+        assert_eq!(state.routes.read().unwrap().len(), MAX_VERIFIED_ROUTES);
+        assert_eq!(state.route_capacity_rejections.load(Ordering::Acquire), 1);
+
+        {
+            let mut conflicts = state.conflicts.write().unwrap();
+            for index in 0..MAX_ROUTE_CONFLICTS {
+                conflicts.insert(format!("conflict-{index}.example.com"), vec![backend()]);
+            }
+        }
+        record_conflict(
+            &state,
+            "overflow.example.com",
+            vec![backend(), {
+                let mut contender = backend();
+                contender.port = 4402;
+                contender
+            }],
+        );
+        assert_eq!(state.conflicts.read().unwrap().len(), MAX_ROUTE_CONFLICTS);
+        assert_eq!(state.conflict_capacity_drops.load(Ordering::Acquire), 1);
+        let diagnostics = render_control_response(&state, &AtomicBool::new(false), "ROUTES");
+        assert_eq!(diagnostics.lines().count(), MAX_ROUTE_DIAGNOSTICS + 1);
+        assert!(
+            diagnostics
+                .lines()
+                .last()
+                .is_some_and(|line| line.starts_with("truncated\t")),
+            "{diagnostics}"
+        );
     }
 
     #[test]

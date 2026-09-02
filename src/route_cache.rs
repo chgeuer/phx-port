@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, value};
 
 const TABLE: &str = "discovered_routes";
+const MAX_CACHED_ROUTES: usize = 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CachedRoute {
@@ -37,6 +38,32 @@ pub fn store(
     update_config(path, |document| {
         if !document.contains_table(TABLE) {
             document[TABLE] = toml_edit::table();
+        }
+        let routes = document[TABLE]
+            .as_table_mut()
+            .expect("the discovered route table was just created");
+        let target_len = routes
+            .len()
+            .saturating_add(usize::from(!routes.contains_key(hostname)));
+        let remove_count = target_len.saturating_sub(MAX_CACHED_ROUTES);
+        if remove_count > 0 {
+            let mut oldest = routes
+                .iter()
+                .filter(|(candidate, _)| *candidate != hostname)
+                .map(|(candidate, item)| {
+                    (
+                        item.as_table()
+                            .and_then(|route| route.get("last_verified_unix"))
+                            .and_then(|item| item.as_integer())
+                            .unwrap_or(i64::MIN),
+                        candidate.to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            oldest.sort();
+            for (_, candidate) in oldest.into_iter().take(remove_count) {
+                routes.remove(&candidate);
+            }
         }
         document[TABLE][hostname] = toml_edit::table();
         document[TABLE][hostname]["project"] = value(project);
@@ -107,7 +134,7 @@ pub fn print(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{load, remove, remove_for_registration, store};
+    use super::{MAX_CACHED_ROUTES, load, remove, remove_for_registration, store};
     use crate::{read_config, update_config};
     use tempfile::tempdir;
     use toml_edit::value;
@@ -158,5 +185,31 @@ mod tests {
 
         assert!(load(&path, "one.example.com").is_none());
         assert!(load(&path, "two.example.com").is_some());
+    }
+
+    #[test]
+    fn persistent_routes_evict_oldest_entries_at_the_fixed_bound() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ports.toml");
+        update_config(&path, |document| {
+            document["discovered_routes"] = toml_edit::table();
+            for index in 0..MAX_CACHED_ROUTES {
+                let hostname = format!("host-{index}.example.com");
+                document["discovered_routes"][&hostname] = toml_edit::table();
+                document["discovered_routes"][&hostname]["project"] = value("/project");
+                document["discovered_routes"][&hostname]["role"] = value("https");
+                document["discovered_routes"][&hostname]["certificate_fingerprint"] = value("AA");
+                document["discovered_routes"][&hostname]["last_verified_unix"] =
+                    value(i64::try_from(index).unwrap());
+            }
+        });
+
+        store(&path, "newest.example.com", "/project", "https", "BB");
+
+        let document = read_config(&path);
+        let routes = document["discovered_routes"].as_table().unwrap();
+        assert_eq!(routes.len(), MAX_CACHED_ROUTES);
+        assert!(!routes.contains_key("host-0.example.com"));
+        assert!(routes.contains_key("newest.example.com"));
     }
 }
