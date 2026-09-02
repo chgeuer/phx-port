@@ -60,6 +60,16 @@ and GitHub Copilot CLI are available. The clean campaign baseline on
 2026-09-02 is 38 passing Rust tests with clean formatting and no clippy
 warnings.
 
+A macOS validation host is available over SSH as
+`mini.geuer-pollmann.de`, with a checkout at `~/phx-port/`. Use it only when
+the selected issue requires executable Darwin, launchd, or macOS PHXP
+evidence. Before synchronizing or changing anything, inspect the remote
+checkout's branch and worktree and stop rather than overwrite unrelated or
+uncommitted work. Synchronize committed work through Git (direct host
+push/pull is allowed; GitHub is not required), run the issue-specific macOS
+gates in `~/phx-port/`, and record the exact commit and commands in the issue
+closure. Do not copy credentials or other host secrets into this repository.
+
 Every implementation issue must pass all of:
 
 ```bash
