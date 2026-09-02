@@ -1926,6 +1926,7 @@ mod tests {
     #[cfg(unix)]
     fn write_logical_registry(directory: &Path, assignments: &[(&str, u16)]) -> PathBuf {
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = directory.canonicalize().unwrap();
         let registry = directory.join("ports.toml");
         let mut content = String::from("[ports]\n");
         for (workload, port) in assignments {
@@ -1954,7 +1955,7 @@ mod tests {
 
         let directory = tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let registry = directory.path().join("ports.toml");
+        let registry = directory.path().canonicalize().unwrap().join("ports.toml");
         let certificate = TestCertificate::for_hostname(HOSTNAME);
         let backend = TestTlsBackend::start(&certificate, b"late");
         let state = ProxyState::new_with_profile_and_connector(
