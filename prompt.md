@@ -70,6 +70,14 @@ push/pull is allowed; GitHub is not required), run the issue-specific macOS
 gates in `~/phx-port/`, and record the exact commit and commands in the issue
 closure. Do not copy credentials or other host secrets into this repository.
 
+Three operator-provided TLS test identities are available locally at
+`~/.dns/production/{a,b,c}.pollmann.rocks.{crt,key}`. Their hostnames resolve
+to localhost and may be used for route, certificate, integration, and
+adversarial-harness tests. Treat the key files as secrets: never print, copy,
+embed, upload, or commit their contents, and pass only their paths to test
+processes. These localhost identities are test fixtures, not evidence for the
+later public DNS/canary gate.
+
 Every implementation issue must pass all of:
 
 ```bash
