@@ -666,6 +666,21 @@ failover. Newly added explicit `https` workloads are checked for conflicts
 through eager discovery. Rotated certificates are served immediately by the
 backend because phx-port does not terminate TLS.
 
+For every verified declared route, the probe retains only the leaf SHA-256
+fingerprint and `notAfter` Unix time. Public status caps certificate detail at
+64 rows, while the loopback Prometheus endpoint emits one certificate-expiry
+sample per active declaration, so both remain bounded by the 1,000-declaration
+limit. Fixed 30-, 14-, 7-, and 1-day states produce one structured warning
+when each threshold is crossed. A near-expiry warning does not affect
+readiness. At actual expiry, selection fails closed immediately, reconciliation
+deactivates the route, and required versus optional declaration policy governs
+readiness. An inactive declaration reactivates only after an atomically
+replaced leaf passes the same system-trusted exact-hostname probe. On an active
+route, clients receive and validate the replacement leaf end to end immediately
+and the next successful ingress probe records the rotation. A changed
+fingerprint emits a bounded event without logging either fingerprint or
+certificate material.
+
 ## Conflicts
 
 If multiple active workloads present valid certificates for the same requested
@@ -854,7 +869,7 @@ certificate rotation through application-owned TLS configuration.
 
 Additional automated coverage remains desirable for sustained connection
 draining, concurrent registry writers under load, gRPC or other non-HTTP TLS
-protocols, and certificate expiration or hostname removal.
+protocols, and certificate hostname removal.
 
 ## Limitations
 

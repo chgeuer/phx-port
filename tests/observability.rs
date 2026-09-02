@@ -241,7 +241,14 @@ fn metrics_listener_is_bounded_read_only_and_uses_only_declared_labels() {
         ),
         "{body}"
     );
-    for forbidden in ["source=", "connection_id", "certificate", "error="] {
+    for forbidden in [
+        "source=",
+        "connection_id",
+        "certificate_fingerprint",
+        "BEGIN CERTIFICATE",
+        "private_key",
+        "error=",
+    ] {
         assert!(
             !body.contains(forbidden),
             "metrics leaked forbidden label {forbidden:?}:\n{body}"

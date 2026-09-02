@@ -183,6 +183,10 @@ endpoint. A bind or setup failure emits a bounded
 plane. Capacity, delivery, reload, registry, and aggregate route metrics use
 fixed labels. Per-route metrics are emitted only for the at-most-1,000 Route
 Declarations, never for dynamically supplied SNI or source addresses.
+Each active declared route publishes
+`phx_port_route_certificate_not_after_seconds` with only its bounded declared
+hostname and one fixed `expiry_state`: `valid`, `warning_30_days`,
+`warning_14_days`, `warning_7_days`, `warning_1_day`, or `expired`.
 
 Temporary source diagnostics are a separate explicit opt-in:
 
@@ -406,8 +410,17 @@ phx-port proxy uninstall-service
 ```
 
 `status --json` emits schema version 1 with liveness, drain state, readiness,
-generation, bounded degraded Route Declaration detail, capacity use, and
-counters.
+generation, bounded degraded Route Declaration detail, capacity use, counters,
+and at most 64 `certificate_routes` containing the leaf `notAfter` Unix time
+and fixed expiry state. `certificate_route_count` and
+`certificate_routes_omitted` preserve the total without allowing an
+unbounded control response. The daemon emits one
+`event=certificate result=expiry_warning` as each verified leaf enters the
+30-, 14-, 7-, and 1-day windows, plus a fingerprint-change
+`result=rotated` event after a replacement leaf verifies. These records never
+contain a private key, certificate body, or fingerprint. Near-expiry warnings
+do not make a route unready; actual expiry or any failed exact-hostname trust
+check deactivates it, and a required declaration then makes readiness false.
 `check --live` and `check --ready` emit the same bounded JSON; exit status 0
 means the requested condition is true, while status 1 means it is false or the
 authenticated local endpoint cannot be queried.

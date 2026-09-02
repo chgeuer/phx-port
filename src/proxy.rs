@@ -68,6 +68,7 @@ const CONTROL_IO_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CONTROL_REQUEST_LIMIT: u64 = 1024;
 const CONTROL_RESPONSE_LIMIT: u64 = 64 * 1024;
 const CONTROL_SCHEMA_VERSION: u32 = 1;
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Clone)]
@@ -195,18 +196,83 @@ struct Backend {
     port: u16,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CertificateProof {
+    fingerprint: String,
+    not_after_unix_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CertificateExpiryState {
+    Valid,
+    Warning30Days,
+    Warning14Days,
+    Warning7Days,
+    Warning1Day,
+    Expired,
+}
+
+impl CertificateExpiryState {
+    fn at(not_after_unix_seconds: u64, now_unix_seconds: u64) -> Self {
+        if now_unix_seconds >= not_after_unix_seconds {
+            return Self::Expired;
+        }
+        match not_after_unix_seconds.saturating_sub(now_unix_seconds) {
+            remaining if remaining <= SECONDS_PER_DAY => Self::Warning1Day,
+            remaining if remaining <= 7 * SECONDS_PER_DAY => Self::Warning7Days,
+            remaining if remaining <= 14 * SECONDS_PER_DAY => Self::Warning14Days,
+            remaining if remaining <= 30 * SECONDS_PER_DAY => Self::Warning30Days,
+            _ => Self::Valid,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::Warning30Days => "warning_30_days",
+            Self::Warning14Days => "warning_14_days",
+            Self::Warning7Days => "warning_7_days",
+            Self::Warning1Day => "warning_1_day",
+            Self::Expired => "expired",
+        }
+    }
+
+    const fn warning_threshold_days(self) -> Option<u8> {
+        match self {
+            Self::Warning30Days => Some(30),
+            Self::Warning14Days => Some(14),
+            Self::Warning7Days => Some(7),
+            Self::Warning1Day => Some(1),
+            Self::Valid | Self::Expired => None,
+        }
+    }
+}
+
+impl CertificateProof {
+    fn expiry_state_at(&self, now_unix_seconds: u64) -> CertificateExpiryState {
+        CertificateExpiryState::at(self.not_after_unix_seconds, now_unix_seconds)
+    }
+}
+
 struct ProbeMatch {
     backend: Backend,
-    certificate_fingerprint: String,
+    certificate: CertificateProof,
 }
 
 #[derive(Clone)]
 struct ActiveRoute {
     backend: Backend,
-    certificate_fingerprint: String,
+    certificate: CertificateProof,
+    last_expiry_warning: Option<CertificateExpiryState>,
     declaration_generation: Option<u64>,
     last_tls_check: Instant,
     tcp_failures: u8,
+}
+
+impl ActiveRoute {
+    fn certificate_is_valid_at(&self, now_unix_seconds: u64) -> bool {
+        self.certificate.expiry_state_at(now_unix_seconds) != CertificateExpiryState::Expired
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,6 +280,7 @@ enum RouteFailure {
     MissingRegistration,
     RegistryInvalid,
     VerificationFailed,
+    CertificateExpired,
     CapacityUnavailable,
 }
 
@@ -223,9 +290,16 @@ impl RouteFailure {
             Self::MissingRegistration => "missing_registration",
             Self::RegistryInvalid => "registry_invalid",
             Self::VerificationFailed => "verification_failed",
+            Self::CertificateExpired => "certificate_expired",
             Self::CapacityUnavailable => "capacity_unavailable",
         }
     }
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(u64::MAX, |duration| duration.as_secs())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1717,14 +1791,7 @@ async fn select_tokio_route(
     hostname: &str,
     ingress: &TokioIngress,
 ) -> Result<(Backend, bool), String> {
-    if let Some(backend) = ingress
-        .state
-        .routes
-        .read()
-        .map_err(|_| "route table lock poisoned".to_string())?
-        .get(hostname)
-        .map(|route| route.backend.clone())
-    {
+    if let Some(backend) = current_active_backend(&ingress.state, hostname)? {
         return Ok((backend, true));
     }
 
@@ -1771,6 +1838,27 @@ async fn select_tokio_route(
                 .state
                 .record_admission_rejection(AdmissionRejection::RoutingTimeout);
             Err("route selection timed out".to_string())
+        }
+    }
+}
+
+fn current_active_backend(state: &ProxyState, hostname: &str) -> Result<Option<Backend>, String> {
+    loop {
+        let active = state
+            .routes
+            .read()
+            .map_err(|_| "route table lock poisoned".to_string())?
+            .get(hostname)
+            .cloned();
+        let Some(active) = active else {
+            return Ok(None);
+        };
+        let now_unix_seconds = current_unix_seconds();
+        if active.certificate_is_valid_at(now_unix_seconds) {
+            return Ok(Some(active.backend));
+        }
+        if deactivate_expired_route(state, hostname, now_unix_seconds) {
+            return Ok(None);
         }
     }
 }
@@ -2451,14 +2539,16 @@ fn route_summary_for_profile(state: &ProxyState, profile: &HostingProfile) -> Ro
         };
     };
 
+    let now_unix_seconds = current_unix_seconds();
     let active_hostnames = routes
         .iter()
         .filter_map(|(hostname, active)| {
             let declaration = snapshot.routes.get(hostname)?;
             (active.declaration_generation == Some(snapshot.generation)
                 && declaration.workload == active.backend.project
-                && declaration.role == active.backend.role)
-                .then_some(hostname)
+                && declaration.role == active.backend.role
+                && active.certificate_is_valid_at(now_unix_seconds))
+            .then_some(hostname)
         })
         .collect::<BTreeSet<_>>();
     let required_routes = snapshot
@@ -2495,6 +2585,16 @@ struct DegradedRouteStatus {
     role: String,
     required: bool,
     reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct DeclaredCertificateStatus {
+    hostname: String,
+    workload: String,
+    role: String,
+    required: bool,
+    not_after_unix_seconds: u64,
+    expiry_state: &'static str,
 }
 
 #[derive(Serialize)]
@@ -2593,6 +2693,9 @@ struct ControlJsonStatus {
     degraded_route_count: usize,
     degraded_routes: Vec<DegradedRouteStatus>,
     degraded_routes_omitted: usize,
+    certificate_route_count: usize,
+    certificate_routes: Vec<DeclaredCertificateStatus>,
+    certificate_routes_omitted: usize,
     configuration: ControlConfigurationStatus,
     admission: ControlAdmissionStatus,
     activity: ControlActivityStatus,
@@ -2606,19 +2709,29 @@ fn degraded_route_statuses(
     let Some(snapshot) = profile.public_snapshot() else {
         return Vec::new();
     };
-    let active_hostnames = state
+    let now_unix_seconds = current_unix_seconds();
+    let (active_hostnames, expired_hostnames) = state
         .routes
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
-        .filter_map(|(hostname, active)| {
-            let declaration = snapshot.routes.get(hostname)?;
-            (active.declaration_generation == Some(snapshot.generation)
-                && declaration.workload == active.backend.project
-                && declaration.role == active.backend.role)
-                .then(|| hostname.clone())
-        })
-        .collect::<BTreeSet<_>>();
+        .fold(
+            (BTreeSet::new(), BTreeSet::new()),
+            |(mut active_hostnames, mut expired_hostnames), (hostname, active)| {
+                if snapshot.routes.get(hostname).is_some_and(|declaration| {
+                    active.declaration_generation == Some(snapshot.generation)
+                        && declaration.workload == active.backend.project
+                        && declaration.role == active.backend.role
+                }) {
+                    if active.certificate_is_valid_at(now_unix_seconds) {
+                        active_hostnames.insert(hostname.clone());
+                    } else {
+                        expired_hostnames.insert(hostname.clone());
+                    }
+                }
+                (active_hostnames, expired_hostnames)
+            },
+        );
     let failures = state
         .route_failures
         .read()
@@ -2640,6 +2753,8 @@ fn degraded_route_statuses(
         .map(|(hostname, declaration)| {
             let reason = if conflicts.contains(hostname) {
                 "conflict"
+            } else if expired_hostnames.contains(hostname) {
+                RouteFailure::CertificateExpired.label()
             } else {
                 failures
                     .get(hostname)
@@ -2658,10 +2773,50 @@ fn degraded_route_statuses(
         .collect()
 }
 
+fn declared_certificate_statuses(
+    state: &ProxyState,
+    profile: &HostingProfile,
+) -> (usize, Vec<DeclaredCertificateStatus>) {
+    let Some(snapshot) = profile.public_snapshot() else {
+        return (0, Vec::new());
+    };
+    let now_unix_seconds = current_unix_seconds();
+    let routes = state
+        .routes
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut count = 0;
+    let statuses = snapshot
+        .routes
+        .iter()
+        .filter_map(|(hostname, declaration)| {
+            let active = routes.get(hostname)?;
+            if active.declaration_generation != Some(snapshot.generation)
+                || declaration.workload != active.backend.project
+                || declaration.role != active.backend.role
+            {
+                return None;
+            }
+            count += 1;
+            (count <= MAX_ROUTE_DIAGNOSTICS).then(|| DeclaredCertificateStatus {
+                hostname: hostname.clone(),
+                workload: declaration.workload.clone(),
+                role: declaration.role.clone(),
+                required: declaration.required,
+                not_after_unix_seconds: active.certificate.not_after_unix_seconds,
+                expiry_state: active.certificate.expiry_state_at(now_unix_seconds).label(),
+            })
+        })
+        .collect();
+    (count, statuses)
+}
+
 fn render_json_control_status(state: &ProxyState, shutdown: &IngressShutdown) -> String {
     let profile = state.hosting_profile();
     let route_summary = route_summary_for_profile(state, &profile);
     let degraded_routes = degraded_route_statuses(state, &profile);
+    let (certificate_route_count, certificate_routes) =
+        declared_certificate_statuses(state, &profile);
     let admission = state.admission.snapshot();
     let mut listeners = state
         .listeners
@@ -2706,6 +2861,9 @@ fn render_json_control_status(state: &ProxyState, shutdown: &IngressShutdown) ->
         degraded_routes_omitted: route_summary
             .degraded_routes
             .saturating_sub(MAX_ROUTE_DIAGNOSTICS),
+        certificate_route_count,
+        certificate_routes_omitted: certificate_route_count.saturating_sub(MAX_ROUTE_DIAGNOSTICS),
+        certificate_routes,
         configuration: ControlConfigurationStatus {
             registry_valid: state.registry_valid.load(Ordering::Acquire),
             undeclared_registrations: state.undeclared_registrations.load(Ordering::Acquire),
@@ -3033,13 +3191,19 @@ fn render_prometheus_metrics(state: &ProxyState, shutdown: &IngressShutdown) -> 
             .route_failures
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now_unix_seconds = current_unix_seconds();
         for (hostname, declaration) in &snapshot.routes {
-            let route_state = if routes.get(hostname).is_some_and(|active| {
+            let active = routes.get(hostname).filter(|active| {
                 active.declaration_generation == Some(snapshot.generation)
                     && active.backend.project == declaration.workload
                     && active.backend.role == declaration.role
-            }) {
-                "active"
+            });
+            let route_state = if let Some(active) = active {
+                if active.certificate_is_valid_at(now_unix_seconds) {
+                    "active"
+                } else {
+                    RouteFailure::CertificateExpired.label()
+                }
             } else if conflicts.contains_key(hostname) {
                 "conflict"
             } else {
@@ -3056,6 +3220,14 @@ fn render_prometheus_metrics(state: &ProxyState, shutdown: &IngressShutdown) -> 
                 prometheus_label(&declaration.role),
                 declaration.required
             );
+            if let Some(active) = active {
+                metric!(
+                    "phx_port_route_certificate_not_after_seconds{{hostname=\"{}\",expiry_state=\"{}\"}} {}",
+                    prometheus_label(hostname),
+                    active.certificate.expiry_state_at(now_unix_seconds).label(),
+                    active.certificate.not_after_unix_seconds
+                );
+            }
         }
     }
     output
@@ -3202,6 +3374,8 @@ fn render_control_response(
             let public_snapshot = profile.public_snapshot();
             let mut lines = Vec::new();
             let mut active_hostnames = BTreeSet::new();
+            let mut expired_hostnames = BTreeSet::new();
+            let now_unix_seconds = current_unix_seconds();
             if let Ok(routes) = state.routes.read() {
                 for (hostname, route) in routes.iter() {
                     if let Some(snapshot) = public_snapshot.as_ref() {
@@ -3215,13 +3389,20 @@ fn render_control_response(
                             continue;
                         }
                     }
+                    let expiry_state = route.certificate.expiry_state_at(now_unix_seconds);
+                    if expiry_state == CertificateExpiryState::Expired {
+                        expired_hostnames.insert(hostname.clone());
+                        continue;
+                    }
                     active_hostnames.insert(hostname.clone());
                     lines.push(format!(
-                        "active\t{hostname}\t{}\t{}\t{}\t{}",
+                        "active\t{hostname}\t{}\t{}\t{}\t{}\t{}\t{}",
                         route.backend.project,
                         route.backend.role,
                         route.backend.port,
-                        route.certificate_fingerprint
+                        route.certificate.fingerprint,
+                        route.certificate.not_after_unix_seconds,
+                        expiry_state.label()
                     ));
                 }
             }
@@ -3251,11 +3432,15 @@ fn render_control_response(
                     } else {
                         "optional"
                     };
-                    let reason = failures
-                        .get(hostname)
-                        .copied()
-                        .map(RouteFailure::label)
-                        .unwrap_or("pending");
+                    let reason = if expired_hostnames.contains(hostname) {
+                        RouteFailure::CertificateExpired.label()
+                    } else {
+                        failures
+                            .get(hostname)
+                            .copied()
+                            .map(RouteFailure::label)
+                            .unwrap_or("pending")
+                    };
                     lines.push(format!(
                         "inactive\t{hostname}\t{}\t{}\t{requirement}\t{reason}",
                         declaration.workload, declaration.role
@@ -3331,12 +3516,7 @@ fn handle_connection(
         .set_read_timeout(None)
         .map_err(|error| format!("cannot clear ClientHello timeout before handoff: {error}"))?;
 
-    let cached_backend = state
-        .routes
-        .read()
-        .map_err(|_| "route table lock poisoned".to_string())?
-        .get(&hostname)
-        .map(|route| route.backend.clone());
+    let cached_backend = current_active_backend(&state, &hostname)?;
     let backend = if let Some(backend) = cached_backend.as_ref() {
         backend.clone()
     } else {
@@ -3750,7 +3930,7 @@ fn activate_declared_route_until(
     {
         return Err("logical Workload registration does not match its declaration".to_string());
     }
-    let certificate_fingerprint = probe_declared_backend_until(hostname, &backend, state, deadline)
+    let certificate = probe_declared_backend_until(hostname, &backend, state, deadline)
         .inspect_err(|_| {
             set_route_failure(state, hostname, RouteFailure::VerificationFailed);
         })?;
@@ -3760,7 +3940,7 @@ fn activate_declared_route_until(
         hostname,
         ProbeMatch {
             backend: backend.clone(),
-            certificate_fingerprint,
+            certificate,
         },
         Some(generation),
     )
@@ -3782,7 +3962,7 @@ fn probe_declared_backend_until(
     backend: &Backend,
     state: &ProxyState,
     deadline: Instant,
-) -> Result<String, String> {
+) -> Result<CertificateProof, String> {
     ensure_before_route_deadline(deadline)?;
     let permit = state.probes.acquire(deadline).ok_or_else(|| {
         set_route_failure(state, hostname, RouteFailure::CapacityUnavailable);
@@ -4097,6 +4277,11 @@ fn reconcile_public_workloads(state: &ProxyState, snapshot: &PublicIngressSnapsh
         };
 
         if let Some(active) = active {
+            let now_unix_seconds = current_unix_seconds();
+            if !active.certificate_is_valid_at(now_unix_seconds) {
+                deactivate_expired_route(state, hostname, now_unix_seconds);
+                continue;
+            }
             if !is_port_open(i64::from(active.backend.port)) {
                 record_tcp_failure(state, hostname);
                 continue;
@@ -4145,12 +4330,12 @@ fn revalidate_declared_route(
         set_route_failure(state, hostname, RouteFailure::CapacityUnavailable);
         return;
     };
-    let certificate_fingerprint = match probe_backend(
+    let certificate = match probe_backend(
         hostname,
         &route.backend,
         state.probe_connector_override.as_ref(),
     ) {
-        Ok(certificate_fingerprint) => certificate_fingerprint,
+        Ok(certificate) => certificate,
         Err(_) => {
             deactivate_route(state, hostname, false, "verification_failed");
             set_route_failure(state, hostname, RouteFailure::VerificationFailed);
@@ -4162,7 +4347,7 @@ fn revalidate_declared_route(
         hostname,
         ProbeMatch {
             backend: route.backend.clone(),
-            certificate_fingerprint,
+            certificate,
         },
         Some(snapshot.generation),
     )
@@ -4243,6 +4428,11 @@ fn reconcile_routes(state: &ProxyState) {
     };
 
     for (hostname, route) in routes {
+        let now_unix_seconds = current_unix_seconds();
+        if !route.certificate_is_valid_at(now_unix_seconds) {
+            deactivate_expired_route(state, &hostname, now_unix_seconds);
+            continue;
+        }
         if !registration_matches(&state.config, &route.backend) {
             deactivate_route(state, &hostname, true, "registration_removed");
             continue;
@@ -4267,25 +4457,19 @@ fn reconcile_routes(state: &ProxyState) {
 
 fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRoute) {
     if let Some(_permit) = state.probes.acquire(Instant::now() + DISCOVERY_TIMEOUT)
-        && let Ok(certificate_fingerprint) = probe_backend(
+        && let Ok(certificate) = probe_backend(
             hostname,
             &incumbent.backend,
             state.probe_connector_override.as_ref(),
         )
     {
         clear_conflict(state, hostname);
-        if certificate_fingerprint != incumbent.certificate_fingerprint {
-            eprintln!(
-                "event=certificate result=rotated hostname={hostname} backend_port={}",
-                incumbent.backend.port
-            );
-        }
         let _ = install_active_route(
             state,
             hostname,
             ProbeMatch {
                 backend: incumbent.backend.clone(),
-                certificate_fingerprint,
+                certificate,
             },
             None,
         );
@@ -4339,6 +4523,11 @@ fn install_active_route(
     matched: ProbeMatch,
     declaration_generation: Option<u64>,
 ) -> Result<(), String> {
+    let now_unix_seconds = current_unix_seconds();
+    let expiry_state = matched.certificate.expiry_state_at(now_unix_seconds);
+    if expiry_state == CertificateExpiryState::Expired {
+        return Err("certificate expired before route activation".to_string());
+    }
     let profile = state
         .hosting_profile
         .read()
@@ -4388,6 +4577,31 @@ fn install_active_route(
             "verified route capacity of {MAX_VERIFIED_ROUTES} is exhausted"
         ));
     }
+    let previous = routes.get(hostname);
+    let same_certificate = previous.is_some_and(|active| {
+        active.backend == matched.backend
+            && active.certificate.fingerprint == matched.certificate.fingerprint
+    });
+    let rotated = previous.is_some_and(|active| {
+        active.backend == matched.backend
+            && active.certificate.fingerprint != matched.certificate.fingerprint
+    });
+    let previous_warning = if same_certificate {
+        previous.and_then(|active| active.last_expiry_warning)
+    } else {
+        None
+    };
+    let current_warning = expiry_state.warning_threshold_days().map(|_| expiry_state);
+    let warning_to_emit = if declaration_generation.is_some() {
+        current_warning
+            .filter(|warning| previous_warning.is_none_or(|previous| *warning > previous))
+    } else {
+        None
+    };
+    let last_expiry_warning = match (previous_warning, current_warning) {
+        (Some(previous), Some(current)) => Some(previous.max(current)),
+        (previous, current) => previous.or(current),
+    };
     if let Some((route_cache_path, route_cache_storage)) = route_cache {
         route_cache::store(
             route_cache_path,
@@ -4395,14 +4609,15 @@ fn install_active_route(
             hostname,
             &matched.backend.project,
             &matched.backend.role,
-            &matched.certificate_fingerprint,
+            &matched.certificate.fingerprint,
         )?;
     }
     routes.insert(
         hostname.to_string(),
         ActiveRoute {
             backend: matched.backend.clone(),
-            certificate_fingerprint: matched.certificate_fingerprint.clone(),
+            certificate: matched.certificate.clone(),
+            last_expiry_warning,
             declaration_generation,
             last_tls_check: Instant::now(),
             tcp_failures: 0,
@@ -4410,6 +4625,22 @@ fn install_active_route(
     );
     drop(routes);
     drop(profile);
+
+    if rotated {
+        eprintln!(
+            "event=certificate result=rotated hostname={hostname} backend_port={}",
+            matched.backend.port
+        );
+    }
+    if let Some(warning) = warning_to_emit {
+        eprintln!(
+            "event=certificate result=expiry_warning hostname={hostname} threshold_days={} not_after_unix_seconds={}",
+            warning
+                .warning_threshold_days()
+                .expect("only warning states are emitted"),
+            matched.certificate.not_after_unix_seconds
+        );
+    }
 
     Ok(())
 }
@@ -4440,6 +4671,25 @@ fn record_tcp_failure(state: &ProxyState, hostname: &str) {
     if failures.is_some_and(|failures| failures >= TCP_FAILURE_THRESHOLD) {
         deactivate_route(state, hostname, false, "backend_unavailable");
     }
+}
+
+fn deactivate_expired_route(state: &ProxyState, hostname: &str, now_unix_seconds: u64) -> bool {
+    let removed = state.routes.write().ok().is_some_and(|mut routes| {
+        if routes
+            .get(hostname)
+            .is_some_and(|route| !route.certificate_is_valid_at(now_unix_seconds))
+        {
+            routes.remove(hostname);
+            true
+        } else {
+            false
+        }
+    });
+    if removed {
+        set_route_failure(state, hostname, RouteFailure::CertificateExpired);
+        eprintln!("event=route result=deactivated hostname={hostname} reason=certificate_expired");
+    }
+    removed
 }
 
 fn deactivate_route(state: &ProxyState, hostname: &str, remove_cached: bool, reason: &'static str) {
@@ -4573,10 +4823,10 @@ fn probe_candidates_until(
             .spawn(move || {
                 let _permit = permit;
                 match probe_backend_until(&hostname, &backend, connector.as_ref(), deadline) {
-                    Ok(certificate_fingerprint) => {
+                    Ok(certificate) => {
                         let _ = sender.send(ProbeMatch {
                             backend,
-                            certificate_fingerprint,
+                            certificate,
                         });
                     }
                     Err(error) => {
@@ -4621,7 +4871,7 @@ fn prefer_https_per_project(matches: Vec<ProbeMatch>) -> Vec<ProbeMatch> {
                 if matched.backend.role == "https" && current.backend.role != "https" {
                     *current = ProbeMatch {
                         backend: matched.backend.clone(),
-                        certificate_fingerprint: matched.certificate_fingerprint.clone(),
+                        certificate: matched.certificate.clone(),
                     };
                 }
             })
@@ -4636,7 +4886,7 @@ fn probe_backend(
     hostname: &str,
     backend: &Backend,
     connector_override: Option<&TlsConnector>,
-) -> Result<String, String> {
+) -> Result<CertificateProof, String> {
     probe_backend_until(
         hostname,
         backend,
@@ -4650,7 +4900,7 @@ fn probe_backend_until(
     backend: &Backend,
     connector_override: Option<&TlsConnector>,
     deadline: Instant,
-) -> Result<String, String> {
+) -> Result<CertificateProof, String> {
     let remaining = route_deadline_remaining(deadline)?;
     let stream = connect_backend_with_timeout(backend, remaining.min(PROBE_TIMEOUT))
         .map_err(|error| format!("TCP connection failed: {error}"))?;
@@ -4670,17 +4920,23 @@ fn probe_backend_until(
         .peer_certificate()
         .map_err(|error| format!("cannot inspect peer certificate: {error}"))?
         .ok_or_else(|| "backend did not present a certificate".to_string())?;
-    let digest = Sha256::digest(
-        certificate
-            .to_der()
-            .map_err(|error| format!("cannot encode peer certificate: {error}"))?,
-    );
+    let der = certificate
+        .to_der()
+        .map_err(|error| format!("cannot encode peer certificate: {error}"))?;
+    let digest = Sha256::digest(&der);
+    let (_, certificate) = X509Certificate::from_der(&der)
+        .map_err(|error| format!("cannot parse peer certificate: {error}"))?;
+    let not_after_unix_seconds = u64::try_from(certificate.validity().not_after.timestamp())
+        .map_err(|_| "peer certificate expiry precedes the Unix epoch".to_string())?;
     ensure_before_route_deadline(deadline)?;
-    Ok(digest
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(":"))
+    Ok(CertificateProof {
+        fingerprint: digest
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+        not_after_unix_seconds,
+    })
 }
 
 fn connect_backend_with_timeout(backend: &Backend, timeout: Duration) -> io::Result<TcpStream> {
@@ -4694,13 +4950,14 @@ fn connect_backend_with_timeout(backend: &Backend, timeout: Duration) -> io::Res
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveRoute, Backend, CONTROL_RESPONSE_LIMIT, DELIVERY_EVENT_INTERVAL, DeliveryOutcome,
-        IngressShutdown, MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS,
-        MAX_VERIFIED_ROUTES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter,
-        ProbeMatch, ProxyState, QueuedRouteSelection, RelayJob, RouteSelectionJob,
-        SOURCE_DIAGNOSTIC_EVENT_INTERVAL, TokioIngress, WaitingClient, cache_negative,
-        clear_conflict, collect_probe_matches, commit_relay_start, handle_connection,
-        handle_route_selection, install_active_route, observe_workloads, prefer_https_per_project,
+        ActiveRoute, Backend, CONTROL_RESPONSE_LIMIT, CertificateExpiryState, CertificateProof,
+        DELIVERY_EVENT_INTERVAL, DeliveryOutcome, IngressShutdown, MAX_PROBES, MAX_ROUTE_CONFLICTS,
+        MAX_ROUTE_DIAGNOSTICS, MAX_VERIFIED_ROUTES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL,
+        ProbeLimiter, ProbeMatch, ProxyState, QueuedRouteSelection, RelayJob, RouteSelectionJob,
+        SOURCE_DIAGNOSTIC_EVENT_INTERVAL, TLS_REVALIDATION_INTERVAL, TokioIngress, WaitingClient,
+        cache_negative, clear_conflict, collect_probe_matches, commit_relay_start,
+        current_active_backend, current_unix_seconds, handle_connection, handle_route_selection,
+        install_active_route, observe_workloads, prefer_https_per_project,
         reap_ready_connection_tasks, reconcile_routes, reconcile_workloads, record_conflict,
         relay_tokio_connection, relay_tokio_connection_with_connector, reload_public_profile,
         render_control_response, render_prometheus_metrics, resolve_backend, select_tokio_route,
@@ -4733,7 +4990,10 @@ mod tests {
         AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr,
         accept, bind, listen, recv, recvmsg, send, socket,
     };
-    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_RSA_SHA256};
+    use rcgen::{
+        CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        PKCS_RSA_SHA256,
+    };
     use std::collections::BTreeMap;
     use std::fs;
     #[cfg(target_os = "linux")]
@@ -4748,7 +5008,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, RwLock};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime};
     use tempfile::{TempDir, tempdir_in};
@@ -4780,11 +5040,77 @@ mod tests {
     fn active_route(backend: Backend) -> ActiveRoute {
         ActiveRoute {
             backend,
-            certificate_fingerprint: "AA:BB".to_string(),
+            certificate: CertificateProof {
+                fingerprint: "AA:BB".to_string(),
+                not_after_unix_seconds: u64::MAX,
+            },
+            last_expiry_warning: None,
             declaration_generation: None,
             last_tls_check: Instant::now(),
             tcp_failures: 0,
         }
+    }
+
+    #[test]
+    fn certificate_expiry_state_uses_the_fixed_warning_thresholds() {
+        let now = 1_000_000;
+        for (remaining, expected) in [
+            (31 * 24 * 60 * 60, CertificateExpiryState::Valid),
+            (30 * 24 * 60 * 60, CertificateExpiryState::Warning30Days),
+            (14 * 24 * 60 * 60, CertificateExpiryState::Warning14Days),
+            (7 * 24 * 60 * 60, CertificateExpiryState::Warning7Days),
+            (24 * 60 * 60, CertificateExpiryState::Warning1Day),
+            (0, CertificateExpiryState::Expired),
+        ] {
+            assert_eq!(CertificateExpiryState::at(now + remaining, now), expected);
+        }
+    }
+
+    #[test]
+    fn expired_optional_certificate_degrades_without_blocking_readiness() {
+        const HOSTNAME: &str = "optional.example.test";
+        let mut declaration = match public_profile(HOSTNAME, "optional-web") {
+            HostingProfile::Public(snapshot) => snapshot.routes[HOSTNAME].clone(),
+            HostingProfile::Development => unreachable!(),
+        };
+        declaration.required = false;
+        let profile = HostingProfile::Public(Arc::new(PublicIngressSnapshot {
+            ingress_config: PathBuf::from("ingress.toml"),
+            intent_owner: IntentOwner::EffectiveUser,
+            generation: 1,
+            listeners: None,
+            metrics: None,
+            source_diagnostics: None,
+            routes: BTreeMap::from([(HOSTNAME.to_string(), declaration)]),
+        }));
+        let directory = tempdir().unwrap();
+        let state = ProxyState::new_with_profile(directory.path().join("ports.toml"), profile);
+        let mut active = active_route(Backend {
+            project: "optional-web".to_string(),
+            role: "https".to_string(),
+            port: 4401,
+        });
+        active.declaration_generation = Some(1);
+        active.certificate.not_after_unix_seconds = current_unix_seconds();
+        state
+            .routes
+            .write()
+            .unwrap()
+            .insert(HOSTNAME.to_string(), active);
+
+        let status = serde_json::from_str::<serde_json::Value>(&render_control_response(
+            &state,
+            &running_shutdown(),
+            "STATUS JSON",
+        ))
+        .unwrap();
+        assert_eq!(status["ready"], true);
+        assert_eq!(status["active_routes"], 0);
+        assert_eq!(status["degraded_route_count"], 1);
+        assert_eq!(
+            status["degraded_routes"][0]["reason"],
+            "certificate_expired"
+        );
     }
 
     #[cfg(unix)]
@@ -4867,16 +5193,30 @@ mod tests {
             Self::for_hostnames(&[hostname])
         }
 
+        fn for_hostname_valid_for(hostname: &str, valid_for: Duration) -> Self {
+            Self::for_hostnames_valid_for(&[hostname], valid_for)
+        }
+
         fn for_hostnames(hostnames: &[&str]) -> Self {
+            Self::for_hostnames_valid_for(hostnames, Duration::from_secs(30 * 24 * 60 * 60))
+        }
+
+        fn for_hostnames_valid_for(hostnames: &[&str], valid_for: Duration) -> Self {
             let signing_key =
                 KeyPair::from_pkcs8_pem_and_sign_algo(TEST_RSA_PRIVATE_KEY, &PKCS_RSA_SHA256)
                     .unwrap();
-            let certificate_params = Self::parameters_for_hostnames(
+            let mut certificate_params = Self::parameters_for_hostnames(
                 hostnames
                     .iter()
                     .map(|hostname| hostname.to_string())
                     .collect(),
             );
+            certificate_params.distinguished_name = DistinguishedName::new();
+            certificate_params.distinguished_name.push(
+                DnType::CommonName,
+                format!("{}-{}", hostnames[0], valid_for.as_secs()),
+            );
+            certificate_params.not_after = (SystemTime::now() + valid_for).into();
             let cert = certificate_params.self_signed(&signing_key).unwrap();
             Self {
                 certificate_pem: cert.pem(),
@@ -4885,11 +5225,17 @@ mod tests {
         }
 
         fn connector(&self) -> TlsConnector {
+            Self::connector_for(&[self])
+        }
+
+        fn connector_for(certificates: &[&Self]) -> TlsConnector {
             let mut builder = TlsConnector::builder();
             builder.disable_built_in_roots(true);
-            builder.add_root_certificate(
-                Certificate::from_pem(self.certificate_pem.as_bytes()).unwrap(),
-            );
+            for certificate in certificates {
+                builder.add_root_certificate(
+                    Certificate::from_pem(certificate.certificate_pem.as_bytes()).unwrap(),
+                );
+            }
             builder.build().unwrap()
         }
 
@@ -4907,6 +5253,7 @@ mod tests {
 
     struct TestTlsBackend {
         address: SocketAddr,
+        acceptor: Arc<RwLock<TlsAcceptor>>,
         accepted: Arc<AtomicUsize>,
         shutdown: Arc<AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
@@ -4922,9 +5269,10 @@ mod tests {
                 certificate.private_key_pem.as_bytes(),
             )
             .unwrap();
-            let acceptor = TlsAcceptor::new(identity).unwrap();
+            let acceptor = Arc::new(RwLock::new(TlsAcceptor::new(identity).unwrap()));
             let accepted = Arc::new(AtomicUsize::new(0));
             let shutdown = Arc::new(AtomicBool::new(false));
+            let acceptor_for_worker = Arc::clone(&acceptor);
             let accepted_for_worker = Arc::clone(&accepted);
             let shutdown_for_worker = Arc::clone(&shutdown);
             let worker = thread::spawn(move || {
@@ -4939,6 +5287,7 @@ mod tests {
                             stream
                                 .set_write_timeout(Some(Duration::from_secs(2)))
                                 .unwrap();
+                            let acceptor = acceptor_for_worker.read().unwrap().clone();
                             if let Ok(mut tls) = acceptor.accept(stream) {
                                 let mut request = [0_u8; 64];
                                 if tls.read(&mut request).is_ok_and(|read| read > 0) {
@@ -4956,6 +5305,7 @@ mod tests {
             });
             Self {
                 address,
+                acceptor,
                 accepted,
                 shutdown,
                 worker: Some(worker),
@@ -4968,6 +5318,15 @@ mod tests {
 
         fn accepted(&self) -> usize {
             self.accepted.load(Ordering::Acquire)
+        }
+
+        fn replace_certificate(&self, certificate: &TestCertificate) {
+            let identity = Identity::from_pkcs8(
+                certificate.certificate_pem.as_bytes(),
+                certificate.private_key_pem.as_bytes(),
+            )
+            .unwrap();
+            *self.acceptor.write().unwrap() = TlsAcceptor::new(identity).unwrap();
         }
     }
 
@@ -5045,7 +5404,139 @@ mod tests {
                 port: backend.port(),
             }
         );
+        drop(routes);
+        let status = serde_json::from_str::<serde_json::Value>(&render_control_response(
+            &state,
+            &running_shutdown(),
+            "STATUS JSON",
+        ))
+        .unwrap();
+        assert_eq!(
+            status["certificate_routes"][0]["expiry_state"],
+            "warning_30_days"
+        );
+        assert_eq!(status["ready"], true);
         assert_eq!(backend.accepted(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declared_certificate_rotation_deactivates_invalid_and_expired_proof() {
+        const HOSTNAME: &str = "rotate.example.test";
+
+        let initial = TestCertificate::for_hostname_valid_for(
+            HOSTNAME,
+            Duration::from_secs(60 * 24 * 60 * 60),
+        );
+        let rotated = TestCertificate::for_hostname_valid_for(
+            HOSTNAME,
+            Duration::from_secs(13 * 24 * 60 * 60),
+        );
+        let invalid = TestCertificate::for_hostname("wrong.example.test");
+        let connector = TestCertificate::connector_for(&[&initial, &rotated, &invalid]);
+        let backend = TestTlsBackend::start(&initial, b"rotated");
+        let directory = tempdir().unwrap();
+        let registry = write_logical_registry(directory.path(), &[("rotate-web", backend.port())]);
+        let state = ProxyState::new_with_profile_and_connector(
+            registry,
+            public_profile(HOSTNAME, "rotate-web"),
+            connector,
+        );
+
+        reconcile_workloads(&state);
+        let initial_fingerprint = state.routes.read().unwrap()[HOSTNAME]
+            .certificate
+            .fingerprint
+            .clone();
+
+        backend.replace_certificate(&rotated);
+        state
+            .routes
+            .write()
+            .unwrap()
+            .get_mut(HOSTNAME)
+            .unwrap()
+            .last_tls_check = Instant::now() - TLS_REVALIDATION_INTERVAL;
+        reconcile_workloads(&state);
+
+        let active = state.routes.read().unwrap()[HOSTNAME].clone();
+        assert_ne!(active.certificate.fingerprint, initial_fingerprint);
+        assert_eq!(
+            active.certificate.expiry_state_at(current_unix_seconds()),
+            CertificateExpiryState::Warning14Days
+        );
+        assert_eq!(
+            active.last_expiry_warning,
+            Some(CertificateExpiryState::Warning14Days)
+        );
+        let metrics = render_prometheus_metrics(&state, &running_shutdown());
+        assert!(
+            metrics.contains(
+                "phx_port_route_certificate_not_after_seconds{hostname=\"rotate.example.test\",expiry_state=\"warning_14_days\"}"
+            ),
+            "{metrics}"
+        );
+
+        backend.replace_certificate(&invalid);
+        state
+            .routes
+            .write()
+            .unwrap()
+            .get_mut(HOSTNAME)
+            .unwrap()
+            .last_tls_check = Instant::now() - TLS_REVALIDATION_INTERVAL;
+        reconcile_workloads(&state);
+        assert!(state.routes.read().unwrap().is_empty());
+        let invalid_status = serde_json::from_str::<serde_json::Value>(&render_control_response(
+            &state,
+            &running_shutdown(),
+            "STATUS JSON",
+        ))
+        .unwrap();
+        assert_eq!(invalid_status["ready"], false);
+        assert_eq!(
+            invalid_status["degraded_routes"][0]["reason"],
+            "verification_failed"
+        );
+
+        backend.replace_certificate(&rotated);
+        reconcile_workloads(&state);
+        assert_eq!(
+            state.routes.read().unwrap()[HOSTNAME]
+                .certificate
+                .fingerprint,
+            active.certificate.fingerprint
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&render_control_response(
+                &state,
+                &running_shutdown(),
+                "STATUS JSON",
+            ))
+            .unwrap()["ready"],
+            true
+        );
+
+        state
+            .routes
+            .write()
+            .unwrap()
+            .get_mut(HOSTNAME)
+            .unwrap()
+            .certificate
+            .not_after_unix_seconds = current_unix_seconds();
+        assert!(current_active_backend(&state, HOSTNAME).unwrap().is_none());
+        let expired_status = serde_json::from_str::<serde_json::Value>(&render_control_response(
+            &state,
+            &running_shutdown(),
+            "STATUS JSON",
+        ))
+        .unwrap();
+        assert_eq!(expired_status["ready"], false);
+        assert_eq!(
+            expired_status["degraded_routes"][0]["reason"],
+            "certificate_expired"
+        );
     }
 
     #[cfg(unix)]
@@ -6440,7 +6931,10 @@ mod tests {
         sender
             .send(ProbeMatch {
                 backend: backend(),
-                certificate_fingerprint: "AA:BB".to_string(),
+                certificate: CertificateProof {
+                    fingerprint: "AA:BB".to_string(),
+                    not_after_unix_seconds: u64::MAX,
+                },
             })
             .unwrap();
         drop(sender);
@@ -6649,7 +7143,10 @@ mod tests {
                     role: "https".to_string(),
                     port: 4401,
                 },
-                certificate_fingerprint: "AA:BB".to_string(),
+                certificate: CertificateProof {
+                    fingerprint: "AA:BB".to_string(),
+                    not_after_unix_seconds: u64::MAX,
+                },
             },
             Some(1),
         )
@@ -6746,7 +7243,10 @@ mod tests {
                 "www.example.com",
                 ProbeMatch {
                     backend: declared_backend,
-                    certificate_fingerprint: "stale".to_string(),
+                    certificate: CertificateProof {
+                        fingerprint: "stale".to_string(),
+                        not_after_unix_seconds: u64::MAX,
+                    },
                 },
                 Some(1),
             )
@@ -6754,7 +7254,9 @@ mod tests {
             .contains("generation changed")
         );
         assert_ne!(
-            state.routes.read().unwrap()["www.example.com"].certificate_fingerprint,
+            state.routes.read().unwrap()["www.example.com"]
+                .certificate
+                .fingerprint,
             "stale"
         );
 
@@ -6788,7 +7290,10 @@ mod tests {
             "overflow.example.com",
             ProbeMatch {
                 backend: backend(),
-                certificate_fingerprint: "AA:BB".to_string(),
+                certificate: CertificateProof {
+                    fingerprint: "AA:BB".to_string(),
+                    not_after_unix_seconds: u64::MAX,
+                },
             },
             None,
         )
@@ -6872,10 +7377,41 @@ mod tests {
             MAX_ROUTE_DECLARATIONS - MAX_ROUTE_DIAGNOSTICS
         );
 
+        let snapshot = state.public_snapshot().unwrap();
+        let active_routes = snapshot
+            .routes
+            .iter()
+            .map(|(hostname, declaration)| {
+                let mut active = active_route(Backend {
+                    project: declaration.workload.clone(),
+                    role: declaration.role.clone(),
+                    port: 4401,
+                });
+                active.declaration_generation = Some(snapshot.generation);
+                active.certificate.not_after_unix_seconds =
+                    current_unix_seconds() + 13 * 24 * 60 * 60;
+                active.last_expiry_warning = Some(CertificateExpiryState::Warning14Days);
+                (hostname.clone(), active)
+            })
+            .collect();
+        *state.routes.write().unwrap() = active_routes;
         state.routes.write().unwrap().insert(
             "attacker-controlled.example".to_string(),
             active_route(backend()),
         );
+
+        let rendered = render_control_response(&state, &running_shutdown(), "STATUS JSON");
+        assert!(rendered.len() as u64 <= CONTROL_RESPONSE_LIMIT);
+        let status = serde_json::from_str::<serde_json::Value>(&rendered).unwrap();
+        assert_eq!(
+            status["certificate_routes"].as_array().unwrap().len(),
+            MAX_ROUTE_DIAGNOSTICS
+        );
+        assert_eq!(
+            status["certificate_routes_omitted"],
+            MAX_ROUTE_DECLARATIONS - MAX_ROUTE_DIAGNOSTICS
+        );
+
         let metrics = render_prometheus_metrics(&state, &running_shutdown());
         assert!(metrics.len() <= PROMETHEUS_BODY_LIMIT);
         assert_eq!(
@@ -6885,8 +7421,22 @@ mod tests {
                 .count(),
             MAX_ROUTE_DECLARATIONS
         );
+        assert_eq!(
+            metrics
+                .lines()
+                .filter(|line| line.starts_with("phx_port_route_certificate_not_after_seconds{"))
+                .count(),
+            MAX_ROUTE_DECLARATIONS
+        );
         assert!(!metrics.contains("attacker-controlled.example"));
-        for forbidden in ["source=", "connection_id", "certificate", "error="] {
+        for forbidden in [
+            "source=",
+            "connection_id",
+            "certificate_fingerprint",
+            "BEGIN CERTIFICATE",
+            "private_key",
+            "error=",
+        ] {
             assert!(
                 !metrics.contains(forbidden),
                 "metrics leaked forbidden label {forbidden:?}"
@@ -7100,28 +7650,37 @@ mod tests {
         main_backend.role = "main".to_string();
         let main = ProbeMatch {
             backend: main_backend,
-            certificate_fingerprint: "MAIN".to_string(),
+            certificate: CertificateProof {
+                fingerprint: "MAIN".to_string(),
+                not_after_unix_seconds: u64::MAX,
+            },
         };
         let mut https_backend = backend();
         https_backend.role = "https".to_string();
         https_backend.port = 4402;
         let https = ProbeMatch {
             backend: https_backend.clone(),
-            certificate_fingerprint: "HTTPS".to_string(),
+            certificate: CertificateProof {
+                fingerprint: "HTTPS".to_string(),
+                not_after_unix_seconds: u64::MAX,
+            },
         };
         let mut other_backend = backend();
         other_backend.project = "/other".to_string();
         other_backend.port = 4403;
         let other = ProbeMatch {
             backend: other_backend.clone(),
-            certificate_fingerprint: "OTHER".to_string(),
+            certificate: CertificateProof {
+                fingerprint: "OTHER".to_string(),
+                not_after_unix_seconds: u64::MAX,
+            },
         };
 
         let preferred = prefer_https_per_project(vec![main, other, https]);
 
         assert_eq!(preferred.len(), 2);
         assert!(preferred.iter().any(|matched| {
-            matched.backend == https_backend && matched.certificate_fingerprint == "HTTPS"
+            matched.backend == https_backend && matched.certificate.fingerprint == "HTTPS"
         }));
         assert!(
             preferred
