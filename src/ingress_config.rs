@@ -204,7 +204,12 @@ impl HostingProfile {
             }
         };
         let metrics = Self::parse_metrics_config(ingress, &path)?;
-        let source_diagnostics = Self::parse_source_diagnostics_config(ingress, &path)?;
+        let source_diagnostics_reference_time = SystemTime::now();
+        let source_diagnostics = Self::parse_source_diagnostics_config(
+            ingress,
+            &path,
+            source_diagnostics_reference_time,
+        )?;
 
         let hosts = ingress
             .get("hosts")
@@ -505,6 +510,7 @@ impl HostingProfile {
     fn parse_source_diagnostics_config(
         ingress: &Table,
         path: &std::path::Path,
+        reference_time: SystemTime,
     ) -> Result<Option<SourceDiagnosticsConfig>, String> {
         let Some(diagnostics) = ingress.get("source_diagnostics") else {
             return Ok(None);
@@ -533,7 +539,7 @@ impl HostingProfile {
             path,
             "[ingress.source_diagnostics] expires_at_unix_seconds",
         )?;
-        let now = SystemTime::now()
+        let now = reference_time
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "system clock is before the Unix epoch".to_string())?
             .as_secs();
@@ -897,15 +903,6 @@ mod tests {
                 "sample_every must be greater than zero",
             ),
             (
-                format!(
-                    "[ingress.source_diagnostics]\n\
-                     sample_every = 1\n\
-                     expires_at_unix_seconds = {}",
-                    now + MAX_SOURCE_DIAGNOSTIC_DURATION_SECONDS + 1
-                ),
-                "no more than 3600 seconds in the future",
-            ),
-            (
                 "[ingress.source_diagnostics]\nsample_every = 1".to_string(),
                 "requires integer [ingress.source_diagnostics] expires_at_unix_seconds",
             ),
@@ -938,6 +935,45 @@ mod tests {
                 .source_diagnostics
                 .unwrap()
                 .active_at(now)
+        );
+    }
+
+    #[test]
+    fn source_diagnostic_expiry_uses_explicit_reference_instant() {
+        const REFERENCE_UNIX_SECONDS: u64 = 1_000_000;
+        let reference_time = UNIX_EPOCH + Duration::from_secs(REFERENCE_UNIX_SECONDS);
+        let parse_at_offset = |offset| {
+            let document = format!(
+                "[ingress.source_diagnostics]\n\
+                 sample_every = 1\n\
+                 expires_at_unix_seconds = {}",
+                REFERENCE_UNIX_SECONDS + offset
+            )
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+            let ingress = document
+                .get("ingress")
+                .and_then(|item| item.as_table())
+                .unwrap();
+            HostingProfile::parse_source_diagnostics_config(
+                ingress,
+                Path::new("ingress.toml"),
+                reference_time,
+            )
+        };
+
+        let at_limit = parse_at_offset(MAX_SOURCE_DIAGNOSTIC_DURATION_SECONDS)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            at_limit.expires_at_unix_seconds,
+            REFERENCE_UNIX_SECONDS + MAX_SOURCE_DIAGNOSTIC_DURATION_SECONDS
+        );
+
+        let error = parse_at_offset(MAX_SOURCE_DIAGNOSTIC_DURATION_SECONDS + 1).unwrap_err();
+        assert!(
+            error.contains("no more than 3600 seconds in the future"),
+            "{error}"
         );
     }
 
