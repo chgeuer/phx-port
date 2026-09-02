@@ -73,7 +73,7 @@ mod unix {
                 .env_remove("PHX_PORT_CONFIG")
                 .env_remove("XDG_RUNTIME_DIR")
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .unwrap();
             let mut daemon = Self {
@@ -132,6 +132,13 @@ mod unix {
                 assert!(Instant::now() < deadline, "{name} did not reach {expected}");
                 thread::sleep(Duration::from_millis(20));
             }
+        }
+
+        fn stop_and_stderr(mut self) -> String {
+            self.request("STOP").unwrap();
+            let output = self.child.take().unwrap().wait_with_output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stderr).unwrap()
         }
     }
 
@@ -195,6 +202,37 @@ mod unix {
         drop(recovered);
         daemon.wait_for_count("active_connections", 0);
         daemon.wait_for_count("pre_routing_connections", 0);
+    }
+
+    #[test]
+    fn repeated_global_overload_emits_one_bounded_aggregate_event() {
+        let address = reserve_address();
+        let daemon = Daemon::start(address);
+
+        let admitted = TcpStream::connect(address).unwrap();
+        daemon.wait_for_count("active_connections", 1);
+
+        for _ in 0..20 {
+            drop(TcpStream::connect(address).unwrap());
+        }
+        daemon.wait_for_count("rejected_global_capacity", 20);
+
+        drop(admitted);
+        daemon.wait_for_count("active_connections", 0);
+        let stderr = daemon.stop_and_stderr();
+        let overload_events = stderr
+            .lines()
+            .filter(|line| line.starts_with("event=ingress_overload "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            overload_events,
+            ["event=ingress_overload reason=global_capacity rejected=1 suppressed=0"],
+            "unexpected overload events in stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("TLS proxy connection rejected"),
+            "per-connection rejection details leaked to stderr:\n{stderr}"
+        );
     }
 
     #[test]

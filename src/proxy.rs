@@ -37,6 +37,7 @@ const TLS_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 const TCP_FAILURE_THRESHOLD: u8 = 3;
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_QUEUE_CAPACITY: usize = 1;
+const OVERLOAD_EVENT_INTERVAL: Duration = Duration::from_secs(10);
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -146,6 +147,59 @@ impl Drop for ProbePermit {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct OverloadEventWindow {
+    last_emitted: Option<Instant>,
+    pending: u64,
+}
+
+struct OverloadEvents {
+    windows: [OverloadEventWindow; AdmissionRejection::COUNT],
+}
+
+impl OverloadEvents {
+    fn new() -> Self {
+        Self {
+            windows: [OverloadEventWindow::default(); AdmissionRejection::COUNT],
+        }
+    }
+
+    fn record(&mut self, reason: AdmissionRejection, now: Instant) -> Option<OverloadEvent> {
+        let window = &mut self.windows[reason.index()];
+        window.pending = window.pending.saturating_add(1);
+        let should_emit = match window.last_emitted {
+            Some(last_emitted) => {
+                now.saturating_duration_since(last_emitted) >= OVERLOAD_EVENT_INTERVAL
+            }
+            None => true,
+        };
+        if !should_emit {
+            return None;
+        }
+
+        window.last_emitted = Some(now);
+        let rejected = std::mem::take(&mut window.pending);
+        Some(OverloadEvent { reason, rejected })
+    }
+}
+
+struct OverloadEvent {
+    reason: AdmissionRejection,
+    rejected: u64,
+}
+
+impl std::fmt::Display for OverloadEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "event=ingress_overload reason={} rejected={} suppressed={}",
+            self.reason.event_reason(),
+            self.rejected,
+            self.rejected.saturating_sub(1)
+        )
+    }
+}
+
 struct ProxyState {
     config: PathBuf,
     limits: ValidatedIngressLimits,
@@ -170,6 +224,7 @@ struct ProxyState {
     rejected_pre_routing_capacity: AtomicU64,
     rejected_relay_capacity: AtomicU64,
     rejected_worker_queue: AtomicU64,
+    overload_events: Mutex<OverloadEvents>,
     successful_discoveries: AtomicU64,
     handoff_attempts: AtomicU64,
     successful_handoffs: AtomicU64,
@@ -205,6 +260,7 @@ impl ProxyState {
             rejected_pre_routing_capacity: AtomicU64::new(0),
             rejected_relay_capacity: AtomicU64::new(0),
             rejected_worker_queue: AtomicU64::new(0),
+            overload_events: Mutex::new(OverloadEvents::new()),
             successful_discoveries: AtomicU64::new(0),
             handoff_attempts: AtomicU64::new(0),
             successful_handoffs: AtomicU64::new(0),
@@ -262,6 +318,16 @@ impl ProxyState {
     }
 
     fn record_admission_rejection(&self, rejection: AdmissionRejection) {
+        if let Some(event) = self.record_admission_rejection_at(rejection, Instant::now()) {
+            eprintln!("{event}");
+        }
+    }
+
+    fn record_admission_rejection_at(
+        &self,
+        rejection: AdmissionRejection,
+        now: Instant,
+    ) -> Option<OverloadEvent> {
         let counter = match rejection {
             AdmissionRejection::AcceptRate => &self.rejected_accept_rate,
             AdmissionRejection::Global => &self.rejected_global_capacity,
@@ -271,8 +337,13 @@ impl ProxyState {
             AdmissionRejection::PreRouting => &self.rejected_pre_routing_capacity,
             AdmissionRejection::Relay => &self.rejected_relay_capacity,
             AdmissionRejection::Handoff => &self.handoff_capacity_skips,
+            AdmissionRejection::WorkerQueue => &self.rejected_worker_queue,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+        self.overload_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(rejection, now)
     }
 }
 
@@ -361,13 +432,11 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
                 queued,
             } = job;
             drop(queued);
-            if let Err(error) =
-                handle_connection(client, accepted_at, Arc::clone(&worker_state), admission)
+            if handle_connection(client, accepted_at, Arc::clone(&worker_state), admission).is_err()
             {
                 worker_state
                     .rejected_connections
                     .fetch_add(1, Ordering::Relaxed);
-                eprintln!("TLS proxy connection rejected: {error}");
             }
         },
     )?;
@@ -407,7 +476,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
                         match connection_sender.try_send(job) {
                             Ok(()) => {}
                             Err(mpsc::TrySendError::Full(_)) => {
-                                state.rejected_worker_queue.fetch_add(1, Ordering::Relaxed);
+                                state.record_admission_rejection(AdmissionRejection::WorkerQueue);
                                 state.rejected_connections.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -1432,12 +1501,12 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream, buffered: &[u8]) -> io:
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, ProbeLimiter, ProbeMatch,
-        ProxyState, WaitingClient, bind_listener, cache_negative, clear_conflict,
-        collect_probe_matches, observe_workloads, prefer_https_per_project, reconcile_routes,
-        record_conflict, render_control_response, supports_eager_discovery,
+        ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL,
+        ProbeLimiter, ProbeMatch, ProxyState, WaitingClient, bind_listener, cache_negative,
+        clear_conflict, collect_probe_matches, observe_workloads, prefer_https_per_project,
+        reconcile_routes, record_conflict, render_control_response, supports_eager_discovery,
     };
-    use crate::{route_cache, update_config};
+    use crate::{admission::AdmissionRejection, route_cache, update_config};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
@@ -1648,6 +1717,62 @@ mod tests {
             "stopping\n"
         );
         assert!(shutdown.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn every_overload_reason_is_counted_and_rate_limited_with_fixed_labels() {
+        let directory = tempdir().unwrap();
+        let state = ProxyState::new(directory.path().join("ports.toml"));
+        let now = Instant::now();
+        let status_counters = [
+            "rejected_accept_rate",
+            "rejected_global_capacity",
+            "rejected_source_rate",
+            "rejected_source_concurrency",
+            "rejected_source_state_capacity",
+            "rejected_pre_routing_capacity",
+            "rejected_relay_capacity",
+            "handoff_capacity_skips",
+            "rejected_worker_queue",
+        ];
+
+        for reason in AdmissionRejection::ALL {
+            let event = state.record_admission_rejection_at(reason, now).unwrap();
+            assert_eq!(
+                event.to_string(),
+                format!(
+                    "event=ingress_overload reason={} rejected=1 suppressed=0",
+                    reason.event_reason()
+                )
+            );
+            assert!(
+                state
+                    .record_admission_rejection_at(reason, now + Duration::from_millis(1))
+                    .is_none()
+            );
+        }
+
+        let status =
+            render_control_response(&state, &std::sync::atomic::AtomicBool::new(false), "STATUS");
+        for counter in status_counters {
+            assert!(
+                status.lines().any(|line| line == format!("{counter}=2")),
+                "missing counter {counter} in status:\n{status}"
+            );
+        }
+
+        for reason in AdmissionRejection::ALL {
+            let event = state
+                .record_admission_rejection_at(reason, now + OVERLOAD_EVENT_INTERVAL)
+                .unwrap();
+            assert_eq!(
+                event.to_string(),
+                format!(
+                    "event=ingress_overload reason={} rejected=2 suppressed=1",
+                    reason.event_reason()
+                )
+            );
+        }
     }
 
     #[test]

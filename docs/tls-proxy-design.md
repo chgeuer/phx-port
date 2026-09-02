@@ -254,6 +254,12 @@ to replace one whose daemon responds.
 configured admission capacity, fixed worker and queue bounds, bounded
 rejection-reason counters, discovery resource usage, connection/discovery
 counters, handoff capacity skips, and handoff outcomes.
+Admission saturation writes fixed-schema `event=ingress_overload` records to
+stderr at most once per bounded reason every ten seconds. Repeated rejections
+within the interval are counted and suppressed, then reported as one aggregate
+when that reason next emits. These events contain only a fixed reason name and
+numeric counts, never a source address, arbitrary SNI, or per-connection error
+string.
 `routes` returns the live active and conflicting route table while the daemon
 is reachable, then falls back to cached registry state for offline diagnostics.
 `stop` requests graceful shutdown: listeners and reconciliation stop accepting

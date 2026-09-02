@@ -178,8 +178,12 @@ capacity is reserved before opening a backend socket, then source and
 pre-routing capacity are released while the active and relay permits remain
 held until encrypted copying ends. `proxy status` reports aggregate source
 table use, configured limits, and bounded rejection-reason counters without
-source-address labels. Production load qualification remains a separate
-milestone; these threaded bounds are not a public-load support claim.
+source-address labels. Saturation also emits a fixed-schema
+`event=ingress_overload` stderr record at most once per bounded reason every
+ten seconds. Further rejections in that window are suppressed and aggregated
+into the next event; neither source addresses nor SNI values appear in the
+event. Production load qualification remains a separate milestone; these
+threaded bounds are not a public-load support claim.
 
 For an unknown SNI hostname, `phx-port` probes active `https` and `main`
 workloads over loopback using that exact hostname. It routes only when exactly
