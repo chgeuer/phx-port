@@ -1,9 +1,11 @@
 #[cfg(test)]
 use crate::ingress_limits::{IngressLimits, SystemCapacity};
 use crate::{
+    admission::{AdmissionController, AdmissionRejection, PreRoutingAdmission, RelayPermit},
     config_path, handoff,
     ingress_limits::{DaemonConfig, ValidatedIngressLimits},
     is_port_open, read_config, route_cache, tls_client_hello,
+    worker_pool::BoundedWorkerPool,
 };
 use native_tls::TlsConnector;
 use sha2::{Digest, Sha256};
@@ -34,6 +36,7 @@ const LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 const TLS_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 const TCP_FAILURE_THRESHOLD: u8 = 3;
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECTION_QUEUE_CAPACITY: usize = 1;
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -113,7 +116,7 @@ impl ProbeLimiter {
         }
     }
 
-    fn acquire(&self, deadline: Instant) -> Option<ProbePermit<'_>> {
+    fn acquire(self: &Arc<Self>, deadline: Instant) -> Option<ProbePermit> {
         let mut in_use = self.in_use.lock().ok()?;
         while *in_use >= MAX_PROBES {
             let remaining = deadline.checked_duration_since(Instant::now())?;
@@ -124,15 +127,17 @@ impl ProbeLimiter {
             }
         }
         *in_use += 1;
-        Some(ProbePermit { limiter: self })
+        Some(ProbePermit {
+            limiter: Arc::clone(self),
+        })
     }
 }
 
-struct ProbePermit<'a> {
-    limiter: &'a ProbeLimiter,
+struct ProbePermit {
+    limiter: Arc<ProbeLimiter>,
 }
 
-impl Drop for ProbePermit<'_> {
+impl Drop for ProbePermit {
     fn drop(&mut self) {
         if let Ok(mut in_use) = self.limiter.in_use.lock() {
             *in_use = in_use.saturating_sub(1);
@@ -144,6 +149,7 @@ impl Drop for ProbePermit<'_> {
 struct ProxyState {
     config: PathBuf,
     limits: ValidatedIngressLimits,
+    admission: AdmissionController,
     listeners: RwLock<Vec<SocketAddr>>,
     routes: RwLock<HashMap<String, ActiveRoute>>,
     conflicts: RwLock<HashMap<String, Vec<Backend>>>,
@@ -151,23 +157,31 @@ struct ProxyState {
     negative: Mutex<HashMap<String, Instant>>,
     workloads: Mutex<Vec<Backend>>,
     waiting_clients: AtomicUsize,
-    active_connections: AtomicUsize,
+    queued_connections: Arc<AtomicUsize>,
     probes: Arc<ProbeLimiter>,
     accepted_connections: AtomicU64,
     relayed_connections: AtomicU64,
     rejected_connections: AtomicU64,
+    rejected_accept_rate: AtomicU64,
+    rejected_global_capacity: AtomicU64,
+    rejected_pre_routing_capacity: AtomicU64,
+    rejected_relay_capacity: AtomicU64,
+    rejected_worker_queue: AtomicU64,
     successful_discoveries: AtomicU64,
     handoff_attempts: AtomicU64,
     successful_handoffs: AtomicU64,
     handoff_fallbacks: AtomicU64,
+    handoff_capacity_skips: AtomicU64,
     delivered_handoff_failures: AtomicU64,
 }
 
 impl ProxyState {
     fn with_limits(config: PathBuf, limits: ValidatedIngressLimits) -> Self {
+        let admission = AdmissionController::new(&limits);
         Self {
             config,
             limits,
+            admission,
             listeners: RwLock::new(Vec::new()),
             routes: RwLock::new(HashMap::new()),
             conflicts: RwLock::new(HashMap::new()),
@@ -175,15 +189,21 @@ impl ProxyState {
             negative: Mutex::new(HashMap::new()),
             workloads: Mutex::new(Vec::new()),
             waiting_clients: AtomicUsize::new(0),
-            active_connections: AtomicUsize::new(0),
+            queued_connections: Arc::new(AtomicUsize::new(0)),
             probes: Arc::new(ProbeLimiter::new()),
             accepted_connections: AtomicU64::new(0),
             relayed_connections: AtomicU64::new(0),
             rejected_connections: AtomicU64::new(0),
+            rejected_accept_rate: AtomicU64::new(0),
+            rejected_global_capacity: AtomicU64::new(0),
+            rejected_pre_routing_capacity: AtomicU64::new(0),
+            rejected_relay_capacity: AtomicU64::new(0),
+            rejected_worker_queue: AtomicU64::new(0),
             successful_discoveries: AtomicU64::new(0),
             handoff_attempts: AtomicU64::new(0),
             successful_handoffs: AtomicU64::new(0),
             handoff_fallbacks: AtomicU64::new(0),
+            handoff_capacity_skips: AtomicU64::new(0),
             delivered_handoff_failures: AtomicU64::new(0),
         }
     }
@@ -234,6 +254,17 @@ impl ProxyState {
         }
         result
     }
+
+    fn record_admission_rejection(&self, rejection: AdmissionRejection) {
+        let counter = match rejection {
+            AdmissionRejection::AcceptRate => &self.rejected_accept_rate,
+            AdmissionRejection::Global => &self.rejected_global_capacity,
+            AdmissionRejection::PreRouting => &self.rejected_pre_routing_capacity,
+            AdmissionRejection::Relay => &self.rejected_relay_capacity,
+            AdmissionRejection::Handoff => &self.handoff_capacity_skips,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 struct WaitingClient<'a> {
@@ -257,14 +288,28 @@ impl Drop for WaitingClient<'_> {
     }
 }
 
-struct ActiveConnection {
-    state: Arc<ProxyState>,
+struct QueuedConnection {
+    count: Arc<AtomicUsize>,
 }
 
-impl Drop for ActiveConnection {
-    fn drop(&mut self) {
-        self.state.active_connections.fetch_sub(1, Ordering::AcqRel);
+impl QueuedConnection {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self { count }
     }
+}
+
+impl Drop for QueuedConnection {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct ConnectionJob {
+    client: TcpStream,
+    accepted_at: Instant,
+    admission: PreRoutingAdmission,
+    queued: QueuedConnection,
 }
 
 pub fn run(config: DaemonConfig) -> Result<(), String> {
@@ -294,6 +339,30 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     ctrlc::set_handler(move || signal.store(true, Ordering::Release))
         .map_err(|error| format!("cannot install shutdown signal handler: {error}"))?;
 
+    let worker_state = Arc::clone(&state);
+    let mut connection_workers = BoundedWorkerPool::start(
+        "phx-port-connection",
+        state.limits.active_connections(),
+        CONNECTION_QUEUE_CAPACITY,
+        move |job: ConnectionJob| {
+            let ConnectionJob {
+                client,
+                accepted_at,
+                admission,
+                queued,
+            } = job;
+            drop(queued);
+            if let Err(error) =
+                handle_connection(client, accepted_at, Arc::clone(&worker_state), admission)
+            {
+                worker_state
+                    .rejected_connections
+                    .fetch_add(1, Ordering::Relaxed);
+                eprintln!("TLS proxy connection rejected: {error}");
+            }
+        },
+    )?;
+
     #[cfg(unix)]
     let (control_path, control_thread) =
         start_control_server(Arc::clone(&state), Arc::clone(&shutdown))?;
@@ -305,28 +374,41 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
             .map_err(|error| format!("cannot configure listener: {error}"))?;
         let state = Arc::clone(&state);
         let shutdown = Arc::clone(&shutdown);
+        let connection_sender = connection_workers.sender();
         listener_threads.push(thread::spawn(move || {
             while !shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        let accepted_at = Instant::now();
                         state.accepted_connections.fetch_add(1, Ordering::Relaxed);
-                        let connection_state = Arc::clone(&state);
-                        connection_state
-                            .active_connections
-                            .fetch_add(1, Ordering::AcqRel);
-                        thread::spawn(move || {
-                            let _active = ActiveConnection {
-                                state: Arc::clone(&connection_state),
-                            };
-                            if let Err(error) =
-                                handle_connection(stream, Arc::clone(&connection_state))
-                            {
-                                connection_state
-                                    .rejected_connections
-                                    .fetch_add(1, Ordering::Relaxed);
-                                eprintln!("TLS proxy connection rejected: {error}");
+                        let admission = match state.admission.try_admit() {
+                            Ok(admission) => admission,
+                            Err(rejection) => {
+                                state.record_admission_rejection(rejection);
+                                state.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                                continue;
                             }
-                        });
+                        };
+                        let job = ConnectionJob {
+                            client: stream,
+                            accepted_at,
+                            admission,
+                            queued: QueuedConnection::new(Arc::clone(&state.queued_connections)),
+                        };
+                        match connection_sender.try_send(job) {
+                            Ok(()) => {}
+                            Err(mpsc::TrySendError::Full(_)) => {
+                                state.rejected_worker_queue.fetch_add(1, Ordering::Relaxed);
+                                state.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
+                                state.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                                if !shutdown.swap(true, Ordering::AcqRel) {
+                                    eprintln!("TLS proxy connection worker pool stopped");
+                                }
+                                break;
+                            }
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(50));
@@ -355,24 +437,31 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     for listener_thread in listener_threads {
         let _ = listener_thread.join();
     }
+    connection_workers.close();
     #[cfg(unix)]
     let _ = control_thread.join();
     let _ = reconciler_thread.join();
 
     let drain_deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
-    while state.active_connections.load(Ordering::Acquire) > 0 && Instant::now() < drain_deadline {
+    while state.admission.snapshot().global.in_use > 0 && Instant::now() < drain_deadline {
         thread::sleep(Duration::from_millis(50));
     }
-    let remaining = state.active_connections.load(Ordering::Acquire);
-    if remaining > 0 {
+    let remaining = state.admission.snapshot().global.in_use;
+    let worker_join_error = if remaining > 0 {
         eprintln!("TLS proxy shutdown drain timed out with {remaining} connection(s) still active");
-    }
+        None
+    } else {
+        connection_workers.join().err()
+    };
 
     #[cfg(unix)]
     if let Err(error) = std::fs::remove_file(&control_path)
         && error.kind() != io::ErrorKind::NotFound
     {
         eprintln!("Could not remove control socket: {error}");
+    }
+    if let Some(error) = worker_join_error {
+        return Err(error);
     }
     eprintln!("TLS proxy stopped");
     Ok(())
@@ -499,6 +588,7 @@ fn start_control_server(
 fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &str) -> String {
     match request {
         "STATUS" => {
+            let admission = state.admission.snapshot();
             let listeners = state
                 .listeners
                 .read()
@@ -523,17 +613,36 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
                 .unwrap_or(0);
             let probes = state.probes.in_use.lock().map(|count| *count).unwrap_or(0);
             format!(
-                "running\nlisteners={listeners}\nactive_routes={active_routes}\nconflicts={conflicts}\nactive_connections={}\nwaiting_clients={}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={}\nrelayed_connections={}\nrejected_connections={}\nsuccessful_discoveries={}\nhandoff_attempts={}\nsuccessful_handoffs={}\nhandoff_fallbacks={}\ndelivered_handoff_failures={}\n",
-                state.active_connections.load(Ordering::Relaxed),
-                state.waiting_clients.load(Ordering::Relaxed),
-                state.accepted_connections.load(Ordering::Relaxed),
-                state.relayed_connections.load(Ordering::Relaxed),
-                state.rejected_connections.load(Ordering::Relaxed),
-                state.successful_discoveries.load(Ordering::Relaxed),
-                state.handoff_attempts.load(Ordering::Relaxed),
-                state.successful_handoffs.load(Ordering::Relaxed),
-                state.handoff_fallbacks.load(Ordering::Relaxed),
-                state.delivered_handoff_failures.load(Ordering::Relaxed),
+                "running\nlisteners={listeners}\nactive_routes={active_routes}\nconflicts={conflicts}\nactive_connections={active_connections}\nactive_connection_limit={active_connection_limit}\npre_routing_connections={pre_routing_connections}\npre_routing_connection_limit={pre_routing_connection_limit}\nactive_relays={active_relays}\nrelay_connection_limit={relay_connection_limit}\nhandoff_negotiations={handoff_negotiations}\nhandoff_negotiation_limit={handoff_negotiation_limit}\naccepts_per_second_limit={accepts_per_second_limit}\naccept_burst_limit={accept_burst_limit}\nqueued_connections={queued_connections}\nconnection_queue_limit={CONNECTION_QUEUE_CAPACITY}\nconnection_workers={connection_workers}\nwaiting_clients={waiting_clients}\ninflight_discoveries={discoveries}\nactive_probes={probes}\naccepted_connections={accepted_connections}\nrelayed_connections={relayed_connections}\nrejected_connections={rejected_connections}\nrejected_accept_rate={rejected_accept_rate}\nrejected_global_capacity={rejected_global_capacity}\nrejected_pre_routing_capacity={rejected_pre_routing_capacity}\nrejected_relay_capacity={rejected_relay_capacity}\nrejected_worker_queue={rejected_worker_queue}\nsuccessful_discoveries={successful_discoveries}\nhandoff_attempts={handoff_attempts}\nsuccessful_handoffs={successful_handoffs}\nhandoff_fallbacks={handoff_fallbacks}\nhandoff_capacity_skips={handoff_capacity_skips}\ndelivered_handoff_failures={delivered_handoff_failures}\n",
+                active_connections = admission.global.in_use,
+                active_connection_limit = admission.global.limit,
+                pre_routing_connections = admission.pre_routing.in_use,
+                pre_routing_connection_limit = admission.pre_routing.limit,
+                active_relays = admission.relay.in_use,
+                relay_connection_limit = admission.relay.limit,
+                handoff_negotiations = admission.handoff.in_use,
+                handoff_negotiation_limit = admission.handoff.limit,
+                accepts_per_second_limit = state.limits.accepts_per_second(),
+                accept_burst_limit = state.limits.accept_burst(),
+                queued_connections = state.queued_connections.load(Ordering::Relaxed),
+                connection_workers = state.limits.active_connections(),
+                waiting_clients = state.waiting_clients.load(Ordering::Relaxed),
+                accepted_connections = state.accepted_connections.load(Ordering::Relaxed),
+                relayed_connections = state.relayed_connections.load(Ordering::Relaxed),
+                rejected_connections = state.rejected_connections.load(Ordering::Relaxed),
+                rejected_accept_rate = state.rejected_accept_rate.load(Ordering::Relaxed),
+                rejected_global_capacity = state.rejected_global_capacity.load(Ordering::Relaxed),
+                rejected_pre_routing_capacity =
+                    state.rejected_pre_routing_capacity.load(Ordering::Relaxed),
+                rejected_relay_capacity = state.rejected_relay_capacity.load(Ordering::Relaxed),
+                rejected_worker_queue = state.rejected_worker_queue.load(Ordering::Relaxed),
+                successful_discoveries = state.successful_discoveries.load(Ordering::Relaxed),
+                handoff_attempts = state.handoff_attempts.load(Ordering::Relaxed),
+                successful_handoffs = state.successful_handoffs.load(Ordering::Relaxed),
+                handoff_fallbacks = state.handoff_fallbacks.load(Ordering::Relaxed),
+                handoff_capacity_skips = state.handoff_capacity_skips.load(Ordering::Relaxed),
+                delivered_handoff_failures =
+                    state.delivered_handoff_failures.load(Ordering::Relaxed),
             )
         }
         "ROUTES" => {
@@ -576,20 +685,32 @@ fn render_control_response(state: &ProxyState, shutdown: &AtomicBool, request: &
     }
 }
 
-fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<(), String> {
+fn handle_connection(
+    mut client: TcpStream,
+    accepted_at: Instant,
+    state: Arc<ProxyState>,
+    admission: PreRoutingAdmission,
+) -> Result<(), String> {
     client
         .set_nonblocking(false)
         .map_err(|error| format!("cannot configure accepted client socket: {error}"))?;
-    let accepted_at_ns = PROCESS_START
-        .get_or_init(Instant::now)
-        .elapsed()
+    let process_start = *PROCESS_START.get_or_init(Instant::now);
+    let accepted_at_ns = accepted_at
+        .saturating_duration_since(process_start)
         .as_nanos()
         .min(u128::from(u64::MAX)) as u64;
     let client_hello_timeout = state.limits.client_hello_timeout();
+    let client_hello_deadline = accepted_at
+        .checked_add(client_hello_timeout)
+        .ok_or_else(|| "ClientHello deadline overflowed".to_string())?;
+    let client_hello_remaining = client_hello_deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "ClientHello deadline elapsed before worker dispatch".to_string())?;
     client
-        .set_read_timeout(Some(client_hello_timeout))
+        .set_read_timeout(Some(client_hello_remaining))
         .map_err(|error| format!("cannot set ClientHello timeout: {error}"))?;
-    let (hostname, peeked_length) = tls_client_hello::peek_sni(&client, client_hello_timeout)
+    let (hostname, peeked_length) = tls_client_hello::peek_sni(&client, client_hello_remaining)
         .map_err(|error| error.to_string())?;
     client
         .set_read_timeout(None)
@@ -608,59 +729,78 @@ fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<()
         resolve_backend(&hostname, &state)?
     };
 
-    let mut connection_id = [0_u8; 16];
-    match getrandom::fill(&mut connection_id) {
-        Ok(()) => {
-            state.handoff_attempts.fetch_add(1, Ordering::Relaxed);
-            match handoff::try_transfer(
-                client,
-                &backend.project,
-                &backend.role,
-                &hostname,
-                peeked_length,
-                connection_id,
-                accepted_at_ns,
-            ) {
-                handoff::Outcome::Transferred => {
-                    state.successful_handoffs.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "Handed off {hostname} to {} ({})",
-                        backend.project, backend.role
-                    );
-                    return Ok(());
+    match state.admission.try_acquire_handoff() {
+        Ok(_handoff_permit) => {
+            let mut connection_id = [0_u8; 16];
+            match getrandom::fill(&mut connection_id) {
+                Ok(()) => {
+                    state.handoff_attempts.fetch_add(1, Ordering::Relaxed);
+                    match handoff::try_transfer(
+                        client,
+                        &backend.project,
+                        &backend.role,
+                        &hostname,
+                        peeked_length,
+                        connection_id,
+                        accepted_at_ns,
+                    ) {
+                        handoff::Outcome::Transferred => {
+                            state.successful_handoffs.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "Handed off {hostname} to {} ({})",
+                                backend.project, backend.role
+                            );
+                            return Ok(());
+                        }
+                        handoff::Outcome::Delivered(error) => {
+                            state
+                                .delivered_handoff_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Err(error);
+                        }
+                        handoff::Outcome::Unavailable(returned) => {
+                            state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
+                            client = returned;
+                        }
+                    }
                 }
-                handoff::Outcome::Delivered(error) => {
-                    state
-                        .delivered_handoff_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(error);
-                }
-                handoff::Outcome::Unavailable(returned) => {
+                Err(error) => {
                     state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
-                    client = returned;
+                    eprintln!(
+                        "TLS socket handoff unavailable: cannot create connection ID: {error}"
+                    );
                 }
             }
         }
-        Err(error) => {
-            state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
-            eprintln!("TLS socket handoff unavailable: cannot create connection ID: {error}");
-        }
+        Err(rejection) => state.record_admission_rejection(rejection),
     }
 
-    let upstream = match connect_backend(&backend) {
-        Ok(stream) => stream,
+    let relay_permit = match acquire_relay_capacity(&state) {
+        Some(permit) => permit,
+        None => return Ok(()),
+    };
+
+    let (upstream, relay_permit) = match connect_backend(&backend) {
+        Ok(stream) => (stream, relay_permit),
         Err(_) if cached.is_some() => {
+            drop(relay_permit);
             state
                 .routes
                 .write()
                 .map_err(|_| "route table lock poisoned".to_string())?
                 .remove(&hostname);
             backend = resolve_backend(&hostname, &state)?;
-            connect_backend(&backend)
-                .map_err(|error| format!("verified backend disappeared: {error}"))?
+            let relay_permit = match acquire_relay_capacity(&state) {
+                Some(permit) => permit,
+                None => return Ok(()),
+            };
+            let stream = connect_backend(&backend)
+                .map_err(|error| format!("verified backend disappeared: {error}"))?;
+            (stream, relay_permit)
         }
         Err(error) => return Err(format!("verified backend disappeared: {error}")),
     };
+    let _relay_admission = admission.into_relay(relay_permit);
 
     let mut buffered = vec![0_u8; peeked_length];
     client
@@ -680,6 +820,17 @@ fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<()
     match relay(client, upstream, &buffered) {
         Ok(()) => Ok(()),
         Err(error) => Err(format!("relay failed: {error}")),
+    }
+}
+
+fn acquire_relay_capacity(state: &ProxyState) -> Option<RelayPermit> {
+    match state.admission.try_acquire_relay() {
+        Ok(permit) => Some(permit),
+        Err(rejection) => {
+            state.record_admission_rejection(rejection);
+            state.rejected_connections.fetch_add(1, Ordering::Relaxed);
+            None
+        }
     }
 }
 
@@ -1121,42 +1272,59 @@ fn probe_candidates(
     state: &ProxyState,
 ) -> Vec<ProbeMatch> {
     let (sender, receiver) = mpsc::channel();
-    let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + DISCOVERY_TIMEOUT;
+    let launch_deadline = started + DISCOVERY_TIMEOUT.saturating_sub(PROBE_TIMEOUT);
 
     for backend in candidates {
         let sender = sender.clone();
         let hostname = hostname.to_string();
         let probes = Arc::clone(&state.probes);
-        thread::spawn(move || {
-            let Some(_permit) = probes.acquire(deadline) else {
-                return;
-            };
-            match probe_backend(&hostname, &backend) {
-                Ok(certificate_fingerprint) => {
-                    let _ = sender.send(ProbeMatch {
-                        backend,
-                        certificate_fingerprint,
-                    });
+        let Some(permit) = probes.acquire(launch_deadline) else {
+            break;
+        };
+        if let Err(error) = thread::Builder::new()
+            .name("phx-port-probe".to_string())
+            .spawn(move || {
+                let _permit = permit;
+                match probe_backend(&hostname, &backend) {
+                    Ok(certificate_fingerprint) => {
+                        let _ = sender.send(ProbeMatch {
+                            backend,
+                            certificate_fingerprint,
+                        });
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Probe rejected {hostname} at 127.0.0.1:{} ({} {}): {error}",
+                            backend.port, backend.project, backend.role
+                        );
+                    }
                 }
-                Err(error) => {
-                    eprintln!(
-                        "Probe rejected {hostname} at 127.0.0.1:{} ({} {}): {error}",
-                        backend.port, backend.project, backend.role
-                    );
-                }
-            }
-        });
+            })
+        {
+            eprintln!("Cannot start bounded certificate probe: {error}");
+            break;
+        }
     }
     drop(sender);
 
+    prefer_https_per_project(collect_probe_matches(receiver, deadline))
+}
+
+fn collect_probe_matches(
+    receiver: mpsc::Receiver<ProbeMatch>,
+    deadline: Instant,
+) -> Vec<ProbeMatch> {
     let mut matches = Vec::new();
-    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
         match receiver.recv_timeout(remaining) {
             Ok(backend) => matches.push(backend),
             Err(mpsc::RecvTimeoutError::Disconnected | mpsc::RecvTimeoutError::Timeout) => break,
         }
     }
-    prefer_https_per_project(matches)
+    matches
 }
 
 fn prefer_https_per_project(matches: Vec<ProbeMatch>) -> Vec<ProbeMatch> {
@@ -1244,8 +1412,8 @@ mod tests {
     use super::{
         ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, ProbeLimiter, ProbeMatch,
         ProxyState, WaitingClient, bind_listener, cache_negative, clear_conflict,
-        observe_workloads, prefer_https_per_project, reconcile_routes, record_conflict,
-        render_control_response, supports_eager_discovery,
+        collect_probe_matches, observe_workloads, prefer_https_per_project, reconcile_routes,
+        record_conflict, render_control_response, supports_eager_discovery,
     };
     use crate::{route_cache, update_config};
     use std::net::TcpListener;
@@ -1312,7 +1480,7 @@ mod tests {
 
     #[test]
     fn probe_limiter_releases_capacity() {
-        let limiter = ProbeLimiter::new();
+        let limiter = Arc::new(ProbeLimiter::new());
         let deadline = Instant::now() + Duration::from_secs(1);
         let permits: Vec<_> = (0..MAX_PROBES)
             .map(|_| limiter.acquire(deadline).unwrap())
@@ -1324,6 +1492,26 @@ mod tests {
         );
         drop(permits);
         assert!(limiter.acquire(deadline).is_some());
+    }
+
+    #[test]
+    fn completed_probe_is_retained_after_the_collection_deadline() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(ProbeMatch {
+                backend: backend(),
+                certificate_fingerprint: "AA:BB".to_string(),
+            })
+            .unwrap();
+        drop(sender);
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+
+        let matches = collect_probe_matches(receiver, deadline);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].backend, backend());
     }
 
     #[test]
@@ -1390,10 +1578,37 @@ mod tests {
             .insert("www.example.com".to_string(), active_route(backend()));
         state.accepted_connections.store(7, Ordering::Relaxed);
         let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let routing = state.admission.try_admit().unwrap();
+        let handoff = state.admission.try_acquire_handoff().unwrap();
 
         let status = render_control_response(&state, &shutdown, "STATUS");
         assert!(status.contains("active_routes=1"));
         assert!(status.contains("accepted_connections=7"));
+        assert!(status.contains("active_connections=1"));
+        assert!(status.contains("active_connection_limit=256"));
+        assert!(status.contains("pre_routing_connections=1"));
+        assert!(status.contains("pre_routing_connection_limit=128"));
+        assert!(status.contains("active_relays=0"));
+        assert!(status.contains("relay_connection_limit=128"));
+        assert!(status.contains("handoff_negotiations=1"));
+        assert!(status.contains("handoff_negotiation_limit=64"));
+        assert!(status.contains("accepts_per_second_limit=200"));
+        assert!(status.contains("accept_burst_limit=400"));
+        assert!(status.contains("connection_queue_limit=1"));
+        assert!(status.contains("connection_workers=256"));
+
+        drop(handoff);
+        let relay = state.admission.try_acquire_relay().unwrap();
+        let relay = routing.into_relay(relay);
+        let status = render_control_response(&state, &shutdown, "STATUS");
+        assert!(status.contains("active_connections=1"));
+        assert!(status.contains("pre_routing_connections=0"));
+        assert!(status.contains("active_relays=1"));
+        assert!(status.contains("handoff_negotiations=0"));
+        drop(relay);
+        assert!(
+            render_control_response(&state, &shutdown, "STATUS").contains("active_connections=0")
+        );
 
         assert_eq!(
             render_control_response(&state, &shutdown, "STOP"),

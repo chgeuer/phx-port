@@ -170,9 +170,16 @@ reserve. When the configured descriptor budget fits the hard limit, startup
 may raise the process soft limit to the calculated minimum and then revalidates
 the resulting limit. It never derives or lowers configured ingress ceilings
 from ambient limits. The validated ClientHello timeout is already used by
-connection handling. The remaining ceilings are the typed inputs to the
-subsequent bounded-admission implementation and do not constitute a
-public-load support claim.
+connection handling. The daemon also enforces the global accept-rate/burst and
+active, pre-routing, relay, and handoff ceilings. It acquires active and
+pre-routing permits immediately after `accept`, before dispatch to a fixed
+worker pool with one bounded queue slot. Saturation closes the new socket
+without allocating a per-connection thread. Relay capacity is reserved before
+opening the loopback backend; after route selection, pre-routing capacity is
+released while active and relay permits remain held until copying ends.
+Per-source admission and production load qualification remain later
+milestones, so these threaded bounds do not constitute a public-load support
+claim.
 
 `daemon` is preferable to a global `--daemon` option because it has its own
 lifecycle, configuration, status, and diagnostics. The IPv4 and IPv6 listeners
@@ -234,8 +241,10 @@ The socket is `$XDG_RUNTIME_DIR/phx-port/control.sock` when
 `0700`; the socket mode is `0600`. Startup removes a stale socket but refuses
 to replace one whose daemon responds.
 
-`status` reports listener addresses, route and conflict counts, bounded
-discovery resource usage, connection/discovery counters, and handoff outcomes.
+`status` reports listener addresses, route and conflict counts, current and
+configured admission capacity, fixed worker and queue bounds, bounded
+rejection-reason counters, discovery resource usage, connection/discovery
+counters, handoff capacity skips, and handoff outcomes.
 `routes` returns the live active and conflicting route table while the daemon
 is reachable, then falls back to cached registry state for offline diagnostics.
 `stop` requests graceful shutdown: listeners and reconciliation stop accepting
@@ -521,10 +530,15 @@ global bounds insufficient.
 ## Implemented components
 
 The daemon is implemented in Rust with OS threads and synchronized shared
-state. Each accepted connection gets a worker thread; bounded probe permits and
-single-flight discovery prevent unknown SNI traffic from creating unbounded
-certificate-probe work. The implementation consists of:
+state. Accepted connections enter a fixed worker pool only after obtaining
+global and pre-routing admission permits. The one-slot user-space queue,
+active workers, relay copy threads, and certificate-probe threads all have
+hard bounds. Probe permits are acquired before their threads are created, and
+single-flight discovery prevents duplicate work for one SNI hostname. The
+implementation consists of:
 
+- `admission.rs` for token-bucket and RAII connection-stage capacity.
+- `worker_pool.rs` for fixed bounded connection execution.
 - `proxy.rs` for listeners, reconciliation, discovery, route health, control,
   handoff selection, and relay.
 - `tls_client_hello.rs` for bounded, non-consuming ClientHello inspection.
@@ -535,12 +549,14 @@ certificate-probe work. The implementation consists of:
 
 ```text
 src/
+  admission.rs
   main.rs
   proxy.rs
   tls_client_hello.rs
   route_cache.rs
   handoff.rs
   handoff_protocol.rs
+  worker_pool.rs
 ```
 
 The ingress parser never completes a server-side handshake or synthesizes a
@@ -560,6 +576,8 @@ Automated tests currently cover:
 - Suppression of eager TLS probes against compatibility `main` roles.
 - Single-flight behavior under concurrent first requests.
 - Waiting-client and concurrent-probe limits.
+- Exact global, pre-routing, handoff, and relay permit transitions and release.
+- Fixed worker/queue bounds, panic recovery, and immediate overload rejection.
 - Deterministic conflict recording and `https` role preference.
 - Persistent route creation and removal with registry changes.
 - Deactivation after three failed TCP checks while retaining the cached hint.

@@ -10,6 +10,7 @@ use std::process;
 use std::time::{Duration, Instant};
 use toml_edit::{DocumentMut, value};
 
+mod admission;
 #[cfg(test)]
 mod config_tests;
 #[cfg(test)]
@@ -23,6 +24,7 @@ mod proxy;
 mod route_cache;
 mod systemd_service;
 mod tls_client_hello;
+mod worker_pool;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_ROLE: &str = "main";
@@ -1046,7 +1048,7 @@ fn main() {
                 }
             };
             if let Err(error) = proxy::run(daemon_config) {
-                eprintln!("Failed to start TLS proxy: {error}");
+                eprintln!("TLS proxy failed: {error}");
                 process::exit(1);
             }
         }

@@ -164,6 +164,30 @@ pub struct ValidatedIngressLimits {
 }
 
 impl ValidatedIngressLimits {
+    pub fn active_connections(&self) -> usize {
+        self.limits.active_connections
+    }
+
+    pub fn pre_routing_connections(&self) -> usize {
+        self.limits.pre_routing_connections
+    }
+
+    pub fn relay_connections(&self) -> usize {
+        self.limits.relay_connections
+    }
+
+    pub fn handoff_negotiations(&self) -> usize {
+        self.limits.handoff_negotiations
+    }
+
+    pub fn accepts_per_second(&self) -> usize {
+        self.limits.accepts_per_second
+    }
+
+    pub fn accept_burst(&self) -> usize {
+        self.limits.accept_burst
+    }
+
     pub fn client_hello_timeout(&self) -> Duration {
         Duration::from_millis(self.limits.client_hello_timeout_ms)
     }

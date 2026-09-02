@@ -147,8 +147,21 @@ the configured limits never change with the host environment. Otherwise
 startup fails with the required and available values. On Linux it also checks
 the systemd cgroup task ceiling and its existing occupants when available;
 `--task-budget N` supplies an additional operator ceiling on any platform.
-These typed ceilings are the input to the bounded-admission work; currently
-the configurable ClientHello timeout is the first runtime consumer.
+
+The daemon enforces the global accept-rate/burst and active, pre-routing,
+relay, and handoff ceilings at runtime. It acquires active and pre-routing
+permits immediately after `accept` and before dispatching to a fixed worker
+pool whose only user-space queue slot is also covered by those permits.
+Saturation closes the newly accepted socket immediately. Handoff negotiation
+uses its own permit; relay capacity is reserved before opening a backend
+socket, then pre-routing capacity is released while the active and relay
+permits remain held until encrypted copying ends. `proxy status` reports each
+current count and configured limit, along with worker and queue bounds.
+Bounded counters distinguish accept-rate, global, pre-routing, relay, and
+worker-queue rejection, while a separate counter records handoff capacity
+skips that safely use relay instead.
+Per-source admission and production load qualification remain separate
+milestones; these threaded bounds are not a public-load support claim.
 
 For an unknown SNI hostname, `phx-port` probes active `https` and `main`
 workloads over loopback using that exact hostname. It routes only when exactly
