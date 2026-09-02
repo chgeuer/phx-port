@@ -92,6 +92,8 @@ fn render_unit(executable: &Path, config: &Path) -> Result<String, String> {
          ExecStart=\"{executable}\" daemon\n\
          Restart=on-failure\n\
          RestartSec=2s\n\
+         LimitNOFILE=65536\n\
+         TasksMax=1024\n\
          TimeoutStopSec=35s\n\
          \n\
          [Install]\n\
@@ -147,6 +149,8 @@ mod tests {
         assert!(unit.contains("ExecStart=\"/home/user/bin/phx-port\" daemon"));
         assert!(unit.contains("Environment=\"PHX_PORT_CONFIG=/home/user/.config/phx-ports.toml\""));
         assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("LimitNOFILE=65536"));
+        assert!(unit.contains("TasksMax=1024"));
         assert!(unit.contains("TimeoutStopSec=35s"));
         assert!(unit.contains("WantedBy=default.target"));
     }

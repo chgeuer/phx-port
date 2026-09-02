@@ -1,4 +1,10 @@
-use crate::{config_path, handoff, is_port_open, read_config, route_cache, tls_client_hello};
+#[cfg(test)]
+use crate::ingress_limits::{IngressLimits, SystemCapacity};
+use crate::{
+    config_path, handoff,
+    ingress_limits::{DaemonConfig, ValidatedIngressLimits},
+    is_port_open, read_config, route_cache, tls_client_hello,
+};
 use native_tls::TlsConnector;
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -18,7 +24,6 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
-const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(250);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_PROBES: usize = 32;
@@ -138,6 +143,7 @@ impl Drop for ProbePermit<'_> {
 
 struct ProxyState {
     config: PathBuf,
+    limits: ValidatedIngressLimits,
     listeners: RwLock<Vec<SocketAddr>>,
     routes: RwLock<HashMap<String, ActiveRoute>>,
     conflicts: RwLock<HashMap<String, Vec<Backend>>>,
@@ -158,9 +164,10 @@ struct ProxyState {
 }
 
 impl ProxyState {
-    fn new(config: PathBuf) -> Self {
+    fn with_limits(config: PathBuf, limits: ValidatedIngressLimits) -> Self {
         Self {
             config,
+            limits,
             listeners: RwLock::new(Vec::new()),
             routes: RwLock::new(HashMap::new()),
             conflicts: RwLock::new(HashMap::new()),
@@ -179,6 +186,20 @@ impl ProxyState {
             handoff_fallbacks: AtomicU64::new(0),
             delivered_handoff_failures: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(test)]
+    fn new(config: PathBuf) -> Self {
+        let limits = IngressLimits::default()
+            .validate(
+                SystemCapacity {
+                    file_descriptors: None,
+                    tasks: None,
+                },
+                2,
+            )
+            .unwrap();
+        Self::with_limits(config, limits)
     }
 
     fn discover_once(
@@ -246,13 +267,16 @@ impl Drop for ActiveConnection {
     }
 }
 
-pub fn run(listen_addresses: &[String]) -> Result<(), String> {
+pub fn run(config: DaemonConfig) -> Result<(), String> {
     PROCESS_START.get_or_init(Instant::now);
-    let state = Arc::new(ProxyState::new(config_path()));
+    let limits = config
+        .limits
+        .validate_for_startup(config.task_budget, config.listen_addresses.len())?;
+    let state = Arc::new(ProxyState::with_limits(config_path(), limits));
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut listeners = Vec::new();
 
-    for address in listen_addresses {
+    for address in &config.listen_addresses {
         let listener = bind_listener(address)
             .map_err(|error| format!("cannot listen on {address}: {error}"))?;
         eprintln!("TLS proxy listening on {}", listener.local_addr().unwrap());
@@ -561,10 +585,11 @@ fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<()
         .elapsed()
         .as_nanos()
         .min(u128::from(u64::MAX)) as u64;
+    let client_hello_timeout = state.limits.client_hello_timeout();
     client
-        .set_read_timeout(Some(CLIENT_HELLO_TIMEOUT))
+        .set_read_timeout(Some(client_hello_timeout))
         .map_err(|error| format!("cannot set ClientHello timeout: {error}"))?;
-    let (hostname, peeked_length) = tls_client_hello::peek_sni(&client, CLIENT_HELLO_TIMEOUT)
+    let (hostname, peeked_length) = tls_client_hello::peek_sni(&client, client_hello_timeout)
         .map_err(|error| error.to_string())?;
     client
         .set_read_timeout(None)
@@ -639,7 +664,7 @@ fn handle_connection(mut client: TcpStream, state: Arc<ProxyState>) -> Result<()
 
     let mut buffered = vec![0_u8; peeked_length];
     client
-        .set_read_timeout(Some(CLIENT_HELLO_TIMEOUT))
+        .set_read_timeout(Some(client_hello_timeout))
         .map_err(|error| format!("cannot restore ClientHello timeout: {error}"))?;
     client
         .read_exact(&mut buffered)

@@ -124,6 +124,32 @@ HTTPS_PORT="$(phx-port https)" my-https-server
 phx-port daemon --listen 0.0.0.0:443 --listen '[::]:443'
 ```
 
+The threaded daemon has explicit startup capacity options:
+
+| Option | Default |
+|---|---:|
+| `--active-connections` | 256 |
+| `--pre-routing-connections` | 128 |
+| `--relay-connections` | 128 |
+| `--handoff-negotiations` | 64 |
+| `--accepts-per-second` | 200 |
+| `--accept-burst` | 400 |
+| `--client-hello-timeout-ms` | 2000 |
+
+Before binding any listener, the daemon rejects zero values, sublimits above
+the global connection limit, ClientHello timeouts outside 500-10000
+milliseconds, arithmetic overflow, and active limits above the threaded
+ceiling of 256. It also checks estimated descriptor demand against the process
+`RLIMIT_NOFILE` while preserving a 30% reserve. If the process soft limit is
+too low but its hard limit permits the configured capacity, startup raises
+only the process soft limit to the calculated minimum and verifies the result;
+the configured limits never change with the host environment. Otherwise
+startup fails with the required and available values. On Linux it also checks
+the systemd cgroup task ceiling and its existing occupants when available;
+`--task-budget N` supplies an additional operator ceiling on any platform.
+These typed ceilings are the input to the bounded-admission work; currently
+the configurable ClientHello timeout is the first runtime consumer.
+
 For an unknown SNI hostname, `phx-port` probes active `https` and `main`
 workloads over loopback using that exact hostname. It routes only when exactly
 one backend completes a system-trusted, hostname-valid TLS handshake. The
@@ -150,8 +176,9 @@ On Linux, `install-service` writes
 `$XDG_CONFIG_HOME/systemd/user/phx-port.service` (or
 `~/.config/systemd/user/phx-port.service`), records absolute executable and
 registry paths, reloads the user manager, and enables and starts the service.
-The unit runs the daemon in the foreground with `Restart=on-failure`.
-`uninstall-service` disables and stops the service before removing the unit.
+The unit runs the daemon in the foreground with `Restart=on-failure`,
+`LimitNOFILE=65536`, and `TasksMax=1024`. `uninstall-service` disables and
+stops the service before removing the unit.
 
 The daemon revalidates a persisted mapping before activating it in a new
 process. Newly active `https` workloads that present a no-SNI default

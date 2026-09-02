@@ -1243,6 +1243,13 @@ live in authoritative configuration and are identical across symmetric hosts.
 Startup fails if FD reserve, limit relationships, arithmetic, or supported
 ranges are unsafe.
 
+Startup may raise its own soft `RLIMIT_NOFILE` to the minimum required by the
+configured ceilings when the existing hard limit permits it, then must re-read
+and validate the effective limit. This is capacity-to-host preparation, not
+ambient derivation of capacity: configured ceilings never change, a failed or
+partial raise fails startup, and service definitions still declare their
+resource limits explicitly.
+
 **Recommendation:** Explicit configured maxima validated against
 `RLIMIT_NOFILE`, with startup failure if unsafe. Use the accepted 256 cap while
 threaded and the benchmark ceilings above for the async pilot.

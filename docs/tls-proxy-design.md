@@ -154,6 +154,26 @@ The daemon entry point is an explicit, foreground command:
 phx-port daemon --listen 0.0.0.0:443 --listen '[::]:443'
 ```
 
+The transitional threaded configuration defaults to 256 active connections,
+128 pre-routing connections, 128 relays, 64 handoff negotiations, 200 accepts
+per second with burst 400, and a two-second ClientHello deadline. Each value
+has a matching `daemon` option. `--task-budget` can declare an operator task
+ceiling; on Linux the daemon also reads the enclosing systemd cgroup task
+limit when one exists.
+
+Capacity validation runs before the first listener bind. It rejects zero
+limits, sublimits above the global limit, ClientHello deadlines outside
+500-10000 milliseconds, arithmetic overflow, active limits above the
+threaded ceiling, task demand above the configured/systemd budget, and
+descriptor demand that would leave less than 30% of `RLIMIT_NOFILE` in
+reserve. When the configured descriptor budget fits the hard limit, startup
+may raise the process soft limit to the calculated minimum and then revalidates
+the resulting limit. It never derives or lowers configured ingress ceilings
+from ambient limits. The validated ClientHello timeout is already used by
+connection handling. The remaining ceilings are the typed inputs to the
+subsequent bounded-admission implementation and do not constitute a
+public-load support claim.
+
 `daemon` is preferable to a global `--daemon` option because it has its own
 lifecycle, configuration, status, and diagnostics. The IPv4 and IPv6 listeners
 are separate; the IPv6 listener uses IPv6-only mode to avoid
@@ -458,7 +478,8 @@ Lazy discovery turns an unknown SNI value into fan-out work and therefore
 requires strict bounds. The implementation currently:
 
 - Reject malformed, non-DNS, oversized, or missing SNI values.
-- Limits ClientHello inspection to 64 KiB and two seconds.
+- Limits ClientHello inspection to 64 KiB and a startup-validated 500-10000
+  millisecond deadline (two seconds by default).
 - Gives discovery a 250 millisecond deadline.
 - Permits at most 64 waiting clients and 32 concurrent backend probes.
 - Probes at most 32 live candidate registrations per discovery.

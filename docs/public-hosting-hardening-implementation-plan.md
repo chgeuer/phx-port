@@ -210,7 +210,10 @@ Validate:
 - thread demand against configured/systemd task budget; and
 - arithmetic overflow.
 
-Startup fails with an actionable error for unsafe limits.
+Startup fails with an actionable error for unsafe limits. It may raise the
+process soft `RLIMIT_NOFILE` to the calculated minimum when the hard limit
+permits, but must re-read the effective value and never alter configured
+ceilings to fit the host.
 
 ### 1.2 Admission permits
 

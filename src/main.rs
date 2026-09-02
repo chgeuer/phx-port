@@ -18,6 +18,7 @@ mod handoff;
 mod handoff_protocol;
 #[cfg(any(target_os = "macos", test))]
 mod handoff_stream;
+mod ingress_limits;
 mod proxy;
 mod route_cache;
 mod systemd_service;
@@ -42,7 +43,7 @@ USAGE:
     phx-port delete <X> debug   Remove a specific port role
     phx-port running            Show which registered projects are currently running
     phx-port discover           Open a browser page to pick a running project
-    phx-port daemon [--listen ADDRESS]...
+    phx-port daemon [--listen ADDRESS]... [CAPACITY OPTIONS]
                                 Route TLS by SNI to live https/main workloads
     phx-port proxy status       Show live daemon state and counters
     phx-port proxy routes       Show persistently discovered TLS routes
@@ -1036,29 +1037,15 @@ fn main() {
             cmd_discover(&config);
         }
         Some("daemon") => {
-            let mut listen_addresses = Vec::new();
-            let mut index = 1;
-            while index < args.len() {
-                match args[index].as_str() {
-                    "--listen" => {
-                        let Some(address) = args.get(index + 1) else {
-                            eprintln!("Usage: phx-port daemon [--listen ADDRESS]...");
-                            process::exit(1);
-                        };
-                        listen_addresses.push(address.clone());
-                        index += 2;
-                    }
-                    other => {
-                        eprintln!("Unknown argument for 'daemon': {}", other);
-                        process::exit(1);
-                    }
+            let daemon_config = match ingress_limits::DaemonConfig::parse(&args[1..]) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("{error}");
+                    eprintln!("{}", ingress_limits::DAEMON_USAGE);
+                    process::exit(1);
                 }
-            }
-
-            if listen_addresses.is_empty() {
-                listen_addresses.extend(["0.0.0.0:443".to_string(), "[::]:443".to_string()]);
-            }
-            if let Err(error) = proxy::run(&listen_addresses) {
+            };
+            if let Err(error) = proxy::run(daemon_config) {
                 eprintln!("Failed to start TLS proxy: {error}");
                 process::exit(1);
             }
