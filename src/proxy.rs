@@ -1786,7 +1786,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
     use tempfile::tempdir;
     use toml_edit::value;
 
@@ -1834,6 +1834,9 @@ mod tests {
                     .unwrap();
             let mut certificate_params =
                 CertificateParams::new(vec![hostname.to_string()]).unwrap();
+            let now = SystemTime::now();
+            certificate_params.not_before = (now - Duration::from_secs(24 * 60 * 60)).into();
+            certificate_params.not_after = (now + Duration::from_secs(30 * 24 * 60 * 60)).into();
             certificate_params.key_usages = vec![
                 KeyUsagePurpose::DigitalSignature,
                 KeyUsagePurpose::KeyEncipherment,
