@@ -3,9 +3,9 @@ use crate::ingress_limits::{IngressLimits, SystemCapacity};
 use crate::{
     admission::{AdmissionController, AdmissionRejection, PreRoutingAdmission, RelayPermit},
     config_path, handoff,
-    ingress_config::HostingProfile,
+    ingress_config::{HostingProfile, RouteDeclaration},
     ingress_limits::{DaemonConfig, ValidatedIngressLimits},
-    is_port_open, read_config, route_cache, tls_client_hello,
+    is_port_open, port_registry, read_config, route_cache, tls_client_hello,
     worker_pool::BoundedWorkerPool,
 };
 use native_tls::TlsConnector;
@@ -215,6 +215,7 @@ struct ProxyState {
     waiting_clients: AtomicUsize,
     queued_connections: Arc<AtomicUsize>,
     probes: Arc<ProbeLimiter>,
+    probe_connector_override: Option<TlsConnector>,
     accepted_connections: AtomicU64,
     relayed_connections: AtomicU64,
     rejected_connections: AtomicU64,
@@ -240,6 +241,7 @@ impl ProxyState {
         config: PathBuf,
         hosting_profile: HostingProfile,
         limits: ValidatedIngressLimits,
+        probe_connector_override: Option<TlsConnector>,
     ) -> Self {
         let admission = AdmissionController::new(&limits);
         Self {
@@ -256,6 +258,7 @@ impl ProxyState {
             waiting_clients: AtomicUsize::new(0),
             queued_connections: Arc::new(AtomicUsize::new(0)),
             probes: Arc::new(ProbeLimiter::new()),
+            probe_connector_override,
             accepted_connections: AtomicU64::new(0),
             relayed_connections: AtomicU64::new(0),
             rejected_connections: AtomicU64::new(0),
@@ -293,7 +296,25 @@ impl ProxyState {
                 2,
             )
             .unwrap();
-        Self::with_limits(config, hosting_profile, limits)
+        Self::with_limits(config, hosting_profile, limits, None)
+    }
+
+    #[cfg(test)]
+    fn new_with_profile_and_connector(
+        config: PathBuf,
+        hosting_profile: HostingProfile,
+        tls_connector: TlsConnector,
+    ) -> Self {
+        let limits = IngressLimits::default()
+            .validate(
+                SystemCapacity {
+                    file_descriptors: None,
+                    tasks: None,
+                },
+                2,
+            )
+            .unwrap();
+        Self::with_limits(config, hosting_profile, limits, Some(tls_connector))
     }
 
     fn discover_once(
@@ -417,6 +438,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         config_path(),
         hosting_profile,
         limits,
+        None,
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut listeners = Vec::new();
@@ -841,50 +863,52 @@ fn handle_connection(
         resolve_backend(&hostname, &state)?
     };
 
-    match state.admission.try_acquire_handoff() {
-        Ok(_handoff_permit) => {
-            let mut connection_id = [0_u8; 16];
-            match getrandom::fill(&mut connection_id) {
-                Ok(()) => {
-                    state.handoff_attempts.fetch_add(1, Ordering::Relaxed);
-                    match handoff::try_transfer(
-                        client,
-                        &backend.project,
-                        &backend.role,
-                        &hostname,
-                        peeked_length,
-                        connection_id,
-                        accepted_at_ns,
-                    ) {
-                        handoff::Outcome::Transferred => {
-                            state.successful_handoffs.fetch_add(1, Ordering::Relaxed);
-                            eprintln!(
-                                "Handed off {hostname} to {} ({})",
-                                backend.project, backend.role
-                            );
-                            return Ok(());
-                        }
-                        handoff::Outcome::Delivered(error) => {
-                            state
-                                .delivered_handoff_failures
-                                .fetch_add(1, Ordering::Relaxed);
-                            return Err(error);
-                        }
-                        handoff::Outcome::Unavailable(returned) => {
-                            state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
-                            client = returned;
+    if !state.hosting_profile.is_public() {
+        match state.admission.try_acquire_handoff() {
+            Ok(_handoff_permit) => {
+                let mut connection_id = [0_u8; 16];
+                match getrandom::fill(&mut connection_id) {
+                    Ok(()) => {
+                        state.handoff_attempts.fetch_add(1, Ordering::Relaxed);
+                        match handoff::try_transfer(
+                            client,
+                            &backend.project,
+                            &backend.role,
+                            &hostname,
+                            peeked_length,
+                            connection_id,
+                            accepted_at_ns,
+                        ) {
+                            handoff::Outcome::Transferred => {
+                                state.successful_handoffs.fetch_add(1, Ordering::Relaxed);
+                                eprintln!(
+                                    "Handed off {hostname} to {} ({})",
+                                    backend.project, backend.role
+                                );
+                                return Ok(());
+                            }
+                            handoff::Outcome::Delivered(error) => {
+                                state
+                                    .delivered_handoff_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                                return Err(error);
+                            }
+                            handoff::Outcome::Unavailable(returned) => {
+                                state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
+                                client = returned;
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "TLS socket handoff unavailable: cannot create connection ID: {error}"
-                    );
+                    Err(error) => {
+                        state.handoff_fallbacks.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "TLS socket handoff unavailable: cannot create connection ID: {error}"
+                        );
+                    }
                 }
             }
+            Err(rejection) => state.record_admission_rejection(rejection),
         }
-        Err(rejection) => state.record_admission_rejection(rejection),
     }
 
     let relay_permit = match acquire_relay_capacity(&state) {
@@ -948,9 +972,14 @@ fn acquire_relay_capacity(state: &ProxyState) -> Option<RelayPermit> {
 
 fn resolve_backend(hostname: &str, state: &ProxyState) -> Result<Backend, String> {
     if state.hosting_profile.is_public() {
-        return Err(format!(
-            "public ingress has no verified Route Declaration for {hostname}"
-        ));
+        let declaration = state
+            .hosting_profile
+            .route(hostname)
+            .cloned()
+            .ok_or_else(|| format!("public ingress has no Route Declaration for {hostname}"))?;
+        return state.discover_once(hostname, || {
+            activate_declared_route(hostname, &declaration, state)
+        });
     }
     let cached = route_cache::load(&state.config, hostname);
     let candidates = candidate_backends(&state.config, cached.as_ref());
@@ -971,6 +1000,60 @@ fn resolve_backend(hostname: &str, state: &ProxyState) -> Result<Backend, String
     }
 
     state.discover_once(hostname, || discover_backend(hostname, state, candidates))
+}
+
+fn activate_declared_route(
+    hostname: &str,
+    declaration: &RouteDeclaration,
+    state: &ProxyState,
+) -> Result<Backend, String> {
+    let backend = registered_declared_backend(&state.config, declaration)?;
+    let _permit = state
+        .probes
+        .acquire(Instant::now() + DISCOVERY_TIMEOUT)
+        .ok_or_else(|| "certificate probe capacity unavailable".to_string())?;
+    let certificate_fingerprint =
+        probe_backend(hostname, &backend, state.probe_connector_override.as_ref())?;
+    install_active_route(
+        state,
+        hostname,
+        ProbeMatch {
+            backend: backend.clone(),
+            certificate_fingerprint,
+        },
+    );
+    eprintln!(
+        "Activated declared route {hostname} at 127.0.0.1:{} ({} {})",
+        backend.port, backend.project, backend.role
+    );
+    Ok(backend)
+}
+
+fn registered_declared_backend(
+    config: &Path,
+    declaration: &RouteDeclaration,
+) -> Result<Backend, String> {
+    let document = port_registry::read(config, port_registry::RegistrySecurity::LogicalWorkload)
+        .map_err(|error| format!("cannot read logical Workload Port Registry: {error}"))?;
+    let port = document
+        .get("ports")
+        .and_then(|item| item.as_table())
+        .and_then(|workloads| workloads.get(&declaration.workload))
+        .and_then(|item| item.as_table())
+        .and_then(|roles| roles.get(&declaration.role))
+        .and_then(|item| item.as_integer())
+        .and_then(|port| u16::try_from(port).ok())
+        .ok_or_else(|| {
+            format!(
+                "declared Workload {}/{} has no registered loopback port",
+                declaration.workload, declaration.role
+            )
+        })?;
+    Ok(Backend {
+        project: declaration.workload.clone(),
+        role: declaration.role.clone(),
+        port,
+    })
 }
 
 fn discover_backend(
@@ -1100,7 +1183,8 @@ fn reconcile_workloads(state: &ProxyState) {
             if let Some(incumbent) = incumbent {
                 if incumbent.backend != backend
                     && let Some(_permit) = state.probes.acquire(Instant::now() + DISCOVERY_TIMEOUT)
-                    && probe_backend(&hostname, &backend).is_ok()
+                    && probe_backend(&hostname, &backend, state.probe_connector_override.as_ref())
+                        .is_ok()
                 {
                     record_conflict(state, &hostname, vec![incumbent.backend, backend.clone()]);
                 }
@@ -1176,9 +1260,6 @@ fn dns_names_from_certificate(der: &[u8]) -> Result<Vec<String>, String> {
 }
 
 fn reconcile_routes(state: &ProxyState) {
-    if state.hosting_profile.is_public() {
-        return;
-    }
     let routes: Vec<(String, ActiveRoute)> = match state.routes.read() {
         Ok(routes) => routes
             .iter()
@@ -1188,6 +1269,10 @@ fn reconcile_routes(state: &ProxyState) {
     };
 
     for (hostname, route) in routes {
+        if state.hosting_profile.is_public() {
+            reconcile_declared_route(state, &hostname, &route);
+            continue;
+        }
         if !registration_matches(&state.config, &route.backend) {
             deactivate_route(state, &hostname, true, "registration was removed");
             continue;
@@ -1210,9 +1295,67 @@ fn reconcile_routes(state: &ProxyState) {
     }
 }
 
+fn reconcile_declared_route(state: &ProxyState, hostname: &str, route: &ActiveRoute) {
+    let registered = state
+        .hosting_profile
+        .route(hostname)
+        .and_then(|declaration| registered_declared_backend(&state.config, declaration).ok());
+    if registered.as_ref() != Some(&route.backend) {
+        deactivate_route(
+            state,
+            hostname,
+            false,
+            "Route Declaration or logical Workload registration changed",
+        );
+        return;
+    }
+    if !is_port_open(i64::from(route.backend.port)) {
+        record_tcp_failure(state, hostname);
+        return;
+    }
+
+    let recovered = route.tcp_failures > 0;
+    let tls_due = route.last_tls_check.elapsed() >= TLS_REVALIDATION_INTERVAL;
+    if recovered || tls_due {
+        let verified = state
+            .probes
+            .acquire(Instant::now() + DISCOVERY_TIMEOUT)
+            .and_then(|_permit| {
+                probe_backend(
+                    hostname,
+                    &route.backend,
+                    state.probe_connector_override.as_ref(),
+                )
+                .ok()
+                .map(|certificate_fingerprint| ProbeMatch {
+                    backend: route.backend.clone(),
+                    certificate_fingerprint,
+                })
+            });
+        if let Some(verified) = verified {
+            install_active_route(state, hostname, verified);
+        } else {
+            deactivate_route(
+                state,
+                hostname,
+                false,
+                "declared Workload failed exact-hostname TLS revalidation",
+            );
+        }
+    } else if let Ok(mut routes) = state.routes.write()
+        && let Some(active) = routes.get_mut(hostname)
+    {
+        active.tcp_failures = 0;
+    }
+}
+
 fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRoute) {
     if let Some(_permit) = state.probes.acquire(Instant::now() + DISCOVERY_TIMEOUT)
-        && let Ok(certificate_fingerprint) = probe_backend(hostname, &incumbent.backend)
+        && let Ok(certificate_fingerprint) = probe_backend(
+            hostname,
+            &incumbent.backend,
+            state.probe_connector_override.as_ref(),
+        )
     {
         clear_conflict(state, hostname);
         if certificate_fingerprint != incumbent.certificate_fingerprint {
@@ -1286,13 +1429,15 @@ fn install_active_route(state: &ProxyState, hostname: &str, matched: ProbeMatch)
             },
         );
     }
-    route_cache::store(
-        &state.config,
-        hostname,
-        &matched.backend.project,
-        &matched.backend.role,
-        &matched.certificate_fingerprint,
-    );
+    if !state.hosting_profile.is_public() {
+        route_cache::store(
+            &state.config,
+            hostname,
+            &matched.backend.project,
+            &matched.backend.role,
+            &matched.certificate_fingerprint,
+        );
+    }
 }
 
 fn registration_matches(config: &Path, backend: &Backend) -> bool {
@@ -1403,6 +1548,7 @@ fn probe_candidates(
         let sender = sender.clone();
         let hostname = hostname.to_string();
         let probes = Arc::clone(&state.probes);
+        let connector = state.probe_connector_override.clone();
         let Some(permit) = probes.acquire(launch_deadline) else {
             break;
         };
@@ -1410,7 +1556,7 @@ fn probe_candidates(
             .name("phx-port-probe".to_string())
             .spawn(move || {
                 let _permit = permit;
-                match probe_backend(&hostname, &backend) {
+                match probe_backend(&hostname, &backend, connector.as_ref()) {
                     Ok(certificate_fingerprint) => {
                         let _ = sender.send(ProbeMatch {
                             backend,
@@ -1470,11 +1616,21 @@ fn prefer_https_per_project(matches: Vec<ProbeMatch>) -> Vec<ProbeMatch> {
     preferred
 }
 
-fn probe_backend(hostname: &str, backend: &Backend) -> Result<String, String> {
+fn probe_backend(
+    hostname: &str,
+    backend: &Backend,
+    connector_override: Option<&TlsConnector>,
+) -> Result<String, String> {
     let stream = connect_backend_with_timeout(backend, PROBE_TIMEOUT)
         .map_err(|error| format!("TCP connection failed: {error}"))?;
-    let connector =
-        TlsConnector::new().map_err(|error| format!("cannot create TLS connector: {error}"))?;
+    let system_connector;
+    let connector = if let Some(connector) = connector_override {
+        connector
+    } else {
+        system_connector =
+            TlsConnector::new().map_err(|error| format!("cannot create TLS connector: {error}"))?;
+        &system_connector
+    };
     let tls = connector
         .connect(hostname, stream)
         .map_err(|error| format!("TLS validation failed: {error}"))?;
@@ -1535,15 +1691,24 @@ mod tests {
     use super::{
         ActiveRoute, Backend, MAX_PROBES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL,
         ProbeLimiter, ProbeMatch, ProxyState, WaitingClient, bind_listener, cache_negative,
-        clear_conflict, collect_probe_matches, observe_workloads, prefer_https_per_project,
-        reconcile_routes, reconcile_workloads, record_conflict, render_control_response,
-        resolve_backend, supports_eager_discovery,
+        clear_conflict, collect_probe_matches, handle_connection, observe_workloads,
+        prefer_https_per_project, reconcile_routes, reconcile_workloads, record_conflict,
+        render_control_response, resolve_backend, supports_eager_discovery,
     };
     use crate::{
-        admission::AdmissionRejection, ingress_config::HostingProfile, route_cache, update_config,
+        admission::AdmissionRejection,
+        ingress_config::{HostingProfile, RouteDeclaration},
+        route_cache, update_config,
     };
-    use std::net::TcpListener;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use native_tls::{Certificate, Identity, TlsAcceptor, TlsConnector};
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use std::fs;
+    use std::io::{self, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1565,6 +1730,252 @@ mod tests {
             last_tls_check: Instant::now(),
             tcp_failures: 0,
         }
+    }
+
+    #[derive(Clone)]
+    struct TestCertificate {
+        certificate_pem: String,
+        private_key_pem: String,
+    }
+
+    impl TestCertificate {
+        fn for_hostname(hostname: &str) -> Self {
+            let CertifiedKey { cert, signing_key } =
+                generate_simple_self_signed(vec![hostname.to_string()]).unwrap();
+            Self {
+                certificate_pem: cert.pem(),
+                private_key_pem: signing_key.serialize_pem(),
+            }
+        }
+
+        fn connector(&self) -> TlsConnector {
+            let mut builder = TlsConnector::builder();
+            builder.disable_built_in_roots(true);
+            builder.add_root_certificate(
+                Certificate::from_pem(self.certificate_pem.as_bytes()).unwrap(),
+            );
+            builder.build().unwrap()
+        }
+    }
+
+    struct TestTlsBackend {
+        address: SocketAddr,
+        accepted: Arc<AtomicUsize>,
+        shutdown: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestTlsBackend {
+        fn start(certificate: &TestCertificate, response: &'static [u8]) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let identity = Identity::from_pkcs8(
+                certificate.certificate_pem.as_bytes(),
+                certificate.private_key_pem.as_bytes(),
+            )
+            .unwrap();
+            let acceptor = TlsAcceptor::new(identity).unwrap();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let accepted_for_worker = Arc::clone(&accepted);
+            let shutdown_for_worker = Arc::clone(&shutdown);
+            let worker = thread::spawn(move || {
+                while !shutdown_for_worker.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            accepted_for_worker.fetch_add(1, Ordering::AcqRel);
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            stream
+                                .set_write_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            if let Ok(mut tls) = acceptor.accept(stream) {
+                                let mut request = [0_u8; 64];
+                                if tls.read(&mut request).is_ok_and(|read| read > 0) {
+                                    tls.write_all(response).unwrap();
+                                    tls.flush().unwrap();
+                                }
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("test TLS backend accept failed: {error}"),
+                    }
+                }
+            });
+            Self {
+                address,
+                accepted,
+                shutdown,
+                worker: Some(worker),
+            }
+        }
+
+        fn port(&self) -> u16 {
+            self.address.port()
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::Acquire)
+        }
+    }
+
+    impl Drop for TestTlsBackend {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_logical_registry(directory: &Path, assignments: &[(&str, u16)]) -> PathBuf {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = directory.join("ports.toml");
+        let mut content = String::from("[ports]\n");
+        for (workload, port) in assignments {
+            content.push_str(&format!("\n[ports.{workload}]\nhttps = {port}\n"));
+        }
+        fs::write(&registry, content).unwrap();
+        fs::set_permissions(&registry, fs::Permissions::from_mode(0o600)).unwrap();
+        registry
+    }
+
+    fn public_profile(hostname: &str, workload: &str) -> HostingProfile {
+        HostingProfile::Public {
+            ingress_config: PathBuf::from("ingress.toml"),
+            route: RouteDeclaration {
+                hostname: hostname.to_string(),
+                workload: workload.to_string(),
+                role: "https".to_string(),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_route_requires_exact_declaration_and_certificate_before_relay() {
+        const HOSTNAME: &str = "declared.example.test";
+
+        let directory = tempdir().unwrap();
+        let valid_certificate = TestCertificate::for_hostname(HOSTNAME);
+        let declared_backend = TestTlsBackend::start(&valid_certificate, b"declared");
+        let decoy_backend = TestTlsBackend::start(&valid_certificate, b"decoy");
+        let registry = write_logical_registry(
+            directory.path(),
+            &[
+                ("contoso-web", declared_backend.port()),
+                ("decoy-web", decoy_backend.port()),
+            ],
+        );
+        let state = Arc::new(ProxyState::new_with_profile_and_connector(
+            registry.clone(),
+            public_profile(HOSTNAME, "contoso-web"),
+            valid_certificate.connector(),
+        ));
+
+        let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let frontend_address = frontend.local_addr().unwrap();
+        let client_connector = valid_certificate.connector();
+        let client = thread::spawn(move || {
+            let stream = TcpStream::connect(frontend_address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut tls = client_connector.connect(HOSTNAME, stream).unwrap();
+            tls.write_all(b"request").unwrap();
+            let mut response = [0_u8; 8];
+            tls.read_exact(&mut response).unwrap();
+            response
+        });
+        let (accepted, peer) = frontend.accept().unwrap();
+        let admission = state.admission.try_admit(peer.ip()).unwrap();
+        handle_connection(accepted, Instant::now(), Arc::clone(&state), admission).unwrap();
+        assert_eq!(&client.join().unwrap(), b"declared");
+        assert_eq!(declared_backend.accepted(), 2);
+        assert_eq!(decoy_backend.accepted(), 0);
+        let active_routes = state.routes.read().unwrap();
+        assert_eq!(active_routes.len(), 1);
+        assert_eq!(
+            active_routes[HOSTNAME].backend,
+            Backend {
+                project: "contoso-web".to_string(),
+                role: "https".to_string(),
+                port: declared_backend.port(),
+            }
+        );
+        drop(active_routes);
+        assert!(
+            !fs::read_to_string(&registry)
+                .unwrap()
+                .contains("discovered_routes")
+        );
+        assert_eq!(state.relayed_connections.load(Ordering::Relaxed), 1);
+        assert_eq!(state.handoff_attempts.load(Ordering::Relaxed), 0);
+
+        let undeclared_frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let undeclared_address = undeclared_frontend.local_addr().unwrap();
+        let undeclared_connector = valid_certificate.connector();
+        let undeclared_client = thread::spawn(move || {
+            let stream = TcpStream::connect(undeclared_address).unwrap();
+            undeclared_connector.connect("undeclared.example.test", stream)
+        });
+        let (undeclared, peer) = undeclared_frontend.accept().unwrap();
+        let admission = state.admission.try_admit(peer.ip()).unwrap();
+        let error = handle_connection(undeclared, Instant::now(), Arc::clone(&state), admission)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "public ingress has no Route Declaration for undeclared.example.test"
+        );
+        assert!(undeclared_client.join().unwrap().is_err());
+        assert_eq!(declared_backend.accepted(), 2);
+        assert_eq!(decoy_backend.accepted(), 0);
+
+        let invalid_directory = tempdir().unwrap();
+        let wrong_hostname_certificate =
+            TestCertificate::for_hostname("wrong-hostname.example.test");
+        let invalid_backend = TestTlsBackend::start(&wrong_hostname_certificate, b"invalid");
+        let invalid_registry = write_logical_registry(
+            invalid_directory.path(),
+            &[("contoso-web", invalid_backend.port())],
+        );
+        let invalid_state = ProxyState::new_with_profile_and_connector(
+            invalid_registry,
+            public_profile(HOSTNAME, "contoso-web"),
+            wrong_hostname_certificate.connector(),
+        );
+
+        let error = resolve_backend(HOSTNAME, &invalid_state).unwrap_err();
+        assert!(error.contains("TLS validation failed"), "{error}");
+        assert_eq!(invalid_backend.accepted(), 1);
+        assert!(invalid_state.routes.read().unwrap().is_empty());
+
+        let untrusted_directory = tempdir().unwrap();
+        let untrusted_certificate = TestCertificate::for_hostname(HOSTNAME);
+        let untrusted_backend = TestTlsBackend::start(&untrusted_certificate, b"untrusted");
+        let untrusted_registry = write_logical_registry(
+            untrusted_directory.path(),
+            &[("contoso-web", untrusted_backend.port())],
+        );
+        let unrelated_trust_anchor = TestCertificate::for_hostname(HOSTNAME);
+        let untrusted_state = ProxyState::new_with_profile_and_connector(
+            untrusted_registry,
+            public_profile(HOSTNAME, "contoso-web"),
+            unrelated_trust_anchor.connector(),
+        );
+
+        let error = resolve_backend(HOSTNAME, &untrusted_state).unwrap_err();
+        assert!(error.contains("TLS validation failed"), "{error}");
+        assert_eq!(untrusted_backend.accepted(), 1);
+        assert!(untrusted_state.routes.read().unwrap().is_empty());
     }
 
     #[test]
@@ -1766,6 +2177,11 @@ mod tests {
             registry,
             HostingProfile::Public {
                 ingress_config: directory.path().join("ingress.toml"),
+                route: RouteDeclaration {
+                    hostname: "declared.example.com".to_string(),
+                    workload: "contoso-web".to_string(),
+                    role: "https".to_string(),
+                },
             },
         );
 
@@ -1774,7 +2190,7 @@ mod tests {
         let error = resolve_backend("www.example.com", &state).unwrap_err();
         assert_eq!(
             error,
-            "public ingress has no verified Route Declaration for www.example.com"
+            "public ingress has no Route Declaration for www.example.com"
         );
         assert_eq!(state.successful_discoveries.load(Ordering::Relaxed), 0);
 

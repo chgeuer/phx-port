@@ -157,10 +157,23 @@ phx-port daemon --listen 0.0.0.0:443 --listen '[::]:443'
 Without an explicit ingress configuration, the daemon uses the development
 Hosting Profile described by this document. `--ingress-config PATH` or
 `PHX_PORT_INGRESS_CONFIG` selects the public profile only when the referenced
-file declares `[ingress] mode = "public"`. `PHX_PORT_WORKLOAD_ID` is not a
-profile selector. Until exact Route Declaration handling lands, public mode
-fails closed with no eligible routes and does not read dynamic or persisted
-development discoveries.
+file declares `[ingress] mode = "public"`. The current typed schema requires
+exactly one `[ingress.hosts."<hostname>"]` Route Declaration with a valid
+logical `workload`, a bounded lowercase `role`, and an optional boolean
+`required`; `unknown_sni`, when present, must be `"reject"`.
+`PHX_PORT_WORKLOAD_ID` is not a profile selector.
+
+The declaration resolves only its exact logical Workload/role assignment from
+the private `PHX_PORT_CONFIG` Port Registry. On first use, ingress connects
+only to that registered loopback port and activates the route only after
+system-trusted TLS verification succeeds for the exact declared hostname.
+Undeclared SNI is rejected before registry lookup, route-cache lookup, or
+certificate probing. Public verified routes are kept in memory and periodically
+revalidated against the same declaration; they never modify the stable Port
+Registry. Delivery is encrypted loopback relay-only until production PHXP
+runtime paths complete their separate Linux and macOS gate. Multi-route
+reconciliation, required-route readiness, reload, and distinct derived state
+remain later milestones.
 
 The transitional threaded configuration defaults to 256 active connections,
 128 pre-routing connections, 128 relays, 64 handoff negotiations, 200 accepts

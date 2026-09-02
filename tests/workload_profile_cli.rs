@@ -523,7 +523,13 @@ fn logical_registry_rejects_unsafe_modes_and_duplicate_ports() {
 fn ingress_config_requires_public_mode_for_cli_and_environment_activation() {
     let directory = tempdir().unwrap();
     let public_config = directory.path().join("public.toml");
-    fs::write(&public_config, "[ingress]\nmode = \"public\"\n").unwrap();
+    fs::write(
+        &public_config,
+        "[ingress]\nmode = \"public\"\n\
+         [ingress.hosts.\"www.example.com\"]\n\
+         workload = \"contoso-web\"\nrole = \"https\"\n",
+    )
+    .unwrap();
     let non_public_config = directory.path().join("non-public.toml");
     fs::write(&non_public_config, "[ingress]\nmode = \"development\"\n").unwrap();
 
@@ -584,7 +590,13 @@ fn ingress_config_requires_public_mode_for_cli_and_environment_activation() {
 fn explicit_ingress_config_activates_public_profile_but_workload_id_does_not() {
     let directory = tempdir().unwrap();
     let public_config = directory.path().join("public.toml");
-    fs::write(&public_config, "[ingress]\nmode = \"public\"\n").unwrap();
+    fs::write(
+        &public_config,
+        "[ingress]\nmode = \"public\"\n\
+         [ingress.hosts.\"www.example.com\"]\n\
+         workload = \"contoso-web\"\nrole = \"https\"\n",
+    )
+    .unwrap();
 
     let public = RunningDaemon::start(Some(&public_config), None);
     assert!(public.status().contains("hosting_profile=public"));

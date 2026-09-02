@@ -149,18 +149,35 @@ phx-port daemon --listen 0.0.0.0:443 --listen '[::]:443'
 
 Development is the default Hosting Profile and retains dynamic certificate
 discovery. Public mode is selected only by `--ingress-config PATH` or
-`PHX_PORT_INGRESS_CONFIG`; the referenced TOML file must explicitly contain:
+`PHX_PORT_INGRESS_CONFIG`. The current public-routing milestone accepts exactly
+one Route Declaration:
 
 ```toml
 [ingress]
 mode = "public"
+unknown_sni = "reject"
+
+[ingress.hosts."www.contoso.com"]
+workload = "contoso-web"
+role = "https"
+required = true
 ```
 
-At this implementation stage the public profile fails closed with no eligible
-routes and never falls back to development discovery. Exact public Route
-Declarations are a separate implementation milestone, so this activation
-mechanism is not yet a production-ready ingress claim. `proxy status` reports
-the active `hosting_profile`.
+Set `PHX_PORT_CONFIG` to the private logical Workload registry populated by
+`PHX_PORT_WORKLOAD_ID`. Public ingress resolves only the declaration's exact
+`(Workload ID, role)` assignment and probes only that loopback listener. The
+route becomes active only after the listener presents a system-trusted
+certificate valid for the exact declared hostname. Undeclared SNI never reads
+the dynamic route cache or probes any registered Workload.
+
+Public delivery is encrypted loopback relay-only at this milestone; production
+PHXP endpoint activation remains a separate, cross-platform gate. Verified
+public routes stay in memory rather than modifying the stable Port Registry,
+and are revalidated against the same declaration and certificate. Multi-route
+reconciliation, readiness semantics for `required`, reload, and split derived
+state are later milestones, so this is not yet a production-ready ingress
+claim. `proxy status` reports the active `hosting_profile` and route/relay
+counters.
 
 The threaded daemon has explicit startup capacity options:
 
