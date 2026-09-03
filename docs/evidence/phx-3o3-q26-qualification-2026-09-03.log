@@ -1,0 +1,34 @@
+Command: systemd-run --user --scope -p MemoryMax=8G taskset -c 0-3 tests/phase8-harness.sh --qualification
+Transcript SHA-256: 6efe2fcef20e81141317cf53d8d389dd3f4c239692155c80cfdbf769799e50f6
+Qualification scope: ingress process constrained to four CPUs and 8 GiB on a larger host.
+Limitation: kernel-wide resources came from the 24-vCPU/~94-GiB host; this is not equivalent to a dedicated 4-vCPU/8-GiB VM.
+Separate gate: representative whole-host Workload soak was not executed and is not complete.
+
+Running as unit: run-p76989-i192854681.scope; invocation ID: 41680773062741d8b3bb5ba566690f53
+phase8: qualification-load
+{"metric":"qualification_host","kernel":"linux","vcpus":4,"affinity_vcpus":4,"affinity_cpus":[0,1,2,3],"host_vcpus":24,"memory_kib":8388608,"memory_source":"cgroup_v2","host_memory_kib":98127636,"environment":"cgroup_constrained_larger_host","dedicated_vm_equivalent":false,"euid":1000}
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/adversarial_public_ingress.rs (target/debug/deps/adversarial_public_ingress-db2457fd7ced9b26)
+
+running 1 test
+{"file_descriptors":76,"metric":"ingress_resources","resident_kibibytes":16592,"stage":"baseline","tasks":17}
+{"metric":"initial_accepted_connection_rate","value":1008.591,"unit":"connections_per_second"}
+{"file_descriptors":10076,"metric":"ingress_resources","resident_kibibytes":198792,"samples":1142,"stage":"initial_mixed_peak","tasks":40}
+{"confirmed_handoffs":25000,"metric":"live_connection_mix","relays":5000,"total":30000,"unchanged_long_lived_handoffs":2500,"unchanged_long_lived_relays":5000}
+test mixed_load_and_fd_pressure_recover_to_baseline has been running for over 60 seconds
+{"metric":"sustained_accepted_connection_rate","value":1009.946,"unit":"connections_per_second","duration_seconds":1800.097}
+{"file_descriptors":10140,"metric":"ingress_resources","resident_kibibytes":203316,"samples":52042,"stage":"sustained_mixed_peak","tasks":64}
+{"file_descriptors":10076,"metric":"ingress_resources","resident_kibibytes":202824,"stage":"end_of_sustained_load","tasks":64}
+{"accepted":1818000,"live_connections_preserved":30000,"metric":"sustained_handoff_replacements","unchanged_long_lived_connections":7500}
+{"file_descriptors":12324,"metric":"ingress_resources","resident_kibibytes":313876,"samples":272,"stage":"relay_shedding_peak","tasks":80}
+{"admitted":5000,"attempted":7500,"client_hello_release":"barrier","client_hello_release_span_milliseconds":43.167207999999995,"metric":"relay_shedding","rejected":2500,"relay_capacity_rejections":2500,"tcp_connections_preestablished":7500,"tcp_preconnect_duration_seconds":7.425850877}
+{"file_descriptors":76,"metric":"ingress_resources","resident_kibibytes":26072,"stage":"recovered","tasks":17}
+{"entries":1,"metric":"source_table_recovery"}
+{"aggregation_windows":187,"handoff_success_events":183,"limit":3243,"lines":195,"metric":"bounded_stderr"}
+test mixed_load_and_fd_pressure_recover_to_baseline ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 1852.21s
+
+{"scenario":19,"status":"passed","profile":"qualification","group":"qualification-load"}
+{"scenario":20,"status":"passed","profile":"qualification","group":"qualification-load"}
+{"summary":"passed","profile":"qualification","scenarios_passed":2,"q26_qualified":true,"representative_whole_host_workload_soak_completed":false}

@@ -60,6 +60,7 @@ const PUBLIC_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 const PHXP_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const ROUTE_SELECTION_QUEUE_CAPACITY: usize = MAX_WAITING_CLIENTS - ROUTE_SELECTION_WORKERS;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+const ALLOCATOR_RECLAIM_COMPLETIONS: usize = 128;
 const OVERLOAD_EVENT_INTERVAL: Duration = Duration::from_secs(10);
 const DELIVERY_EVENT_INTERVAL: Duration = Duration::from_secs(10);
 const SOURCE_DIAGNOSTIC_EVENT_INTERVAL: Duration = Duration::from_secs(1);
@@ -586,6 +587,9 @@ struct ProxyState {
     queued_connections: Arc<AtomicUsize>,
     probes: Arc<ProbeLimiter>,
     probe_connector_override: Option<TlsConnector>,
+    allocator_reclaim_gate: RwLock<()>,
+    connection_tasks_in_flight: AtomicUsize,
+    completed_connection_tasks: AtomicUsize,
     accepted_connections: AtomicU64,
     relayed_connections: AtomicU64,
     rejected_connections: AtomicU64,
@@ -654,6 +658,9 @@ impl ProxyState {
             queued_connections: Arc::new(AtomicUsize::new(0)),
             probes: Arc::new(ProbeLimiter::new()),
             probe_connector_override,
+            allocator_reclaim_gate: RwLock::new(()),
+            connection_tasks_in_flight: AtomicUsize::new(0),
+            completed_connection_tasks: AtomicUsize::new(0),
             accepted_connections: AtomicU64::new(0),
             relayed_connections: AtomicU64::new(0),
             rejected_connections: AtomicU64::new(0),
@@ -1617,6 +1624,10 @@ async fn accept_tokio_connections(
                         }
                         let accepted_at = Instant::now();
                         state.accepted_connections.fetch_add(1, Ordering::Relaxed);
+                        let reclaim_gate = state
+                            .allocator_reclaim_gate
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         let admission = match state.admission.try_admit(peer.ip()) {
                             Ok(admission) => admission,
                             Err(rejection) => {
@@ -1630,6 +1641,9 @@ async fn accept_tokio_connections(
                             shutdown: shutdown.clone(),
                             route_sender: route_sender.clone(),
                         };
+                        state
+                            .connection_tasks_in_flight
+                            .fetch_add(1, Ordering::AcqRel);
                         connections.spawn(async move {
                             route_tokio_connection(
                                 stream,
@@ -1640,6 +1654,7 @@ async fn accept_tokio_connections(
                             )
                             .await
                         });
+                        drop(reclaim_gate);
                     }
                     Err(error) => {
                         if !accept_error_reported {
@@ -1665,6 +1680,30 @@ async fn accept_tokio_connections(
     ListenerDrainReport {
         forced_connections,
         failure,
+    }
+}
+
+fn reclaim_connection_memory_if_quiescent(state: &ProxyState) {
+    if state.completed_connection_tasks.load(Ordering::Acquire) < ALLOCATOR_RECLAIM_COMPLETIONS {
+        return;
+    }
+
+    let _reclaim_gate = state
+        .allocator_reclaim_gate
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.connection_tasks_in_flight.load(Ordering::Acquire) != 0
+        || state.admission.snapshot().global.in_use != 0
+        || state.completed_connection_tasks.load(Ordering::Acquire) < ALLOCATOR_RECLAIM_COMPLETIONS
+    {
+        return;
+    }
+    state.completed_connection_tasks.swap(0, Ordering::AcqRel);
+
+    // Glibc otherwise keeps the freed 32-KiB relay futures resident after a bounded burst.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        nix::libc::malloc_trim(0);
     }
 }
 
@@ -1715,6 +1754,18 @@ fn record_connection_completion(
     state: &ProxyState,
     failure: &mut Option<String>,
 ) {
+    let _ = state.completed_connection_tasks.fetch_update(
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        |completed| Some(completed.saturating_add(1)),
+    );
+    let previous = state
+        .connection_tasks_in_flight
+        .fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(previous > 0);
+    if previous == 1 {
+        reclaim_connection_memory_if_quiescent(state);
+    }
     match joined {
         Ok(Ok(())) => {}
         Ok(Err(_)) => {
@@ -4963,18 +5014,20 @@ fn connect_backend_with_timeout(backend: &Backend, timeout: Duration) -> io::Res
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveRoute, Backend, CONTROL_RESPONSE_LIMIT, CertificateExpiryState, CertificateProof,
-        DELIVERY_EVENT_INTERVAL, DeliveryOutcome, IngressShutdown, MAX_PROBES, MAX_ROUTE_CONFLICTS,
-        MAX_ROUTE_DIAGNOSTICS, MAX_VERIFIED_ROUTES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL,
-        ProbeLimiter, ProbeMatch, ProxyState, QueuedRouteSelection, RelayJob, RouteSelectionJob,
+        ALLOCATOR_RECLAIM_COMPLETIONS, ActiveRoute, Backend, CONTROL_RESPONSE_LIMIT,
+        CertificateExpiryState, CertificateProof, DELIVERY_EVENT_INTERVAL, DeliveryOutcome,
+        IngressShutdown, MAX_PROBES, MAX_ROUTE_CONFLICTS, MAX_ROUTE_DIAGNOSTICS,
+        MAX_VERIFIED_ROUTES, MAX_WAITING_CLIENTS, OVERLOAD_EVENT_INTERVAL, ProbeLimiter,
+        ProbeMatch, ProxyState, QueuedRouteSelection, RelayJob, RouteSelectionJob,
         SOURCE_DIAGNOSTIC_EVENT_INTERVAL, TLS_REVALIDATION_INTERVAL, TokioIngress, WaitingClient,
         cache_negative, clear_conflict, collect_probe_matches, commit_relay_start,
         current_active_backend, current_unix_seconds, handle_connection, handle_route_selection,
         install_active_route, observe_workloads, prefer_https_per_project,
         reap_ready_connection_tasks, reconcile_routes, reconcile_workloads, record_conflict,
-        relay_tokio_connection, relay_tokio_connection_with_connector, reload_public_profile,
-        render_control_response, render_prometheus_metrics, resolve_backend, select_tokio_route,
-        serve_tokio_ingress, supports_eager_discovery,
+        record_connection_completion, relay_tokio_connection,
+        relay_tokio_connection_with_connector, reload_public_profile, render_control_response,
+        render_prometheus_metrics, resolve_backend, select_tokio_route, serve_tokio_ingress,
+        supports_eager_discovery,
     };
     #[cfg(unix)]
     use super::{ControlAccess, ControlEndpointPolicy, ControlPeer, bind_private_control_socket};
@@ -5021,7 +5074,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, RwLock};
+    use std::sync::{Arc, Barrier, RwLock, mpsc};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime};
     use tempfile::{TempDir, tempdir_in};
@@ -5878,6 +5931,9 @@ mod tests {
         runtime.block_on(async {
             let handoff_state = Arc::clone(&state);
             let mut connections = JoinSet::new();
+            state
+                .connection_tasks_in_flight
+                .fetch_add(1, Ordering::AcqRel);
             connections.spawn(async move {
                 let outcome = prepare_handoff(handoff, handoff_state).await?;
                 if outcome.is_some() {
@@ -6410,6 +6466,9 @@ mod tests {
 
         runtime.block_on(async {
             let mut connections = JoinSet::new();
+            state
+                .connection_tasks_in_flight
+                .fetch_add(COMPLETED_TASKS, Ordering::AcqRel);
             for _ in 0..COMPLETED_TASKS {
                 connections.spawn(async { Err("malformed ClientHello".to_string()) });
             }
@@ -6427,6 +6486,85 @@ mod tests {
                 COMPLETED_TASKS as u64
             );
         });
+    }
+
+    #[test]
+    fn allocator_reclaim_runs_only_on_process_wide_zero_transition() {
+        let directory = tempdir().unwrap();
+        let state = Arc::new(ProxyState::new(directory.path().join("ports.toml")));
+        state
+            .completed_connection_tasks
+            .store(ALLOCATOR_RECLAIM_COMPLETIONS - 1, Ordering::Release);
+        state.connection_tasks_in_flight.store(2, Ordering::Release);
+        let reclaim_reader = state.allocator_reclaim_gate.read().unwrap();
+        let worker_state = Arc::clone(&state);
+        let (finished, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut failure = None;
+            record_connection_completion(Ok(Ok(())), &worker_state, &mut failure);
+            finished.send(failure).unwrap();
+        });
+
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            None,
+            "a nonzero in-flight transition attempted exclusive reclamation"
+        );
+        worker.join().unwrap();
+        assert_eq!(state.connection_tasks_in_flight.load(Ordering::Acquire), 1);
+        assert_eq!(
+            state.completed_connection_tasks.load(Ordering::Acquire),
+            ALLOCATOR_RECLAIM_COMPLETIONS
+        );
+
+        drop(reclaim_reader);
+        let mut failure = None;
+        record_connection_completion(Ok(Ok(())), &state, &mut failure);
+        assert!(failure.is_none());
+        assert_eq!(state.connection_tasks_in_flight.load(Ordering::Acquire), 0);
+        assert_eq!(state.completed_connection_tasks.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn allocator_reclaim_waits_for_admitted_task_registration() {
+        let directory = tempdir().unwrap();
+        let state = Arc::new(ProxyState::new(directory.path().join("ports.toml")));
+        state
+            .completed_connection_tasks
+            .store(ALLOCATOR_RECLAIM_COMPLETIONS - 1, Ordering::Release);
+        state.connection_tasks_in_flight.store(1, Ordering::Release);
+        let registration_gate = state.allocator_reclaim_gate.read().unwrap();
+        let pending_registration = state
+            .admission
+            .try_admit(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .unwrap();
+        let worker_state = Arc::clone(&state);
+        let (finished, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut failure = None;
+            record_connection_completion(Ok(Ok(())), &worker_state, &mut failure);
+            finished.send(failure).unwrap();
+        });
+
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        state.connection_tasks_in_flight.store(1, Ordering::Release);
+        drop(registration_gate);
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), None);
+        worker.join().unwrap();
+        assert_eq!(state.connection_tasks_in_flight.load(Ordering::Acquire), 1);
+        assert_eq!(
+            state.completed_connection_tasks.load(Ordering::Acquire),
+            ALLOCATOR_RECLAIM_COMPLETIONS
+        );
+
+        drop(pending_registration);
+        let mut failure = None;
+        record_connection_completion(Ok(Ok(())), &state, &mut failure);
+        assert!(failure.is_none());
+        assert_eq!(state.completed_connection_tasks.load(Ordering::Acquire), 0);
     }
 
     #[test]

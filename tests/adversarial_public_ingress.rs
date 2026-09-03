@@ -34,12 +34,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{
     TcpListener as TokioTcpListener, TcpSocket as TokioTcpSocket, TcpStream as TokioTcpStream,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Barrier, mpsc};
 use tokio::task::JoinSet;
 
 const TEST_RSA_PRIVATE_KEY: &str = include_str!("fixtures/proxy-test-rsa-key.pem");
 const ROLE: &str = "https";
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const LOAD_RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
+const SIMULTANEOUS_RELEASE_MAX_SPAN: Duration = Duration::from_secs(1);
 static HARNESS_LOCK: Mutex<()> = Mutex::new(());
 
 fn harness_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1113,7 +1115,7 @@ fn fragmented_tls_round_trip(connector: &TlsConnector, hostname: &str, ingress: 
     worker.join().unwrap();
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ResourceSnapshot {
     file_descriptors: usize,
     tasks: usize,
@@ -1144,6 +1146,133 @@ impl ResourceSnapshot {
             resident_kibibytes: self.resident_kibibytes.max(other.resident_kibibytes),
         }
     }
+}
+
+struct ResourcePeak {
+    snapshot: ResourceSnapshot,
+    samples: usize,
+}
+
+impl ResourcePeak {
+    fn new(snapshot: ResourceSnapshot) -> Self {
+        Self {
+            snapshot,
+            samples: 1,
+        }
+    }
+
+    fn observe(&mut self, snapshot: ResourceSnapshot) {
+        self.snapshot = self.snapshot.max(snapshot);
+        self.samples = self.samples.saturating_add(1);
+    }
+}
+
+struct ProcessResourceSampler {
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<ResourcePeak>>,
+}
+
+impl ProcessResourceSampler {
+    fn start(pid: u32) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            let mut peak = ResourcePeak::new(ResourceSnapshot::read(pid));
+            while !worker_stop.load(Ordering::Acquire) {
+                thread::sleep(LOAD_RESOURCE_SAMPLE_INTERVAL);
+                peak.observe(ResourceSnapshot::read(pid));
+            }
+            peak
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn finish(mut self) -> ResourcePeak {
+        self.stop.store(true, Ordering::Release);
+        self.worker.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for ProcessResourceSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[test]
+fn resource_peaks_combine_every_sample_component_wise() {
+    let first = ResourceSnapshot {
+        file_descriptors: 100,
+        tasks: 20,
+        resident_kibibytes: 1_000,
+    };
+    let second = ResourceSnapshot {
+        file_descriptors: 90,
+        tasks: 30,
+        resident_kibibytes: 900,
+    };
+    let third = ResourceSnapshot {
+        file_descriptors: 80,
+        tasks: 10,
+        resident_kibibytes: 2_000,
+    };
+    let mut peak = ResourcePeak::new(first);
+    peak.observe(second);
+    peak.observe(third);
+    assert_eq!(
+        peak.snapshot,
+        ResourceSnapshot {
+            file_descriptors: 100,
+            tasks: 30,
+            resident_kibibytes: 2_000,
+        }
+    );
+    assert_eq!(peak.samples, 3);
+}
+
+fn emit_qualification_resources(stage: &str, snapshot: ResourceSnapshot) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "metric": "ingress_resources",
+            "stage": stage,
+            "file_descriptors": snapshot.file_descriptors,
+            "tasks": snapshot.tasks,
+            "resident_kibibytes": snapshot.resident_kibibytes,
+        })
+    );
+}
+
+fn emit_qualification_resource_peak(stage: &str, snapshot: ResourceSnapshot, samples: usize) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "metric": "ingress_resources",
+            "stage": stage,
+            "file_descriptors": snapshot.file_descriptors,
+            "tasks": snapshot.tasks,
+            "resident_kibibytes": snapshot.resident_kibibytes,
+            "samples": samples,
+        })
+    );
+}
+
+fn assert_resource_sample_floor(context: &str, samples: usize, elapsed: Duration) {
+    let minimum_samples = usize::try_from(elapsed.as_secs())
+        .unwrap_or(usize::MAX)
+        .saturating_mul(10)
+        .max(2);
+    assert!(
+        samples >= minimum_samples,
+        "{context} sampled resources {samples} times, below the \
+         {minimum_samples}-sample qualification floor"
+    );
 }
 
 #[test]
@@ -1456,6 +1585,8 @@ struct LoadProfile {
     launch_rate: usize,
 }
 
+const LOAD_CONNECTIONS_PER_SOURCE: usize = 16;
+
 impl LoadProfile {
     fn from_environment() -> Self {
         match std::env::var("PHX_PORT_PHASE8_PROFILE").as_deref() {
@@ -1506,36 +1637,67 @@ async fn open_raw_connection(
     id: u64,
     source: Option<Ipv4Addr>,
 ) -> Result<TokioTcpStream, String> {
-    let mut stream = match source {
+    let stream = connect_raw_connection(address, &hostname, id, source).await?;
+    route_raw_connection(stream, &hostname, id, source).await
+}
+
+fn raw_connection_context(hostname: &str, id: u64, source: Option<Ipv4Addr>) -> String {
+    format!(
+        "connection {id} for {hostname} from {}",
+        source
+            .map(|address| address.to_string())
+            .unwrap_or_else(|| "the default source".to_string())
+    )
+}
+
+async fn connect_raw_connection(
+    address: SocketAddr,
+    hostname: &str,
+    id: u64,
+    source: Option<Ipv4Addr>,
+) -> Result<TokioTcpStream, String> {
+    let context = || raw_connection_context(hostname, id, source);
+    let stream = match source {
         Some(source) => {
-            let socket = TokioTcpSocket::new_v4().map_err(|error| error.to_string())?;
+            let socket = TokioTcpSocket::new_v4()
+                .map_err(|error| format!("cannot create {}: {error}", context()))?;
             socket
                 .bind(SocketAddr::from((source, 0)))
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| format!("cannot bind {}: {error}", context()))?;
             socket
                 .connect(address)
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(|error| format!("cannot connect {}: {error}", context()))?
         }
         None => TokioTcpStream::connect(address)
             .await
-            .map_err(|error| error.to_string())?,
+            .map_err(|error| format!("cannot connect {}: {error}", context()))?,
     };
+    Ok(stream)
+}
+
+async fn route_raw_connection(
+    mut stream: TokioTcpStream,
+    hostname: &str,
+    id: u64,
+    source: Option<Ipv4Addr>,
+) -> Result<TokioTcpStream, String> {
+    let context = || raw_connection_context(hostname, id, source);
     stream
-        .write_all(&client_hello(Some(&hostname)))
+        .write_all(&client_hello(Some(hostname)))
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("cannot write ClientHello for {}: {error}", context()))?;
     stream
         .write_all(&id.to_be_bytes())
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("cannot write payload for {}: {error}", context()))?;
     let mut response = [0_u8; 8];
     tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut response))
         .await
-        .map_err(|_| "routed payload response timed out".to_string())?
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| format!("routed payload response timed out for {}", context()))?
+        .map_err(|error| format!("cannot read routed payload for {}: {error}", context()))?;
     if response != id.to_be_bytes() {
-        return Err("routed payload was corrupted".to_string());
+        return Err(format!("routed payload was corrupted for {}", context()));
     }
     Ok(stream)
 }
@@ -1543,6 +1705,8 @@ async fn open_raw_connection(
 struct MixedConnections {
     streams_by_route: Vec<Vec<TokioTcpStream>>,
     elapsed: Duration,
+    resource_peak: ResourceSnapshot,
+    resource_samples: usize,
 }
 
 fn loopback_source(group: usize) -> Ipv4Addr {
@@ -1554,13 +1718,33 @@ fn loopback_source(group: usize) -> Ipv4Addr {
     )
 }
 
+fn load_source(id: usize) -> Ipv4Addr {
+    loopback_source(id / LOAD_CONNECTIONS_PER_SOURCE)
+}
+
+#[test]
+fn load_generator_never_exceeds_source_pre_routing_limit() {
+    let first = load_source(0);
+    assert!(
+        (1..LOAD_CONNECTIONS_PER_SOURCE).all(|id| load_source(id) == first),
+        "one source group should use every allowed pre-routing slot"
+    );
+    assert_ne!(
+        load_source(LOAD_CONNECTIONS_PER_SOURCE),
+        first,
+        "the first connection beyond the source limit must use a new source"
+    );
+}
+
 async fn open_mixed_raw_connections(
     address: SocketAddr,
     routes: &[(String, usize)],
     launch_rate: usize,
+    pid: u32,
 ) -> Result<MixedConnections, String> {
     let mut jobs = JoinSet::new();
     let mut id = 0_u64;
+    let resource_sampler = ProcessResourceSampler::start(pid);
     let started = tokio::time::Instant::now();
     for (route_index, (hostname, count)) in routes.iter().enumerate() {
         for _ in 0..*count {
@@ -1571,7 +1755,7 @@ async fn open_mixed_raw_connections(
                 tokio::time::sleep_until(started + offset).await;
             }
             let hostname = hostname.clone();
-            let source = loopback_source((id as usize) / 128);
+            let source = load_source(id as usize);
             jobs.spawn(async move {
                 open_raw_connection(address, hostname, id, Some(source))
                     .await
@@ -1588,9 +1772,13 @@ async fn open_mixed_raw_connections(
         let (route_index, stream) = result.map_err(|error| error.to_string())??;
         streams_by_route[route_index].push(stream);
     }
+    let elapsed = started.elapsed();
+    let resource_peak = resource_sampler.finish();
     Ok(MixedConnections {
         streams_by_route,
-        elapsed: started.elapsed(),
+        elapsed,
+        resource_peak: resource_peak.snapshot,
+        resource_samples: resource_peak.samples,
     })
 }
 
@@ -1630,6 +1818,7 @@ struct SustainedConnections {
     elapsed: Duration,
     accepted: usize,
     resource_peak: ResourceSnapshot,
+    resource_samples: usize,
 }
 
 async fn sustain_handoff_accepts(
@@ -1653,10 +1842,9 @@ async fn sustain_handoff_accepts(
         .map_err(|_| "sustained accept count does not fit usize".to_string())?;
     let accepted_offset = u64::try_from(accepted_offset).map_err(|error| error.to_string())?;
     let max_pending = launch_rate.saturating_mul(5).max(1);
+    let resource_sampler = ProcessResourceSampler::start(pid);
     let started = tokio::time::Instant::now();
     let deadline = started + sustain;
-    let mut next_sample = started + Duration::from_secs(1);
-    let mut resource_peak = ResourceSnapshot::read(pid);
     let mut rotating = VecDeque::from(streams);
     let mut jobs = JoinSet::new();
     let mut accepted = 0;
@@ -1681,14 +1869,9 @@ async fn sustain_handoff_accepts(
             ));
         }
         let id = accepted_offset.saturating_add(index);
-        let source = loopback_source((id as usize) / 128);
+        let source = load_source(id as usize);
         let hostname = hostname.to_string();
         jobs.spawn(open_raw_connection(address, hostname, id, Some(source)));
-
-        if tokio::time::Instant::now() >= next_sample {
-            resource_peak = resource_peak.max(ResourceSnapshot::read(pid));
-            next_sample += Duration::from_secs(1);
-        }
     }
 
     while let Some(result) = jobs.join_next().await {
@@ -1700,65 +1883,105 @@ async fn sustain_handoff_accepts(
         );
         rotating.push_back(stream);
         accepted += 1;
-        resource_peak = resource_peak.max(ResourceSnapshot::read(pid));
     }
     tokio::time::sleep_until(deadline).await;
-    resource_peak = resource_peak.max(ResourceSnapshot::read(pid));
+    let elapsed = started.elapsed();
+    let resource_peak = resource_sampler.finish();
 
     Ok(SustainedConnections {
         streams: rotating.into(),
-        elapsed: started.elapsed(),
+        elapsed,
         accepted,
-        resource_peak,
+        resource_peak: resource_peak.snapshot,
+        resource_samples: resource_peak.samples,
     })
 }
 
 struct AttemptedConnections {
     admitted: Vec<TokioTcpStream>,
     rejected: usize,
+    elapsed: Duration,
+    preconnected: usize,
+    preconnect_elapsed: Duration,
+    simultaneous_release_span: Duration,
     resource_peak: ResourceSnapshot,
+    resource_samples: usize,
 }
 
-async fn attempt_raw_connections(
+async fn attempt_simultaneous_raw_connections(
     address: SocketAddr,
     hostname: &str,
     count: usize,
+    preconnect_rate: usize,
     pid: u32,
-) -> AttemptedConnections {
-    let mut jobs = JoinSet::new();
-    let mut resource_peak = ResourceSnapshot::read(pid);
-    for id in 0..count {
-        let source_index = id / 16;
-        let source = loopback_source(source_index);
-        jobs.spawn(open_raw_connection(
-            address,
-            hostname.to_string(),
-            id as u64,
-            Some(source),
-        ));
-        if id % 64 == 0 {
-            resource_peak = resource_peak.max(ResourceSnapshot::read(pid));
-        }
+) -> Result<AttemptedConnections, String> {
+    if count == 0 {
+        return Err("simultaneous relay attempt requires at least one connection".to_string());
     }
+
+    let resource_sampler = ProcessResourceSampler::start(pid);
+    let started = tokio::time::Instant::now();
+    let mut pending = Vec::with_capacity(count);
+    for id in 0..count {
+        if preconnect_rate > 0 {
+            let offset = Duration::from_nanos(
+                u64::try_from(id).unwrap().saturating_mul(1_000_000_000)
+                    / u64::try_from(preconnect_rate).unwrap(),
+            );
+            tokio::time::sleep_until(started + offset).await;
+        }
+        let source = load_source(id);
+        let stream = connect_raw_connection(address, hostname, id as u64, Some(source)).await?;
+        pending.push((id, source, stream));
+    }
+    let preconnect_elapsed = started.elapsed();
+    let preconnected = pending.len();
+
+    // Route selection starts with the ClientHello. Preconnecting avoids losing
+    // clients to the kernel listen backlog while this barrier keeps the actual
+    // relay attempts simultaneous.
+    let release_barrier = Arc::new(Barrier::new(count));
+    let release_epoch = tokio::time::Instant::now();
+    let mut jobs = JoinSet::new();
+    for (id, source, stream) in pending {
+        let hostname = hostname.to_string();
+        let release_barrier = Arc::clone(&release_barrier);
+        jobs.spawn(async move {
+            release_barrier.wait().await;
+            let released_at = release_epoch.elapsed();
+            let result = route_raw_connection(stream, &hostname, id as u64, Some(source)).await;
+            (released_at, result)
+        });
+    }
+
     let mut admitted = Vec::new();
     let mut rejected = 0;
-    let mut completed = 0;
+    let mut first_release = None;
+    let mut last_release = Duration::ZERO;
     while let Some(result) = jobs.join_next().await {
-        match result.unwrap() {
+        let (released_at, result) = result.map_err(|error| error.to_string())?;
+        first_release =
+            Some(first_release.map_or(released_at, |first: Duration| first.min(released_at)));
+        last_release = last_release.max(released_at);
+        match result {
             Ok(stream) => admitted.push(stream),
             Err(_) => rejected += 1,
         }
-        completed += 1;
-        if completed % 64 == 0 {
-            resource_peak = resource_peak.max(ResourceSnapshot::read(pid));
-        }
     }
-    resource_peak = resource_peak.max(ResourceSnapshot::read(pid));
-    AttemptedConnections {
+    let elapsed = started.elapsed();
+    let resource_peak = resource_sampler.finish();
+    let simultaneous_release_span =
+        last_release.saturating_sub(first_release.unwrap_or(Duration::ZERO));
+    Ok(AttemptedConnections {
         admitted,
         rejected,
-        resource_peak,
-    }
+        elapsed,
+        preconnected,
+        preconnect_elapsed,
+        simultaneous_release_span,
+        resource_peak: resource_peak.snapshot,
+        resource_samples: resource_peak.samples,
+    })
 }
 
 fn ensure_open_file_limit(required: rlim_t) {
@@ -1798,6 +2021,106 @@ fn assert_resource_bounds(
         "{context} RSS use exceeded its configuration-derived bound: \
          baseline={baseline:?}, snapshot={snapshot:?}"
     );
+}
+
+#[test]
+#[ignore = "qualification-scale resource gate"]
+fn qualification_scale_relay_shedding_uses_relay_capacity() {
+    let _guard = harness_lock();
+    const RELAY_HOST: &str = "shedding-relay.phase8.test";
+    const ACTIVE_LIMIT: usize = 7_500;
+    const RELAY_LIMIT: usize = 5_000;
+    const RELAY_ATTEMPTS: usize = 7_500;
+
+    ensure_open_file_limit(30_000);
+    let ca = TestCa::new();
+    let relay_identity = ca.issue(RELAY_HOST, Duration::from_secs(60 * 24 * 60 * 60));
+    let relay_backend = TestBackend::start(&relay_identity, RELAY_HOST);
+    let limits = HarnessLimits {
+        active: ACTIVE_LIMIT,
+        pre_routing: ACTIVE_LIMIT,
+        relays: RELAY_LIMIT,
+        handoffs: 256,
+        accept_rate: RELAY_ATTEMPTS + 128,
+        accept_burst: RELAY_ATTEMPTS + 128,
+        source_rate: RELAY_ATTEMPTS + 128,
+        source_burst: RELAY_ATTEMPTS + 128,
+        source_pre_routing: LOAD_CONNECTIONS_PER_SOURCE,
+        source_table: RELAY_ATTEMPTS
+            .div_ceil(LOAD_CONNECTIONS_PER_SOURCE)
+            .saturating_add(LOAD_CONNECTIONS_PER_SOURCE),
+        source_ttl_seconds: 1,
+        client_hello_timeout_ms: 10_000,
+        source_policy: None,
+    };
+    let host = HarnessHost::new(
+        &ca.root_pem,
+        vec![
+            Route::new(RELAY_HOST, "shedding-relay", relay_backend.port())
+                .with_disabled_idle_timeout(),
+        ],
+        limits,
+        false,
+    );
+    let daemon = host.start();
+    daemon.wait_until_ready();
+    let baseline = ResourceSnapshot::read(daemon.pid());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_io()
+        .enable_time()
+        .build()
+        .unwrap();
+
+    let attempted = runtime
+        .block_on(attempt_simultaneous_raw_connections(
+            daemon.address_v4(),
+            RELAY_HOST,
+            RELAY_ATTEMPTS,
+            1_010,
+            daemon.pid(),
+        ))
+        .unwrap();
+    let status = daemon.status();
+    assert_eq!(attempted.preconnected, RELAY_ATTEMPTS, "{status}");
+    assert!(
+        attempted.simultaneous_release_span <= SIMULTANEOUS_RELEASE_MAX_SPAN,
+        "barrier-released ClientHellos spanned {:?}, above the {:?} simultaneous-attempt bound",
+        attempted.simultaneous_release_span,
+        SIMULTANEOUS_RELEASE_MAX_SPAN
+    );
+    assert_resource_sample_floor(
+        "qualification-scale relay shedding",
+        attempted.resource_samples,
+        attempted.elapsed,
+    );
+    assert_eq!(
+        daemon.counter("accepted_connections"),
+        RELAY_ATTEMPTS as u64,
+        "{status}"
+    );
+    assert_eq!(attempted.admitted.len(), RELAY_LIMIT, "{status}");
+    assert_eq!(attempted.rejected, RELAY_ATTEMPTS - RELAY_LIMIT, "{status}");
+    assert_eq!(
+        daemon.counter("rejected_relay_capacity"),
+        (RELAY_ATTEMPTS - RELAY_LIMIT) as u64,
+        "{status}"
+    );
+
+    let admitted = runtime
+        .block_on(ping_raw_connections(attempted.admitted))
+        .unwrap();
+    drop(admitted);
+    daemon.wait_for_no_active_connections();
+    wait_until(
+        "relay tasks and memory to return to their quiescent bounds",
+        || {
+            let recovered = ResourceSnapshot::read(daemon.pid());
+            recovered.tasks <= baseline.tasks + 4
+                && recovered.resident_kibibytes <= baseline.resident_kibibytes + 16 * 1024
+        },
+    );
+    daemon.stop();
 }
 
 #[test]
@@ -1856,11 +2179,16 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
         accept_burst: burst,
         source_rate: burst,
         source_burst: burst,
-        source_pre_routing: 16,
-        source_table: profile.relay_attempts.div_ceil(16).saturating_add(16),
+        source_pre_routing: LOAD_CONNECTIONS_PER_SOURCE,
+        source_table: profile
+            .relay_attempts
+            .div_ceil(LOAD_CONNECTIONS_PER_SOURCE)
+            .saturating_add(LOAD_CONNECTIONS_PER_SOURCE),
         source_ttl_seconds: 1,
-        client_hello_timeout_ms: 2_000,
-        source_policy: Some(format!("127.0.0.1/32={burst},{burst},16")),
+        client_hello_timeout_ms: if qualification { 10_000 } else { 2_000 },
+        source_policy: Some(format!(
+            "127.0.0.1/32={burst},{burst},{LOAD_CONNECTIONS_PER_SOURCE}"
+        )),
     };
     let host = HarnessHost::new(
         &ca.root_pem,
@@ -1884,6 +2212,9 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
     let daemon = host.start();
     daemon.wait_until_ready();
     let baseline = ResourceSnapshot::read(daemon.pid());
+    if qualification {
+        emit_qualification_resources("baseline", baseline);
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -1899,8 +2230,14 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
                 (RELAY_HOST.to_string(), profile.mixed_relays),
             ],
             profile.generator_rate(),
+            daemon.pid(),
         ))
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "initial mixed load failed: {error}; daemon status: {}",
+                daemon.status()
+            )
+        });
     if qualification {
         let achieved_rate =
             (profile.handoffs + profile.mixed_relays) as f64 / mixed.elapsed.as_secs_f64();
@@ -1916,6 +2253,8 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
         );
     }
     assert_eq!(mixed.streams_by_route.len(), 2);
+    let mut initial_peak = mixed.resource_peak;
+    let mut initial_resource_samples = mixed.resource_samples;
     let mut streams_by_route = mixed.streams_by_route;
     let mut handoffs = streams_by_route.remove(0);
     let mut relays = streams_by_route.remove(0);
@@ -1928,19 +2267,39 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
         profile.mixed_relays > 16,
         "smoke profile must prove source permits are released after routing"
     );
-    let peak = ResourceSnapshot::read(daemon.pid());
+    initial_peak = initial_peak.max(ResourceSnapshot::read(daemon.pid()));
+    initial_resource_samples += 1;
+    assert_resource_sample_floor("initial load", initial_resource_samples, mixed.elapsed);
     assert!(
-        peak.file_descriptors >= baseline.file_descriptors + profile.mixed_relays * 2,
-        "relay FD pressure was not observable: baseline={baseline:?}, peak={peak:?}"
+        initial_peak.file_descriptors >= baseline.file_descriptors + profile.mixed_relays * 2,
+        "relay FD pressure was not observable: baseline={baseline:?}, peak={initial_peak:?}"
     );
     assert_resource_bounds(
         "initial mixed load",
-        peak,
+        initial_peak,
         baseline,
         active_limit,
         profile.mixed_relays,
         handoff_worker_limit,
     );
+    if qualification {
+        emit_qualification_resource_peak(
+            "initial_mixed_peak",
+            initial_peak,
+            initial_resource_samples,
+        );
+        println!(
+            "{}",
+            serde_json::json!({
+                "metric": "live_connection_mix",
+                "total": profile.handoffs + profile.mixed_relays,
+                "confirmed_handoffs": profile.handoffs,
+                "relays": profile.mixed_relays,
+                "unchanged_long_lived_handoffs": profile.long_lived_handoffs,
+                "unchanged_long_lived_relays": profile.mixed_relays,
+            })
+        );
+    }
 
     handoffs = runtime.block_on(ping_raw_connections(handoffs)).unwrap();
     relays = runtime.block_on(ping_raw_connections(relays)).unwrap();
@@ -1977,9 +2336,15 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
         );
     }
     rotating_handoffs = sustained.streams;
+    let sustained_resource_samples = sustained.resource_samples.saturating_add(1);
     let sustained_peak = sustained
         .resource_peak
         .max(ResourceSnapshot::read(daemon.pid()));
+    assert_resource_sample_floor(
+        "sustained mixed load",
+        sustained_resource_samples,
+        sustained.elapsed,
+    );
     assert_resource_bounds(
         "sustained mixed load",
         sustained_peak,
@@ -1988,6 +2353,13 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
         profile.mixed_relays,
         handoff_worker_limit,
     );
+    if qualification {
+        emit_qualification_resource_peak(
+            "sustained_mixed_peak",
+            sustained_peak,
+            sustained_resource_samples,
+        );
+    }
     daemon.wait_counter_at_least(
         "successful_handoffs",
         profile.handoffs.saturating_add(sustained_accepts) as u64,
@@ -2013,21 +2385,59 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
         profile.mixed_relays,
         handoff_worker_limit,
     );
+    if qualification {
+        emit_qualification_resources("end_of_sustained_load", final_live);
+        println!(
+            "{}",
+            serde_json::json!({
+                "metric": "sustained_handoff_replacements",
+                "accepted": sustained.accepted,
+                "live_connections_preserved": profile.handoffs + profile.mixed_relays,
+                "unchanged_long_lived_connections":
+                    profile.long_lived_handoffs + profile.mixed_relays,
+            })
+        );
+    }
     drop(long_lived_handoffs);
     drop(rotating_handoffs);
     drop(relays);
     daemon.wait_for_no_active_connections();
     handoff_receiver.finish();
 
-    let attempted = runtime.block_on(attempt_raw_connections(
-        daemon.address_v4(),
-        RELAY_HOST,
-        profile.relay_attempts,
-        daemon.pid(),
-    ));
+    let accepted_before_shedding = daemon.counter("accepted_connections");
+    let relay_rejections_before_shedding = daemon.counter("rejected_relay_capacity");
+    let attempted = runtime
+        .block_on(attempt_simultaneous_raw_connections(
+            daemon.address_v4(),
+            RELAY_HOST,
+            profile.relay_attempts,
+            profile.generator_rate(),
+            daemon.pid(),
+        ))
+        .unwrap();
     let rejected = attempted.rejected;
+    assert_eq!(
+        attempted.preconnected, profile.relay_attempts,
+        "not every relay TCP connection was established before the simultaneous release"
+    );
+    assert!(
+        attempted.simultaneous_release_span <= SIMULTANEOUS_RELEASE_MAX_SPAN,
+        "barrier-released ClientHellos spanned {:?}, above the {:?} simultaneous-attempt bound",
+        attempted.simultaneous_release_span,
+        SIMULTANEOUS_RELEASE_MAX_SPAN
+    );
+    assert_resource_sample_floor(
+        "simultaneous relay shedding",
+        attempted.resource_samples,
+        attempted.elapsed,
+    );
     let relay_pressure = attempted.resource_peak;
     let attempted_relays = attempted.admitted;
+    assert_eq!(
+        daemon.counter("accepted_connections") - accepted_before_shedding,
+        profile.relay_attempts as u64,
+        "not every preconnected relay attempt reached ingress"
+    );
     assert_eq!(
         attempted_relays.len(),
         profile.relay_limit,
@@ -2047,7 +2457,14 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
     );
     daemon.wait_counter_at_least(
         "rejected_relay_capacity",
+        relay_rejections_before_shedding + (profile.relay_attempts - profile.relay_limit) as u64,
+    );
+    let relay_capacity_rejections =
+        daemon.counter("rejected_relay_capacity") - relay_rejections_before_shedding;
+    assert_eq!(
+        relay_capacity_rejections,
         (profile.relay_attempts - profile.relay_limit) as u64,
+        "relay attempts were rejected for an unexpected reason"
     );
     let attempted_relays = runtime
         .block_on(ping_raw_connections(attempted_relays))
@@ -2060,6 +2477,29 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
         profile.relay_limit,
         handoff_worker_limit,
     );
+    if qualification {
+        emit_qualification_resource_peak(
+            "relay_shedding_peak",
+            relay_pressure,
+            attempted.resource_samples,
+        );
+        println!(
+            "{}",
+            serde_json::json!({
+                "metric": "relay_shedding",
+                "attempted": profile.relay_attempts,
+                "admitted": profile.relay_limit,
+                "rejected": rejected,
+                "relay_capacity_rejections": relay_capacity_rejections,
+                "tcp_connections_preestablished": attempted.preconnected,
+                "tcp_preconnect_duration_seconds":
+                    attempted.preconnect_elapsed.as_secs_f64(),
+                "client_hello_release": "barrier",
+                "client_hello_release_span_milliseconds":
+                    attempted.simultaneous_release_span.as_secs_f64() * 1_000.0,
+            })
+        );
+    }
     drop(attempted_relays);
     daemon.wait_for_no_active_connections();
     thread::sleep(Duration::from_millis(1_100));
@@ -2085,7 +2525,7 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
         "daemon tasks did not return to their quiescent bound after load: \
          baseline={baseline:?}, recovered={recovered:?}"
     );
-    let peak_resident = peak
+    let peak_resident = initial_peak
         .resident_kibibytes
         .max(sustained_peak.resident_kibibytes)
         .max(final_live.resident_kibibytes)
@@ -2094,8 +2534,18 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
         recovered.resident_kibibytes <= peak_resident
             && recovered.resident_kibibytes <= baseline.resident_kibibytes + 16 * 1024,
         "daemon memory did not recover within the bounded allocator allowance: \
-         baseline={baseline:?}, peak={peak:?}, recovered={recovered:?}"
+         baseline={baseline:?}, peak={initial_peak:?}, recovered={recovered:?}"
     );
+    if qualification {
+        emit_qualification_resources("recovered", recovered);
+        println!(
+            "{}",
+            serde_json::json!({
+                "metric": "source_table_recovery",
+                "entries": daemon.status()["admission"]["source_entries"]["in_use"],
+            })
+        );
+    }
     let stderr = daemon.stop();
     let event_windows = usize::try_from(
         log_window_started
@@ -2121,6 +2571,18 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
         stderr.lines().count() <= log_line_limit,
         "bounded overload produced excessive logs (limit {log_line_limit}):\n{stderr}"
     );
+    if qualification {
+        println!(
+            "{}",
+            serde_json::json!({
+                "metric": "bounded_stderr",
+                "lines": stderr.lines().count(),
+                "limit": log_line_limit,
+                "handoff_success_events": handoff_success_events,
+                "aggregation_windows": event_windows,
+            })
+        );
+    }
 }
 
 fn checked_output(command: &mut Command, action: &str) -> Output {
