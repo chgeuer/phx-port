@@ -6,19 +6,19 @@ default:
     @just --list
 
 build:
-    cargo build
+    cargo build --locked
 
 release:
-    cargo build --release
+    cargo build --release --locked
 
 install:
-    cargo install --path .
+    cargo install --path . --locked
 
 test:
-    cargo test
+    cargo test --locked
 
 check:
-    cargo clippy -- -D warnings
+    cargo clippy --locked -- -D warnings
 
 fmt:
     cargo fmt

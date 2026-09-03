@@ -20,13 +20,16 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
+            artifact: phx-port
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
             artifact: phx-port
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
             artifact: phx-port
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
             artifact: phx-port
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -38,8 +41,15 @@ jobs:
       - name: Install Rust toolchain
         run: rustup target add ${{ matrix.target }}
 
+      - name: Verify native Unix target
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
+
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
@@ -57,7 +67,7 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           mkdir launchd
-          cp ../../../packaging/launchd/dev.phx-port.ingress.plist launchd/
+          cp ../../../packaging/launchd/*.plist launchd/
           tar czf ../../../phx-port-${{ matrix.target }}.tar.gz \
             ${{ matrix.artifact }} launchd
 

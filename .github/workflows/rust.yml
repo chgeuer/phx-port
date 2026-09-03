@@ -11,18 +11,40 @@ env:
 
 jobs:
   build:
+    name: ${{ matrix.name }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - name: Linux x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - name: Linux ARM64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: macOS x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: macOS ARM64
+            os: macos-15
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
 
     steps:
     - uses: actions/checkout@v4
+    - name: Verify native target
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --locked --verbose --target ${{ matrix.target }}
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --locked --verbose --target ${{ matrix.target }}
     - name: Test Rust handoff sample
-      run: cargo test --manifest-path samples/rust/Cargo.toml --verbose
+      run: cargo test --locked --manifest-path samples/rust/Cargo.toml --verbose --target ${{ matrix.target }}
     - name: Test Rustler handoff broker
-      run: cargo test --manifest-path integrations/elixir/phx_port_handoff/native/phx_port_handoff_native/Cargo.toml --verbose
+      run: cargo test --locked --manifest-path integrations/elixir/phx_port_handoff/native/phx_port_handoff_native/Cargo.toml --verbose --target ${{ matrix.target }}
+    - name: Validate launchd plists
+      if: runner.os == 'macOS'
+      run: plutil -lint packaging/launchd/*.plist

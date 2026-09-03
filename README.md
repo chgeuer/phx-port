@@ -18,7 +18,7 @@ When you work on multiple web projects, they often default to the same port. `ph
 ## Install
 
 ```bash
-cargo install --git https://github.com/chgeuer/phx-port
+cargo install --git https://github.com/chgeuer/phx-port --locked
 ```
 
 Or build from source:
@@ -26,9 +26,24 @@ Or build from source:
 ```bash
 git clone https://github.com/chgeuer/phx-port
 cd phx-port
-cargo build --release
+cargo build --release --locked
 cp target/release/phx-port ~/.local/bin/
 ```
+
+## Documentation
+
+Use the short manual for procedures; use the design documents only when you
+need rationale or protocol detail:
+
+- [Build and release](docs/manual/build.md)
+- [Local development](docs/manual/development.md)
+- [Public server setup](docs/manual/public-server.md)
+- [Inspection and operations](docs/manual/operations.md)
+- [Manual index and mode boundary](docs/manual/README.md)
+
+The development workflow is the default and requires no production
+configuration. Public ingress is activated only by an explicit ingress config
+that declares `mode = "public"`.
 
 ## How it works
 
@@ -137,7 +152,7 @@ On [Omarchy](https://omarchy.com), `phx-port discover` is registered as a deskto
 
 ### TLS/SNI proxy
 
-The experimental daemon routes TLS connections to live registered workloads
+The TLS daemon routes TLS connections to live registered workloads
 without terminating TLS or reading their private keys:
 
 ```bash
@@ -554,11 +569,13 @@ certificate-verified routing, derived-state writes, local control, sandboxed
 non-root identity with no effective capabilities, and routing after restart.
 
 On macOS, the public Hosting Profile ships
+`packaging/launchd/dev.phx-port.runtime.plist` and
 `packaging/launchd/dev.phx-port.ingress.plist`, also included under `launchd/`
 in macOS release archives. Provision the non-login `phx-port` account and
-`phx-port-admin` group, add the service account and read-only operators to that
-group, then provision its root-owned intent plus service-owned state/runtime
-directories and install the LaunchDaemon:
+`phx-port-admin` group as documented in the
+[public server manual](docs/manual/public-server.md), add the service account
+and read-only operators to that group, then provision its root-owned intent
+plus service-owned state/runtime directories and install both LaunchDaemons:
 
 ```bash
 sudo install -d -o root -g phx-port -m 0755 \
@@ -572,12 +589,20 @@ sudo install -d -o phx-port -g phx-port -m 0700 \
 sudo install -o root -g phx-port -m 0640 ingress.toml \
   "/Library/Application Support/phx-port/ingress.toml"
 sudo install -o root -g wheel -m 0644 \
+  packaging/launchd/dev.phx-port.runtime.plist /Library/LaunchDaemons/
+sudo install -o root -g wheel -m 0644 \
   packaging/launchd/dev.phx-port.ingress.plist /Library/LaunchDaemons/
+sudo launchctl bootstrap system \
+  /Library/LaunchDaemons/dev.phx-port.runtime.plist
+sudo launchctl print system/dev.phx-port.runtime
 sudo launchctl bootstrap system \
   /Library/LaunchDaemons/dev.phx-port.ingress.plist
 ```
 
-The plist's `tls-ipv4` and `tls-ipv6` sockets own port 443. The non-root daemon
+The root one-shot runtime job recreates `/private/var/run/phx-port` with exact
+owners and modes after every reboot; require its last exit code to be zero
+before first ingress bootstrap. The ingress plist's `tls-ipv4` and `tls-ipv6`
+sockets own port 443. The non-root daemon
 retrieves them by name with `launch_activate_socket()`, requires exactly one
 listening TCP descriptor on each configured address, and sets both
 nonblocking and close-on-exec without rebinding. Adjust the account and paths
@@ -585,8 +610,9 @@ in the plist only together with the provisioned ownership. Its explicit
 `--task-budget 1024` bounds the same runtime, probe, route-selection, and PHXP
 worker demand checked during preflight; lower it only with matching capacity
 arguments and executable evidence. Remove it with
-`sudo launchctl bootout system/dev.phx-port.ingress` before deleting the
-plist. The ignored `real_launchd_job_adopts_named_socket_and_runs_as_owner`
+`sudo launchctl bootout system/dev.phx-port.ingress` before deleting its
+plist. Boot out `system/dev.phx-port.runtime` only when uninstalling the
+complete deployment. The ignored `real_launchd_job_adopts_named_socket_and_runs_as_owner`
 test exercises the same API in a disposable user launchd domain without
 touching port 443.
 

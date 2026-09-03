@@ -153,8 +153,15 @@ The security score is diagnostic input, not an acceptance oracle.
 
 ## launchd activated-listener preflight
 
-On a clean macOS host, copy the shipped plist to a temporary administrative
-staging plist before installing the real LaunchDaemon:
+On a clean macOS host, first install and bootstrap the shipped root one-shot
+`packaging/launchd/dev.phx-port.runtime.plist`. Require its last exit code to
+be zero and verify that it created `/private/var/run/phx-port` as
+`phx-port:phx-port-admin` mode `0750` plus `handoff/` as
+`phx-port:phx-port` mode `0700`. The job remains installed so it recreates the
+ephemeral tree at every boot.
+
+Then copy the shipped ingress plist to a temporary administrative staging
+plist before installing the real ingress LaunchDaemon:
 
 1. Give the copy a unique label such as `dev.phx-port.preflight`.
 2. Retain its `UserName`, `GroupName`, environment, resource limits, and
