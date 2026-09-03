@@ -2023,6 +2023,24 @@ fn assert_resource_bounds(
     );
 }
 
+fn memory_recovered_within_allocator_allowance(
+    baseline_kibibytes: u64,
+    recovered_kibibytes: u64,
+) -> bool {
+    recovered_kibibytes <= baseline_kibibytes + 16 * 1024
+}
+
+#[test]
+fn recovered_memory_may_exceed_an_incomplete_sampled_peak() {
+    let sampled_peak_kibibytes = 14_236;
+    let recovered_kibibytes = 15_428;
+    assert!(recovered_kibibytes > sampled_peak_kibibytes);
+    assert!(memory_recovered_within_allocator_allowance(
+        12_664,
+        recovered_kibibytes
+    ));
+}
+
 #[test]
 #[ignore = "qualification-scale resource gate"]
 fn qualification_scale_relay_shedding_uses_relay_capacity() {
@@ -2525,16 +2543,13 @@ fn mixed_load_and_fd_pressure_recover_to_baseline() {
         "daemon tasks did not return to their quiescent bound after load: \
          baseline={baseline:?}, recovered={recovered:?}"
     );
-    let peak_resident = initial_peak
-        .resident_kibibytes
-        .max(sustained_peak.resident_kibibytes)
-        .max(final_live.resident_kibibytes)
-        .max(relay_pressure.resident_kibibytes);
     assert!(
-        recovered.resident_kibibytes <= peak_resident
-            && recovered.resident_kibibytes <= baseline.resident_kibibytes + 16 * 1024,
+        memory_recovered_within_allocator_allowance(
+            baseline.resident_kibibytes,
+            recovered.resident_kibibytes,
+        ),
         "daemon memory did not recover within the bounded allocator allowance: \
-         baseline={baseline:?}, peak={initial_peak:?}, recovered={recovered:?}"
+         baseline={baseline:?}, recovered={recovered:?}"
     );
     if qualification {
         emit_qualification_resources("recovered", recovered);
