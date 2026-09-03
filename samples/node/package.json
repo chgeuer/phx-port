@@ -1,0 +1,23 @@
+{
+  "name": "phxp-fastify-sample",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PHXP v1 descriptor handoff for Node.js and Fastify",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build:native": "node-gyp rebuild",
+    "install": "node-gyp rebuild",
+    "start": "node src/sample.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js"
+  },
+  "dependencies": {
+    "fastify": "5.6.2"
+  },
+  "devDependencies": {
+    "node-gyp": "11.5.0"
+  }
+}

@@ -137,8 +137,45 @@ Reference integrations and runnable Workloads:
 - Elixir/Bandit: `integrations/elixir/phx_port_handoff/`
 - Rust/Axum: `samples/rust/`
 - .NET 10 on Linux: `samples/dotnet/`
+- Go `net/http`: `samples/go/`
+- Python FastAPI/Uvicorn: `samples/python/`
+- Node/Fastify: `samples/node/`
 
-The local playground exercises handoff and relay:
+The Go, Python, and Node samples use the ordinary framework server for both
+their loopback listener and handed-off sockets. Their application middleware,
+router, handlers, and TLS behavior therefore do not branch on PHXP.
+
+Build and test them:
+
+```bash
+just build-frameworks
+just test-frameworks
+```
+
+Run one sample in the foreground, then inspect its direct and ingress paths:
+
+```bash
+just start-go       # or start-python / start-node
+just show-go        # or show-python / show-node
+```
+
+The defaults use `a.pollmann.rocks`, `b.pollmann.rocks`, and
+`c.pollmann.rocks`, respectively, with keys under
+`~/.dns/production`. Override `PHXP_HOST` or `PHXP_CERT_DIR` when using another
+trusted local certificate. `start-python` requires `just setup-python`;
+`start-node` requires `just build-node`.
+
+Exercise all three against a real high-port daemon:
+
+```bash
+just e2e-frameworks
+```
+
+This requires the three local certificate fixtures. It uses isolated temporary
+registry/runtime state, requires exactly one successful handoff and zero
+relays per framework, stops only the PIDs it starts, and removes its state.
+
+The Rust/Elixir local playground separately exercises handoff and relay:
 
 ```bash
 just play

@@ -17,6 +17,10 @@ support target Linux and macOS; Windows retains the port-registry CLI.
 ## Prerequisites
 
 - Rust 1.88 or newer; the crate and locked dependency graph require it.
+- Go 1.23 or newer for the `net/http` PHXP adapter.
+- Python 3.11 or newer for the FastAPI/Uvicorn PHXP adapter.
+- Node.js 20 or newer, Python, `make`, and a C++17 compiler for the Fastify
+  adapter's stable N-API addon.
 - Linux: a C toolchain, `pkg-config`, and OpenSSL development headers.
 - macOS: Xcode Command Line Tools.
 - `just` is optional; every required command is also shown as Cargo.
@@ -66,6 +70,7 @@ cargo test --locked --manifest-path samples/rust/Cargo.toml
 cargo test \
   --locked \
   --manifest-path integrations/elixir/phx_port_handoff/native/phx_port_handoff_native/Cargo.toml
+just test-frameworks
 ```
 
 Platform and service-manager tests marked `ignored` require their documented
@@ -76,9 +81,11 @@ smoke profile as production capacity evidence.
 ## CI
 
 `.github/workflows/rust.yml` runs native builds and tests on all four
-Linux/macOS architecture combinations. Each job verifies that the Rust host
-target matches the declared matrix target before compiling. This prevents an
-ARM artifact from being represented by an x64 cross-build, or vice versa.
+Linux/macOS architecture combinations. Each job verifies the Rust host target,
+Go host architecture, Python machine, and Node architecture before compiling.
+It then tests the Rust daemon and receivers plus the Go, Python, and Node
+framework adapters. In particular, the Node native addon is compiled and
+exercised on Linux/macOS x64/ARM64 rather than cross-compiled.
 
 Pull requests and pushes to `master` run the matrix. A change is not
 cross-platform merely because it compiles on one runner.
@@ -97,6 +104,11 @@ git push origin v0.2.0
 - Linux x64 and ARM64 tarballs containing the binary and `systemd/` units;
 - macOS x64 and ARM64 tarballs containing the binary and `launchd/` plists;
 - a Windows x64 zip.
+
+Release archives intentionally contain the `phx-port` binary and native
+service-manager definitions only. Framework integrations remain source
+examples in the repository and are validated by CI; they are not separate
+runtime artifacts shipped with the daemon.
 
 Before publishing, verify artifact architecture:
 

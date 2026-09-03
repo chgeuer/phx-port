@@ -1,6 +1,9 @@
 rust_hostname := "alpha.phx-port.pollmann.rocks"
 dotnet_hostname := "beta.phx-port.pollmann.rocks"
 elixir_hostname := "alias-alpha.phx-port.pollmann.rocks"
+go_hostname := "a.pollmann.rocks"
+python_hostname := "b.pollmann.rocks"
+node_hostname := "c.pollmann.rocks"
 
 default:
     @just --list
@@ -113,11 +116,114 @@ status-elixir:
 stop-elixir:
     @samples/manage.sh stop elixir Elixir
 
+# Build the Go net/http PHXP sample
+build-go:
+    mkdir -p target/samples
+    cd samples/go && go build -o ../../target/samples/phxp-http ./cmd/phxp-http
+
+# Test the Go PHXP adapter, including descriptor races
+test-go:
+    cd samples/go && go vet ./... && go test -race ./...
+
+# Start the Go net/http sample with the a.pollmann.rocks certificate
+start-go:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd samples/go
+    CERT_DIR="${PHXP_CERT_DIR:-$HOME/.dns/production}"
+    HOST="${PHXP_HOST:-{{ go_hostname }}}"
+    HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
+    echo "Go: https://$HOST:$HTTPS_PORT/"
+    exec ../../target/samples/phxp-http \
+      -https "127.0.0.1:$HTTPS_PORT" \
+      -cert "$CERT_DIR/$HOST.crt" \
+      -key "$CERT_DIR/$HOST.key"
+
+# Show direct and PHXP-ingress responses from the Go sample
+show-go:
+    @bash samples/show-tls.sh go Go "${PHXP_HOST:-{{ go_hostname }}}" "phxp Go handoff example"
+
+# Create the Python environment and install the FastAPI PHXP sample
+setup-python:
+    python3 -m venv samples/python/.venv
+    samples/python/.venv/bin/python -m pip install --quiet -e 'samples/python[test]'
+
+# Build-check the Python/FastAPI PHXP sample
+build-python: setup-python
+    samples/python/.venv/bin/python -m compileall -q samples/python/src samples/python/tests
+
+# Test and lint the Python/FastAPI PHXP adapter
+test-python: setup-python
+    cd samples/python && .venv/bin/ruff format --check . && .venv/bin/ruff check . && .venv/bin/pytest -q
+
+# Start the Python/FastAPI sample with the b.pollmann.rocks certificate
+start-python:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd samples/python
+    test -x .venv/bin/phxp-fastapi || {
+      echo "Python sample is not installed; run 'just setup-python'." >&2
+      exit 1
+    }
+    CERT_DIR="${PHXP_CERT_DIR:-$HOME/.dns/production}"
+    HOST="${PHXP_HOST:-{{ python_hostname }}}"
+    HTTPS_PORT="${HTTPS_PORT:-$(phx-port https)}"
+    echo "Python: https://$HOST:$HTTPS_PORT/"
+    exec .venv/bin/phxp-fastapi \
+      --https "127.0.0.1:$HTTPS_PORT" \
+      --cert "$CERT_DIR/$HOST.crt" \
+      --key "$CERT_DIR/$HOST.key"
+
+# Show direct and PHXP-ingress responses from the Python sample
+show-python:
+    @bash samples/show-tls.sh python Python "${PHXP_HOST:-{{ python_hostname }}}" "phxp Python handoff example"
+
+# Install and build the Node/Fastify native PHXP addon from its lockfile
+build-node:
+    cd samples/node && npm ci --no-audit --no-fund
+
+# Test the Node/Fastify PHXP adapter
+test-node: build-node
+    cd samples/node && npm test
+
+# Start the Node/Fastify sample with the c.pollmann.rocks certificate
+start-node:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd samples/node
+    test -f build/Release/phxp_native.node || {
+      echo "Node sample is not built; run 'just build-node'." >&2
+      exit 1
+    }
+    CERT_DIR="${PHXP_CERT_DIR:-$HOME/.dns/production}"
+    HOST="${PHXP_HOST:-{{ node_hostname }}}"
+    export PORT="${PORT:-$(phx-port https)}"
+    export PHXP_TLS_CERT="$CERT_DIR/$HOST.crt"
+    export PHXP_TLS_KEY="$CERT_DIR/$HOST.key"
+    echo "Node: https://$HOST:$PORT/"
+    exec node src/sample.js
+
+# Show direct and PHXP-ingress responses from the Node sample
+show-node:
+    @bash samples/show-tls.sh node Node "${PHXP_HOST:-{{ node_hostname }}}" "shared Fastify HTTPS pipeline"
+
+# Build all Go, Python, and Node framework adapters
+build-frameworks: build-go build-python build-node
+
+# Test all Go, Python, and Node framework adapters
+test-frameworks: test-go test-python test-node
+
+# Exercise each framework through a real phx-port daemon and require zero relay
+e2e-frameworks: build build-frameworks
+    @bash samples/framework-e2e.sh go "{{ go_hostname }}" "phxp Go handoff example"
+    @bash samples/framework-e2e.sh python "{{ python_hostname }}" "phxp Python handoff example"
+    @bash samples/framework-e2e.sh node "{{ node_hostname }}" "shared Fastify HTTPS pipeline"
+
 # Show the stable ports assigned to every language sample
 ports-samples:
     #!/usr/bin/env bash
     set -euo pipefail
-    for sample in samples/rust samples/dotnet samples/elixir; do
+    for sample in samples/rust samples/dotnet samples/elixir samples/go samples/python samples/node; do
       (
         cd "$sample"
         printf '%-20s http=%s https=%s\n' "$sample" "$(phx-port)" "$(phx-port https)"
@@ -146,7 +252,7 @@ play-try:
 
 # Show recent playground logs: all, daemon, elixir, rust, or relay
 play-logs service="all":
-    @bash samples/playground.sh logs "{{service}}"
+    @bash samples/playground.sh logs "{{ service }}"
 
 # Stop only the processes managed by the playground
 play-down:

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "phxp-fastapi-sample"
+version = "0.1.0"
+description = "Reusable PHXP v1 receiver and FastAPI/Uvicorn integration"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<0.117",
+  "uvicorn>=0.34,<0.36",
+]
+
+[project.optional-dependencies]
+test = [
+  "cryptography>=44,<46",
+  "pytest>=8.3,<9",
+  "ruff>=0.9,<0.13",
+]
+
+[project.scripts]
+phxp-fastapi = "phxp.sample:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/phxp"]
+
+[tool.pytest.ini_options]
+addopts = "--basetemp=.pytest-tmp"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

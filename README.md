@@ -635,13 +635,24 @@ the ordinary relay:
 
 Set `PHX_PORT_RUNTIME_DIR` to use an explicit runtime root on either platform;
 the endpoint is then `<runtime>/handoff/<hash>.sock`. The repository includes
-a reusable Phoenix/Bandit integration and minimal Elixir and Rust reference
-servers for Linux and macOS. The .NET 10 receiver remains Linux-only:
+framework-native receivers for Phoenix/Bandit, Rust/Axum, Go `net/http`,
+FastAPI/Uvicorn, and Node/Fastify on Linux and macOS. The .NET 10 receiver
+remains Linux-only:
 
 - [`integrations/elixir/phx_port_handoff`](integrations/elixir/phx_port_handoff)
 - [`samples/elixir`](samples/elixir)
 - [`samples/rust`](samples/rust)
 - [`samples/dotnet`](samples/dotnet)
+- [`samples/go`](samples/go)
+- [`samples/python`](samples/python)
+- [`samples/node`](samples/node)
+
+Every integration feeds direct and handed-off sockets through the same
+framework TLS, middleware/plugin, router, and handler pipeline. PHXP adds no
+HTTP parser, response path, request header, or application-visible origin
+marker. Use `just test-frameworks` for focused adapter checks and
+`just e2e-frameworks` with the local `a`, `b`, and `c` certificate fixtures to
+prove real-daemon handoff with zero relay.
 
 The handoff design and protocol are described in
 [`docs/tls-proxy-design.md`](docs/tls-proxy-design.md) and
