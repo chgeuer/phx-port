@@ -1,11 +1,10 @@
-import { mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 
-let sequence = 0;
-
 export async function runtime(name) {
-  const root = path.resolve('test', `.runtime-${process.pid}-${sequence++}-${name}`);
-  await mkdir(root, { mode: 0o700 });
+  const temporaryRoot = process.platform === 'darwin' ? '/private/tmp' : os.tmpdir();
+  const root = await mkdtemp(path.join(temporaryRoot, `px-${name}-`));
   return {
     root,
     endpoint: {

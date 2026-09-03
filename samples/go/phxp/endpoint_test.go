@@ -136,6 +136,10 @@ func TestChangedStaleSocketEndpointIsNotRemoved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	held := endpoint + ".held"
+	if err := os.Link(endpoint, held); err != nil {
+		t.Fatal(err)
+	}
 	if err := syscall.Close(stale); err != nil {
 		t.Fatal(err)
 	}
