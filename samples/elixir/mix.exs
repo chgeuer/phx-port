@@ -22,7 +22,7 @@ defmodule PhxpHandoffSample.MixProject do
     [
       {:bandit, "~> 1.12"},
       {:plug, "~> 1.20"},
-      {:phx_port_handoff, path: "../../integrations/elixir/phx_port_handoff"}
+      {:phx_port_handoff, github: "chgeuer/phx-port", sparse: "phx_port_handoff"}
     ]
   end
 end

@@ -69,7 +69,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --manifest-path samples/rust/Cargo.toml
 cargo test \
   --locked \
-  --manifest-path integrations/elixir/phx_port_handoff/native/phx_port_handoff_native/Cargo.toml
+  --manifest-path phx_port_handoff/native/phx_port_handoff_native/Cargo.toml
 just test-frameworks
 ```
 

@@ -635,7 +635,7 @@ public listener activation is independent of descriptor handoff.
 ### Native Rustler receiver
 
 Refactor
-`integrations/elixir/phx_port_handoff/native/phx_port_handoff_native/src/lib.rs`
+`phx_port_handoff/native/phx_port_handoff_native/src/lib.rs`
 with the same Linux/Darwin transport separation as the daemon.
 
 Shared receiver logic should continue to own:

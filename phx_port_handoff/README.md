@@ -13,13 +13,14 @@ ownership behavior.
 
 ## Installation
 
-Until the package is published, add it as a path dependency:
+Until the package is published, add it directly from this repository:
 
 ```elixir
 def deps do
   [
     {:phx_port_handoff,
-     path: "/path/to/phx-port/integrations/elixir/phx_port_handoff"}
+     github: "chgeuer/phx-port",
+     sparse: "phx_port_handoff"}
   ]
 end
 ```

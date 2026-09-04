@@ -90,7 +90,7 @@ Add a focused regression test that demonstrably fails without the change and
 passes with it. Run focused tests while iterating, then all three commands
 above before closing.
 
-If the issue changes `integrations/elixir/phx_port_handoff`, also run its full
+If the issue changes `phx_port_handoff`, also run its full
 existing `mix test`. If it changes a language sample, service definition,
 playground, or production harness, run that component's existing build/test
 path and every issue-specific platform or integration gate. Do not substitute

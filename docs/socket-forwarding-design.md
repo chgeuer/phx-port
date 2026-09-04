@@ -877,7 +877,7 @@ rejection remain automation gaps.
 - Use a handoff-only second Bandit server now; implement a hybrid listener only
   if shared limits or measured performance justify the additional complexity.
 - Keep the Elixir adapter as an independently versioned Mix package under
-  `integrations/elixir/phx_port_handoff` in this repository.
+  `phx_port_handoff` in this repository.
 - Keep the Elixir, Rust, and .NET implementations as minimal interoperability
   examples under `samples`; they do not replace framework-native production
   adapters.

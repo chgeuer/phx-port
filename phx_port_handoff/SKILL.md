@@ -18,10 +18,11 @@ Unix-socket-only Bandit child and reuses the endpoint's exact TLS options.
 
 ## Add the dependency
 
-Until the package is published, add the local path to `mix.exs`:
+Until the package is published, add the Git dependency to `mix.exs`:
 ```elixir
 {:phx_port_handoff,
- path: "/home/chgeuer/github/chgeuer/phx-port/integrations/elixir/phx_port_handoff"}
+ github: "chgeuer/phx-port",
+ sparse: "phx_port_handoff"}
 ```
 Then run:
 ```bash

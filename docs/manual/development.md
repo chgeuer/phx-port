@@ -134,7 +134,7 @@ It is not the hardened public `systemd` deployment.
 
 Reference integrations and runnable Workloads:
 
-- Elixir/Bandit: `integrations/elixir/phx_port_handoff/`
+- Elixir/Bandit: `phx_port_handoff/`
 - Rust/Axum: `samples/rust/`
 - .NET 10 on Linux: `samples/dotnet/`
 - Go `net/http`: `samples/go/`

@@ -639,7 +639,7 @@ framework-native receivers for Phoenix/Bandit, Rust/Axum, Go `net/http`,
 FastAPI/Uvicorn, and Node/Fastify on Linux and macOS. The .NET 10 receiver
 remains Linux-only:
 
-- [`integrations/elixir/phx_port_handoff`](integrations/elixir/phx_port_handoff)
+- [`phx_port_handoff`](phx_port_handoff)
 - [`samples/elixir`](samples/elixir)
 - [`samples/rust`](samples/rust)
 - [`samples/dotnet`](samples/dotnet)

@@ -73,7 +73,7 @@ jobs:
     - name: Test Rust handoff sample
       run: cargo test --locked --manifest-path samples/rust/Cargo.toml --verbose --target ${{ matrix.target }}
     - name: Test Rustler handoff broker
-      run: cargo test --locked --manifest-path integrations/elixir/phx_port_handoff/native/phx_port_handoff_native/Cargo.toml --verbose --target ${{ matrix.target }}
+      run: cargo test --locked --manifest-path phx_port_handoff/native/phx_port_handoff_native/Cargo.toml --verbose --target ${{ matrix.target }}
     - name: Test Go net/http handoff adapter
       working-directory: samples/go
       run: go vet ./... && go test -race ./...
