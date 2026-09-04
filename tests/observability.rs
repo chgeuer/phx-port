@@ -225,7 +225,7 @@ fn metrics_listener_is_bounded_read_only_and_uses_only_declared_labels() {
         .unwrap();
     assert_eq!(content_length, body.len());
     assert!(content_length <= 1024 * 1024);
-    assert!(body.contains("phx_port_build_info{version=\"0.1.0\"} 1"));
+    assert!(body.contains("phx_port_build_info{version=\"0.2.0\"} 1"));
     assert!(body.contains("phx_port_admission_limit{stage=\"active\"} 4"));
     assert!(body.contains("phx_port_handoffs_total{outcome=\"success\"} 0"));
     assert!(body.contains("phx_port_relays_total{outcome=\"started\"} 0"));

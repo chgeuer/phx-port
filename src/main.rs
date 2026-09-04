@@ -775,35 +775,56 @@ fn build_discover_html(projects: &[RunningProject]) -> String {
             "    <li class=\"empty\">No projects are currently running. Refresh to check again.</li>\n",
         );
     } else {
-        for p in projects {
-            let name = std::path::Path::new(&p.dir)
+        let mut project_groups: Vec<(&str, Vec<&RunningProject>)> = Vec::new();
+        for project in projects {
+            if let Some((_, endpoints)) = project_groups
+                .iter_mut()
+                .find(|(dir, _)| *dir == project.dir)
+            {
+                endpoints.push(project);
+            } else {
+                project_groups.push((&project.dir, vec![project]));
+            }
+        }
+
+        for (dir, endpoints) in project_groups {
+            let name = std::path::Path::new(dir)
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or(&p.dir);
-            let role_suffix = if p.role == DEFAULT_ROLE {
-                String::new()
-            } else {
-                format!(" <span class=\"role\">({})</span>", escape_html(&p.role))
-            };
-            let local_scheme = scheme_for_role(&p.role);
-            items.push_str("    <li>");
+                .unwrap_or(dir);
+            items.push_str("    <li class=\"project-card\">");
             items.push_str(&format!(
-                "<div class=\"project\"><strong>{name}{role}</strong>\
+                "<div class=\"project\"><strong>{name}</strong>\
                  <div class=\"dir\">{dir}</div></div>\
-                 <div class=\"links\">\
-                 <a class=\"endpoint local\" href=\"{local_scheme}://localhost:{port}\">\
-                 {local_scheme}://localhost:{port}</a>",
-                port = p.port,
+                 <div class=\"services\">",
                 name = escape_html(name),
-                role = role_suffix,
-                dir = escape_html(&p.dir),
+                dir = escape_html(dir),
             ));
-            for hostname in &p.hostnames {
-                let hostname = escape_html(hostname);
+
+            for endpoint in endpoints {
+                let local_scheme = scheme_for_role(&endpoint.role);
+                let role_label = if endpoint.role == DEFAULT_ROLE {
+                    local_scheme
+                } else {
+                    &endpoint.role
+                };
                 items.push_str(&format!(
-                    "<a class=\"endpoint tls\" href=\"https://{hostname}/\">\
-                     https://{hostname}/</a>"
+                    "<div class=\"service\">\
+                     <div class=\"role\">{role}</div>\
+                     <div class=\"links\">\
+                     <a class=\"endpoint local\" href=\"{local_scheme}://localhost:{port}\">\
+                     {local_scheme}://localhost:{port}</a>",
+                    role = escape_html(role_label),
+                    port = endpoint.port,
                 ));
+                for hostname in &endpoint.hostnames {
+                    let hostname = escape_html(hostname);
+                    items.push_str(&format!(
+                        "<a class=\"endpoint tls\" href=\"https://{hostname}/\">\
+                         https://{hostname}/</a>"
+                    ));
+                }
+                items.push_str("</div></div>");
             }
             items.push_str("</div></li>\n");
         }
@@ -822,6 +843,9 @@ ul { list-style: none; }
 li { margin-bottom: 0.75rem; padding: 0.9rem 1rem; background: #16213e;
      border-radius: 6px; }
 .project { margin-bottom: 0.65rem; }
+.services { display: grid; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+            gap: 0.75rem; }
+.service { min-width: 0; }
 .links { display: flex; flex-wrap: wrap; gap: 0.45rem; }
 .endpoint { display: inline-block; padding: 0.45rem 0.65rem; background: #0f3460;
             border-radius: 4px; color: #eee; text-decoration: none;
@@ -830,7 +854,8 @@ li { margin-bottom: 0.75rem; padding: 0.9rem 1rem; background: #16213e;
 .endpoint:hover { background: #16518f; }
 .endpoint.tls { color: #9ee6b8; }
 .dir { color: #888; font-size: 0.85rem; margin-top: 0.25rem; }
-.role { color: #aaa; }
+.role { color: #aaa; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.08em;
+        margin-bottom: 0.35rem; text-transform: uppercase; }
 .empty { color: #888; padding: 0.75rem 1rem; }
 footer { margin-top: 2rem; color: #555; font-size: 0.8rem; }
 </style></head>

@@ -80,3 +80,33 @@ fn renders_non_https_roles_as_cleartext_local_links() {
 
     assert!(html.contains("href=\"http://localhost:4400\""));
 }
+
+#[test]
+fn groups_http_and_https_endpoints_for_the_same_directory() {
+    let html = build_discover_html(&[
+        RunningProject {
+            dir: "/srv/contoso".to_string(),
+            role: "main".to_string(),
+            port: 4400,
+            hostnames: vec![],
+        },
+        RunningProject {
+            dir: "/srv/fabrikam".to_string(),
+            role: "main".to_string(),
+            port: 4401,
+            hostnames: vec![],
+        },
+        RunningProject {
+            dir: "/srv/contoso".to_string(),
+            role: "https".to_string(),
+            port: 4402,
+            hostnames: vec!["contoso.example".to_string()],
+        },
+    ]);
+
+    assert_eq!(html.matches("class=\"project-card\"").count(), 2);
+    assert_eq!(html.matches("<strong>contoso</strong>").count(), 1);
+    assert!(html.contains("href=\"http://localhost:4400\""));
+    assert!(html.contains("href=\"https://localhost:4402\""));
+    assert!(html.contains("grid-template-columns: repeat(auto-fit"));
+}
