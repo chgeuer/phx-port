@@ -173,13 +173,13 @@ Or, less politely: why do all that unnecessary TCP shit?
 
 I remembered a Twitter conversation with Chris McCord about
 [blue/green deployments](https://github.com/chgeuer/blue_green). The key idea
-was that on Linux, one process can hand an existing socket to another process
-using `SCM_RIGHTS`.
+was that on Unix-like systems, one process can hand an existing socket to
+another process using `SCM_RIGHTS`.
 
-Linux can pass an open file descriptor between processes over a Unix-domain
-socket using `sendmsg(2)` and `SCM_RIGHTS`. The descriptor received by the
-application refers to the same kernel TCP socket that `phx-port` accepted on
-port 443.
+Linux and macOS can pass an open file descriptor between processes over a
+Unix-domain socket using `sendmsg(2)` and `SCM_RIGHTS`. The descriptor received
+by the application refers to the same kernel TCP socket that `phx-port`
+accepted on port 443.
 
 That turns `phx-port` into a proxy only during connection establishment. It
 accepts the connection, identifies the application, transfers the socket, and
@@ -197,7 +197,7 @@ sequenceDiagram
     Router->>Receiver: HELLO
     Receiver-->>Router: READY
     Router->>Receiver: HANDOFF + client FD via SCM_RIGHTS
-    Note over Router,Receiver: Successful sendmsg transfers ownership
+    Note over Router,Receiver: Successful sendmsg crosses the ownership boundary
     Router->>Router: Close daemon's descriptor
     Receiver->>Phoenix: Adopt FD with gen_tcp.fdopen
     Receiver-->>Router: ADOPTED
@@ -209,8 +209,8 @@ For a handoff-enabled Phoenix application, the sequence is:
 
 1. `phx-port` accepts a client connection on port 443.
 2. It peeks at the ClientHello and resolves the SNI route.
-3. It connects to the selected application's private Unix
-   `SOCK_SEQPACKET` endpoint.
+3. It connects to the selected application's private Unix endpoint:
+   `SOCK_SEQPACKET` on Linux or framed `SOCK_STREAM` on macOS.
 4. The daemon and receiver negotiate the versioned PHXP protocol and verify
    that both processes run as the same user.
 5. `phx-port` sends the connected client descriptor with `SCM_RIGHTS`.
@@ -276,8 +276,10 @@ after TLS setup, become an otherwise ordinary Bandit connection.
 The `PhxPortHandoff` package provides a custom
 `ThousandIsland.Transport`. Its native Rustler receiver:
 
-- binds a private `SOCK_SEQPACKET` endpoint;
-- authenticates the daemon with `SO_PEERCRED`;
+- binds a private `SOCK_SEQPACKET` endpoint on Linux or framed `SOCK_STREAM`
+  endpoint on macOS;
+- authenticates the daemon with `SO_PEERCRED` on Linux or `getpeereid` on
+  macOS;
 - receives exactly one connected stream descriptor per handoff;
 - imports it through `:gen_tcp.fdopen/2`; and
 - transfers ownership to the normal Thousand Island connection process.
@@ -318,8 +320,8 @@ optimization, not a requirement for joining the routing system. Each
 `(project path, role)` pair maps deterministically to a private Unix socket:
 
 ```text
-$XDG_RUNTIME_DIR/phx-port/handoff/
-  <sha256(canonical-project-path NUL role)>.sock
+Linux: $XDG_RUNTIME_DIR/phx-port/handoff/<sha256(project-path NUL role)>.sock
+macOS: /tmp/phx-port-<euid>/handoff/<sha256(project-path NUL role)>.sock
 ```
 
 If a compatible receiver is live, `phx-port` attempts handoff. If it is
@@ -344,7 +346,8 @@ The handoff channel is local and deliberately narrow:
 
 - Its parent directory is mode `0700`.
 - Each receiver socket is mode `0600`.
-- Both peers verify same-user credentials with `SO_PEERCRED`.
+- Both peers verify same-user credentials with `SO_PEERCRED` on Linux or
+  `getpeereid` on macOS.
 - Protocol messages have fixed bounds and a versioned binary format.
 - The receiver accepts exactly one connected TCP stream descriptor.
 - Duplicate connection identifiers are rejected.
@@ -386,10 +389,13 @@ That completes the progression that motivated the work:
 
 ## Current boundaries
 
-The handoff transport is intentionally Linux-specific. Rust and .NET 10
-samples now demonstrate the same production-shaped boundary outside the BEAM:
+The handoff transport currently targets Linux and macOS rather than every Unix
+variant. Framework samples demonstrate the same production-shaped boundary
+outside the BEAM:
 
-- Descriptor passing uses Linux/Unix socket facilities.
+- Descriptor passing uses Unix-domain sockets and `SCM_RIGHTS`. Linux uses
+  `SOCK_SEQPACKET` plus `SO_PEERCRED`; macOS uses framed `SOCK_STREAM` plus
+  `getpeereid`.
 - The Phoenix receiver requires Erlang/OTP 29 or later and pins Rustler 0.36.2.
 - A second, handoff-only Bandit supervisor is used beside the ordinary
   endpoint.
@@ -398,9 +404,16 @@ samples now demonstrate the same production-shaped boundary outside the BEAM:
   Hyper, and one Axum router for direct and handed-off requests.
 - The .NET sample exposes the descriptor through a custom public Kestrel
   `IConnectionListener`; Kestrel performs TLS and HTTP before dispatching to
-  the same ASP.NET Core middleware as its ordinary listeners.
-- Both framework paths negotiate HTTP/1.1 and HTTP/2. Their custom code stops
-  at the accepted-socket transport boundary rather than implementing HTTP.
+  the same ASP.NET Core middleware as its ordinary listeners. This adapter
+  remains Linux-only.
+- Go feeds direct and handed-off connections into one `net/http.Server`.
+- Python adopts the socket through `asyncio` and Uvicorn, then uses the normal
+  FastAPI/Starlette pipeline.
+- Node wraps the descriptor as a documented `net.Socket` and emits it into the
+  existing Fastify server connection path.
+- The Linux/macOS adapters stop at the accepted-socket transport boundary
+  rather than implementing TLS or HTTP themselves. Protocol support remains
+  whatever the selected framework normally provides.
 
 Other runtimes can implement the PHXP receiver protocol, but they do not need
 to. The generic TLS relay remains the baseline behavior.

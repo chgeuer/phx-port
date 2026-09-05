@@ -19,11 +19,12 @@ The generic path is layer-4 TLS passthrough. `phx-port` forwards the untouched
 ClientHello and relays encrypted bytes. It never terminates TLS and works with
 any TLS server.
 
-For Phoenix/Bandit on Linux, there is now a second path. `phx-port` reads SNI
-with `MSG_PEEK`, then passes the accepted port-443 socket to the application
-over `SOCK_SEQPACKET` using `SCM_RIGHTS`. The receiver adopts the descriptor
-with `:gen_tcp.fdopen/2`, Thousand Island performs server-side TLS, and Bandit
-continues through its normal HTTP pipeline.
+For Phoenix/Bandit on Linux and macOS, there is now a second path. `phx-port`
+reads SNI with `MSG_PEEK`, then passes the accepted port-443 socket to the
+application using `SCM_RIGHTS`. Linux uses a `SOCK_SEQPACKET` control socket;
+macOS uses a framed `SOCK_STREAM` control socket. The receiver adopts the
+descriptor with `:gen_tcp.fdopen/2`, Thousand Island performs server-side TLS,
+and Bandit continues through its normal HTTP pipeline.
 
 After the transfer:
 
@@ -38,9 +39,10 @@ Bandit projects. A custom transport can introduce an externally accepted
 socket without forking Bandit or implementing another HTTP stack.
 
 The relay remains the compatibility fallback. Descriptor handoff currently
-targets Linux. The Phoenix adapter requires OTP 29+ and the end-to-end verified
-Rustler 0.36.2 line; standalone Rust and .NET 10 receivers now exercise the
-same protocol without the BEAM.
+targets Linux and macOS. The Phoenix adapter requires OTP 29+ and the
+end-to-end verified Rustler 0.36.2 line. Standalone Rust/Axum, Go `net/http`,
+FastAPI/Uvicorn, and Node/Fastify receivers exercise the same protocol on both
+platforms; the Kestrel/.NET 10 receiver currently remains Linux-only.
 
 Implementation and diagrams:
 https://github.com/chgeuer/phx-port/blob/master/docs/proxying-without-the-proxy.md

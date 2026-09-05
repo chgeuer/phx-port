@@ -7,16 +7,19 @@ through the handoff-only second-server architecture described below. Darwin
 application-level end-to-end validation is manual, not automation-complete.
 
 The version 1 wire codec, endpoint derivation, same-UID capability handshake,
-Rust `SCM_RIGHTS` sender, and three framework transport adapters are
-implemented: Thousand Island/Bandit and Tokio/Axum on Linux and macOS, plus
-Kestrel/ASP.NET Core on Linux. The latter two independently implement the same
-PHXP protocol and demonstrate that handoff is not tied to the BEAM. Existing
+Rust `SCM_RIGHTS` sender, and six framework transport adapters are implemented:
+Thousand Island/Bandit, Tokio/Axum, Go `net/http`, FastAPI/Uvicorn, and
+Node/Fastify on Linux and macOS, plus Kestrel/ASP.NET Core on Linux. The
+non-BEAM adapters independently implement the same PHXP protocol and
+demonstrate that handoff is not tied to the BEAM. Existing
 automated tests and manual integration runs have exercised independently
 certificated Phoenix endpoints over HTTP/1.1, HTTP/2, and WebSockets through
 dynamic SNI routing on original port-443 sockets, plus concurrent cross-site
-requests and an in-VM handoff listener restart. The Rust and .NET examples have
+requests and an in-VM handoff listener restart. The framework samples have
 also been exercised through direct HTTP, direct trusted HTTPS, and
-daemon-driven TLS handoff with the original peer and local socket addresses.
+daemon-driven TLS handoff with the original peer and local socket addresses;
+their protocol support remains whatever each underlying framework normally
+provides.
 These statements are implementation evidence, not a claim that every scenario
 is covered by macOS CI.
 
@@ -214,11 +217,17 @@ socket state for every descriptor referring to that connection.
 
 ```mermaid
 sequenceDiagram
+    box Client
     participant Client
+    end
+    box phx-port
     participant Daemon as phx-port
+    end
+    box Phoenix Web App
     participant NIF as Rustler receiver
     participant TI as Thousand Island
     participant Bandit
+    end
 
     Client->>Daemon: TCP connection + TLS ClientHello
     Daemon->>Daemon: MSG_PEEK and resolve SNI
@@ -813,9 +822,9 @@ The original remote address remains the standard connection peer metadata.
 
 The HTTP/1.1, HTTP/2, LiveView WebSocket, original peer-address, concurrent
 cross-site, and in-VM listener restart scenarios have been exercised end to
-end in Phoenix. The standalone Rust and .NET 10 receivers have also been built
-and exercised through certificate discovery and real daemon handoff using the
-Alpha and Beta fixture certificates. Certificate rotation under load and
+end in Phoenix. The standalone Rust, .NET 10, Go, Python, and Node receivers
+have also been built and exercised through certificate discovery and real
+daemon handoff using local fixture certificates. Certificate rotation under load and
 comparative performance benchmarks remain outstanding. Manual validation on
 macOS arm64 transferred an untouched TCP descriptor with explicit
 close-on-exec checks. Bandit and Axum completed trusted handed-off TLS over
@@ -844,14 +853,15 @@ rejection remain automation gaps.
    in-VM listener restart.
 7. [x] Prove PHXP interoperability with standalone Rust and .NET 10 receivers.
 8. [x] Port the daemon, Phoenix/Bandit receiver, and Rust sample to macOS.
-9. [ ] Commit reproducible Darwin end-to-end coverage for post-delivery
+9. [x] Add Go, FastAPI/Uvicorn, and Node/Fastify receivers for Linux and macOS.
+10. [ ] Commit reproducible Darwin end-to-end coverage for post-delivery
    failures, Phoenix HTTP/2/WebSockets, cross-UID rejection, concurrency,
    restart, and descriptor lifecycle.
-10. [ ] Replace serialized blocking accepts with a supervised native worker and
+11. [ ] Replace serialized blocking accepts with a supervised native worker and
    queue if benchmarks show it is needed.
-11. [ ] Evaluate combining ordinary TCP and handoff acceptance in one hybrid
+12. [ ] Evaluate combining ordinary TCP and handoff acceptance in one hybrid
    transport.
-12. [ ] Benchmark and harden before presenting handoff as a general production
+13. [ ] Benchmark and harden before presenting handoff as a general production
    default.
 
 ## Resolved implementation choices
@@ -878,9 +888,9 @@ rejection remain automation gaps.
   if shared limits or measured performance justify the additional complexity.
 - Keep the Elixir adapter as an independently versioned Mix package under
   `phx_port_handoff` in this repository.
-- Keep the Elixir, Rust, and .NET implementations as minimal interoperability
-  examples under `samples`; they do not replace framework-native production
-  adapters.
+- Keep the Elixir, Rust, .NET, Go, Python, and Node implementations as focused
+  interoperability examples under `samples`; they stop at each framework's
+  accepted-socket boundary rather than replacing its TLS or HTTP stack.
 
 The remaining questions are empirical rather than architectural: scheduler
 impact, socket option compatibility, comparative performance, sustained
@@ -901,8 +911,8 @@ For Phoenix applications, a custom `ThousandIsland.Transport` accepts handed
 off descriptors, performs the server-side TLS handshake, and feeds them into
 the normal Bandit connection pipeline. The ordinary Phoenix endpoint continues
 to accept direct TLS traffic separately. Both paths use the same Phoenix Plug
-and TLS configuration. Standalone Rust and .NET 10 examples validate the same
-wire protocol and descriptor lifecycle outside the BEAM. All three preserve
+and TLS configuration. Standalone Rust, .NET 10, Go, Python, and Node examples validate
+the same wire protocol and descriptor lifecycle outside the BEAM. All preserve
 the client's real peer address and remove phx-port from the established
 connection's data path.
 
