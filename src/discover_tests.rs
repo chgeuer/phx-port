@@ -110,3 +110,16 @@ fn groups_http_and_https_endpoints_for_the_same_directory() {
     assert!(html.contains("href=\"https://localhost:4402\""));
     assert!(html.contains("grid-template-columns: repeat(auto-fit"));
 }
+
+#[test]
+fn keeps_links_clickable_after_the_discover_server_closes() {
+    let html = build_discover_html(&[RunningProject {
+        dir: "/srv/contoso".to_string(),
+        role: "main".to_string(),
+        port: 4400,
+        hostnames: vec![],
+    }]);
+
+    assert!(!html.contains("removeAttribute('href')"));
+    assert!(html.contains("The discover server has closed. This list may be out of date."));
+}

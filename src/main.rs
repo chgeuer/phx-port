@@ -872,7 +872,6 @@ document.querySelectorAll('a').forEach(a => {
     setTimeout(async () => {
         try { await fetch('/ping'); poll(); }
         catch {
-            document.querySelectorAll('a').forEach(a => a.removeAttribute('href'));
             document.querySelector('footer').textContent =
                 'The discover server has closed. This list may be out of date.';
             document.body.style.opacity = '0.5';
