@@ -55,12 +55,8 @@ defmodule Mix.Tasks.PhxPortHandoff.Install do
 
   @doc false
   def igniter(igniter) do
-    Loader.load!()
-    installer = Function.capture(installer_module(), :install, 1)
+    installer_module = Loader.load!()
+    installer = Function.capture(installer_module, :install, 1)
     installer.(igniter)
-  end
-
-  defp installer_module do
-    String.to_existing_atom("Elixir.PhxPortHandoff.Installer")
   end
 end

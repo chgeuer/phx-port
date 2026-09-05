@@ -11,8 +11,9 @@ defmodule PhxPortHandoff.Installer.Loader do
     "Igniter.Project.Module",
     "Sourceror.Zipper"
   ]
+  @installer_module Module.concat(PhxPortHandoff, "Installer")
 
-  @spec load!() :: :ok
+  @spec load!() :: module()
   def load! do
     case unavailable_modules() do
       [] ->
@@ -20,7 +21,7 @@ defmodule PhxPortHandoff.Installer.Loader do
         |> Application.app_dir(["priv", "installer", "igniter.exs"])
         |> Code.require_file()
 
-        :ok
+        @installer_module
 
       modules ->
         Mix.raise("Igniter installer modules are unavailable: #{Enum.join(modules, ", ")}")
