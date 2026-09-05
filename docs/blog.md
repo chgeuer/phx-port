@@ -75,18 +75,19 @@ So now that all gives me a slick local dev experience, I can have many web proje
 
 That's a bummer, because during development I'm running stuff on my developer laptop, which is in my home LAN, behind a DSL router and NAT, and Let's Encrypt cannot reach any of my web projects from the public Internet. Luckily, Let's Encrypt also offers another way to prove that I control a domain (so they're willing to issue me a certificate), the ACME DNS-01 challenge.
 
-```mermaidjs
+```mermaid
 sequenceDiagram
-    participant Let's Encrypt
-    participant Web Project
-    actor DNS@{ "type": "database" } as DNS Server
+    participant LE as Let's Encrypt
+    participant App as Web Project
+    participant DNS as DNS Server
 
-    Web Project->>Let's Encrypt: Hi, I'm this domain, give me a certificate
-    Let's Encrypt-->>Web Project: Prove it by storing this challenge in your DNS server, if you can do that, I trust you
-    Web Project->>DNS: Store this challenge
-    Let's Encrypt->>DNS: Were they able to store my challenge there?
-    Web Project->>Let's Encrypt: You should've seen I own my DNS, so can I haz cheese, please?
-    Let's Encrypt-->>Web Project: Here's your production certificate    
+    App->>LE: Hi, I'm this domain, give me a certificate
+    LE-->>App: Prove control by storing this challenge in DNS
+    App->>DNS: Store the challenge as a TXT record
+    LE->>DNS: Is the expected challenge present?
+    DNS-->>LE: Yes
+    App->>LE: You saw that I control DNS, so can I haz cheese?
+    LE-->>App: Here's your production certificate
 ```
 
 So I created a little `:acme_dns` library, which supports DNSimple and Azure DNS as DNS providers, and which then handles dynamic certificate issuance for my web projects. DNS-01 does not require Let's Encrypt to reach the laptop at all; it proves control by asking me to publish a temporary DNS TXT record. Separately, I arrange for the hostname to resolve to my laptop from the clients that should reach it, for example through local DNS, a private LAN address, or a public address with suitable routing. The web app can then grab a real, publicly trusted certificate from Let's Encrypt, and I can reach my project via HTTPS.
@@ -179,6 +180,26 @@ Phoenix and Bandit were where I first proved the idea, but PHXP—the small prot
 Each adapter does only the narrow bit of plumbing its runtime needs: receive and validate the descriptor, turn it into that framework's idea of an accepted connection, and then get out of the way. TLS, HTTP, middleware, routing, WebSockets, and application code continue through the framework's normal pipeline. Rust, Node, Python, Go, and Elixir work on Linux and macOS; the .NET/Kestrel sample is currently Linux-only.
 
 ## The result
+
+```mermaid
+flowchart LR
+    Browser["Browser<br/>https://hostname:443"]
+    Router["phx-port<br/>port 443"]
+    Routes["Certificate-verified<br/>route table"]
+    Listener["Application HTTPS listener<br/>assigned local port"]
+    Receiver["Application<br/>PHXP receiver"]
+    Framework["Normal application<br/>TLS and HTTP pipeline"]
+
+    Listener -->|"TLS probe proves<br/>hostname ownership"| Routes
+    Browser -->|"TCP connection<br/>and TLS ClientHello"| Router
+    Router -->|"MSG_PEEK reads SNI<br/>without consuming bytes"| Routes
+    Routes -->|"Selected workload"| Router
+    Router -->|"PHXP and SCM_RIGHTS<br/>original connected socket"| Receiver
+    Receiver --> Framework
+    Framework -->|"TLS and HTTP over<br/>the original socket"| Browser
+    Router -.->|"Fallback: opaque<br/>encrypted relay"| Listener
+    Listener -.-> Framework
+```
 
 The browser connects to the normal `https://www.geuer-pollmann.de/` URL on port 443. `phx-port` accepts the TCP connection and peeks at the ClientHello just far enough to read the SNI hostname. The important word is **peeks**: The ClientHello bytes remain untouched in the kernel's receive queue, exactly where the application's TLS stack expects to find them.
 
