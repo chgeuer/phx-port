@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"syscall"
+	"testing"
 	"time"
 )
 
@@ -19,6 +20,40 @@ func startTestHandoff(path string, tcp *net.TCPConn, request Message) <-chan han
 		result <- handoffResult{response: response, err: err}
 	}()
 	return result
+}
+
+func acceptTestHandoff(t *testing.T, listener *Listener, result <-chan handoffResult) (net.Conn, handoffResult) {
+	t.Helper()
+
+	accepted := make(chan acceptResult, 1)
+	go func() {
+		conn, err := listener.Accept()
+		accepted <- acceptResult{conn: conn, err: err}
+	}()
+
+	timeout := time.NewTimer(listener.timeout + time.Second)
+	defer timeout.Stop()
+
+	var acceptance acceptResult
+	select {
+	case acceptance = <-accepted:
+	case handoff := <-result:
+		t.Fatalf("handoff ended before acceptance: response=%#v, error=%v", handoff.response, handoff.err)
+	case <-timeout.C:
+		t.Fatal("handoff acceptance timed out")
+	}
+	if acceptance.err != nil {
+		t.Fatal(acceptance.err)
+	}
+
+	select {
+	case handoff := <-result:
+		return acceptance.conn, handoff
+	case <-timeout.C:
+		_ = acceptance.conn.Close()
+		t.Fatal("handoff response timed out after acceptance")
+		return nil, handoffResult{}
+	}
 }
 
 func sendTestHandoff(path string, tcp *net.TCPConn, request Message) (Message, error) {

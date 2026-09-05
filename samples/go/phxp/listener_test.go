@@ -140,11 +140,7 @@ func TestHandoffRoundTripRetainsAddressesAndData(t *testing.T) {
 		AcceptedAtNS: 42,
 		RequestedSNI: "www.contoso.com",
 	})
-	adopted, err := receiver.Accept()
-	if err != nil {
-		t.Fatal(err)
-	}
-	handoff := <-result
+	adopted, handoff := acceptTestHandoff(t, receiver, result)
 	if handoff.err != nil {
 		t.Fatal(handoff.err)
 	}
@@ -201,11 +197,7 @@ func TestDuplicateActiveConnectionIDsAreRejected(t *testing.T) {
 	firstResult := startTestHandoff(receiver.path, accepted1, Message{
 		Type: TypeHandoff, ConnectionID: id, RequestedSNI: "one.example",
 	})
-	adopted, err := receiver.Accept()
-	if err != nil {
-		t.Fatal(err)
-	}
-	first := <-firstResult
+	adopted, first := acceptTestHandoff(t, receiver, firstResult)
 	if first.err != nil || first.response.Type != TypeAdopted {
 		t.Fatalf("first handoff = %#v, %v", first.response, first.err)
 	}
@@ -284,7 +276,12 @@ func TestFullAdoptionQueueRejectsBeforeOwnership(t *testing.T) {
 	})
 	deadline := time.Now().Add(2 * time.Second)
 	for len(receiver.queue) != 1 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+		select {
+		case first := <-firstResult:
+			t.Fatalf("first handoff ended before entering the adoption queue: response=%#v, error=%v",
+				first.response, first.err)
+		case <-time.After(time.Millisecond):
+		}
 	}
 	if len(receiver.queue) != 1 {
 		t.Fatal("first handoff did not enter the bounded adoption queue")
@@ -308,11 +305,7 @@ func TestFullAdoptionQueueRejectsBeforeOwnership(t *testing.T) {
 		t.Fatalf("full-queue response = %#v", second)
 	}
 
-	firstConn, err := receiver.Accept()
-	if err != nil {
-		t.Fatal(err)
-	}
-	first := <-firstResult
+	firstConn, first := acceptTestHandoff(t, receiver, firstResult)
 	if first.err != nil || first.response.Type != TypeAdopted {
 		t.Fatalf("first handoff = %#v, %v", first.response, first.err)
 	}
