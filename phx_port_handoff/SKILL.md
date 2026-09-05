@@ -18,18 +18,20 @@ Unix-socket-only Bandit child and reuses the endpoint's exact TLS options.
 
 ## Add the dependency
 
-Until the package is published, add the Git dependency to `mix.exs`:
+Resolve the absolute directory containing this `SKILL.md` and use it directly:
 ```elixir
-{:phx_port_handoff,
- github: "chgeuer/phx-port",
- sparse: "phx_port_handoff"}
+{:phx_port_handoff, path: "/absolute/directory/containing/this/SKILL.md"}
 ```
+This keeps instructions and implementation in the same checkout. Do not
+substitute a Hex or Git dependency.
 Then run:
 ```bash
 mix deps.get
-mix deps.compile phx_port_handoff
+mix deps.compile
 ```
-The package intentionally pins Rustler 0.36. Rustler 0.38 is unsupported.
+Compile the complete dependency graph on a clean checkout so Rustler and TOML
+are available before `phx_port_handoff` is compiled. The package intentionally
+pins Rustler 0.36. Rustler 0.38 is unsupported.
 
 ## Add the handoff child
 
@@ -73,14 +75,11 @@ runtime root.
 
 ## Wire stable ports
 
-The server launcher must export both roles before Phoenix starts:
-```bash
-export PORT="${PORT:-$(phx-port | cat)}"
-export HTTPS_PORT="${HTTPS_PORT:-$(phx-port https | cat)}"
-MIX_ENV=prod mix phx.server
-```
-Ensure the endpoint HTTPS configuration consumes `HTTPS_PORT`. Keep the normal
-HTTPS port available for discovery, health checks, and relay fallback.
+The server launcher must export both roles before Phoenix starts. Prefer a
+checked-in `justfile`; otherwise update the project's existing launcher. Use
+the concrete recipes in [EXAMPLES.md](EXAMPLES.md). Ensure the endpoint HTTPS
+configuration consumes `HTTPS_PORT`. Keep the normal HTTPS port available for
+discovery, health checks, and relay fallback.
 
 ## Verify real handoff
 
