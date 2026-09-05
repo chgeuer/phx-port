@@ -13,6 +13,46 @@ defmodule PhxPortHandoff do
   @workload_id_pattern ~r/\A[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?\z/
 
   @spec endpoint_path(endpoint_identity(), String.t()) :: Path.t()
+  @doc """
+  Returns a child specification for a handoff listener backed by an endpoint's
+  configured HTTPS options.
+
+  The child is ignored when the endpoint has no HTTPS configuration, allowing
+  the same supervision tree to run in environments where HTTPS is disabled.
+  """
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
+  def child_spec(options) do
+    endpoint = Keyword.fetch!(options, :endpoint)
+    role = Keyword.get(options, :role, "https")
+
+    %{
+      id: {__MODULE__, endpoint, role},
+      start: {__MODULE__, :start_link, [options]},
+      type: :supervisor
+    }
+  end
+
+  @doc false
+  @spec start_link(keyword()) :: Supervisor.on_start()
+  def start_link(options) do
+    otp_app = Keyword.fetch!(options, :otp_app)
+    endpoint = Keyword.fetch!(options, :endpoint)
+    role = Keyword.get(options, :role, "https")
+
+    case Application.fetch_env!(otp_app, endpoint)[:https] do
+      nil ->
+        :ignore
+
+      https ->
+        identity = Keyword.get_lazy(options, :identity, &handoff_identity/0)
+
+        %{start: {module, function, arguments}} =
+          bandit_child_spec(endpoint, identity, role, https)
+
+        apply(module, function, arguments)
+    end
+  end
+
   def endpoint_path(identity, role) do
     {path, _validate_runtime_root?} = derived_endpoint(identity, role)
     path
@@ -102,6 +142,13 @@ defmodule PhxPortHandoff do
 
   defp child_identity({:workload, workload_id}), do: {:workload, workload_id}
   defp child_identity(project), do: Path.expand(project)
+
+  defp handoff_identity do
+    case System.get_env("PHX_PORT_WORKLOAD_ID") do
+      id when is_binary(id) and id != "" -> {:workload, id}
+      _other -> File.cwd!()
+    end
+  end
 
   defp runtime_handoff_directory(profile) do
     case nonempty_env("PHX_PORT_RUNTIME_DIR") do

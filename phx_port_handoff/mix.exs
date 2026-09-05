@@ -22,6 +22,7 @@ defmodule PhxPortHandoff.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      {:igniter, "~> 0.8", optional: true},
       {:rustler, "~> 0.36.1"},
       {:thousand_island, "~> 1.4"}
     ]

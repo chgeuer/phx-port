@@ -87,6 +87,29 @@ defmodule PhxPortHandoffTest do
              Path.join([runtime, "handoff", expected_hash <> ".sock"])
   end
 
+  test "configured child has a stable identity and ignores disabled HTTPS" do
+    endpoint = __MODULE__.Endpoint
+    Application.put_env(:phx_port_handoff, endpoint, [])
+    on_exit(fn -> Application.delete_env(:phx_port_handoff, endpoint) end)
+
+    assert %{
+             id: {PhxPortHandoff, ^endpoint, "https"},
+             start:
+               {PhxPortHandoff, :start_link, [[otp_app: :phx_port_handoff, endpoint: ^endpoint]]},
+             type: :supervisor
+           } =
+             PhxPortHandoff.child_spec(
+               otp_app: :phx_port_handoff,
+               endpoint: endpoint
+             )
+
+    assert :ignore =
+             PhxPortHandoff.start_link(
+               otp_app: :phx_port_handoff,
+               endpoint: endpoint
+             )
+  end
+
   test "native broker creates a private endpoint" do
     path = endpoint_path()
 

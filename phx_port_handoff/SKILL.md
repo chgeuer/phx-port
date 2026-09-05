@@ -18,56 +18,62 @@ Unix-socket-only Bandit child and reuses the endpoint's exact TLS options.
 
 ## Add the dependency
 
-Resolve the absolute directory containing this `SKILL.md` and use it directly:
-```elixir
-{:phx_port_handoff, path: "/absolute/directory/containing/this/SKILL.md"}
-```
-This keeps instructions and implementation in the same checkout. Do not
-substitute a Hex or Git dependency.
-Then run:
+Resolve the absolute directory containing this `SKILL.md`, then let Igniter
+add the path dependency and update the application supervisor:
+
 ```bash
-mix deps.get
-mix deps.compile
+mix igniter.install \
+  phx_port_handoff@path:/absolute/directory/containing/this/SKILL.md \
+  --yes
 ```
-Compile the complete dependency graph on a clean checkout so Rustler and TOML
-are available before `phx_port_handoff` is compiled. The package intentionally
-pins Rustler 0.36. Rustler 0.38 is unsupported.
 
-## Add the handoff child
+This keeps instructions and implementation in the same checkout. Do not
+substitute a Hex or Git dependency. The installer discovers the OTP
+application and Phoenix endpoint and adds the conditional handoff child
+immediately before the ordinary endpoint.
 
-In the application supervisor, place the handoff child immediately before the
-ordinary endpoint. If certificate startup is gated, place it after that gate:
+If the dependency is already present, rerun the same Igniter command; the
+installer is idempotent:
+
+```bash
+mix igniter.install \
+  phx_port_handoff@path:/absolute/directory/containing/this/SKILL.md \
+  --yes
+```
+
+Review the generated diff. It should contain:
+
+```elixir
+{PhxPortHandoff,
+ otp_app: :my_app,
+ endpoint: MyAppWeb.Endpoint,
+ role: "https"},
+MyAppWeb.Endpoint
+```
+
+The child reads the endpoint's HTTPS options unchanged, derives the path or
+Workload identity, and returns `:ignore` when HTTPS is disabled. The package
+intentionally pins Rustler 0.36. Rustler 0.38 is unsupported.
+
+## Manual fallback
+
+If Igniter cannot recognize a custom supervision tree, place the child
+immediately before the ordinary endpoint:
 
 ```elixir
 children =
-  existing_children_before_endpoint() ++
-    handoff_children() ++
-    [MyAppWeb.Endpoint]
-
-defp handoff_children do
-  case Application.fetch_env!(:my_app, MyAppWeb.Endpoint)[:https] do
-    nil -> []
-    https ->
-      [
-        PhxPortHandoff.bandit_child_spec(
-          MyAppWeb.Endpoint,
-          handoff_identity(),
-          "https",
-          https
-        )
-      ]
-  end
-end
-defp handoff_identity do
-  case System.get_env("PHX_PORT_WORKLOAD_ID") do
-    id when is_binary(id) and id != "" -> {:workload, id}
-    _other -> File.cwd!()
-  end
-end
+  [
+    # existing children
+    {PhxPortHandoff,
+     otp_app: :my_app,
+     endpoint: MyAppWeb.Endpoint,
+     role: "https"},
+    MyAppWeb.Endpoint
+  ]
 ```
+
 Replace `:my_app` and `MyAppWeb.Endpoint`. Preserve the project's actual child
-list rather than introducing `existing_children_before_endpoint/0`. Returning
-`[]` without HTTPS keeps development and tests working.
+list.
 For local path identity, always start from the same canonical project directory
 registered with `phx-port`. Hosted production must set the registry's logical
 `PHX_PORT_WORKLOAD_ID`; set `PHX_PORT_RUNTIME_DIR` when using a non-default

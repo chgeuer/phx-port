@@ -13,31 +13,31 @@ ownership behavior.
 
 ## Installation
 
-Until the package is published, add it directly from this repository:
+Until the package is published, install it from the package directory with
+Igniter:
 
-```elixir
-def deps do
-  [
-    {:phx_port_handoff,
-     github: "chgeuer/phx-port",
-     sparse: "phx_port_handoff"}
-  ]
-end
+```bash
+mix igniter.install \
+  phx_port_handoff@path:/absolute/path/to/phx-port/phx_port_handoff \
+  --yes
 ```
+
+The installer adds the path dependency and inserts the handoff child
+immediately before the Phoenix endpoint. Rerunning the command is safe; the
+installer is idempotent.
 
 ## Phoenix integration
 
-Add a handoff-only Bandit child before the ordinary Phoenix endpoint child.
-Pass the endpoint's existing HTTPS options unchanged so both listeners use the
-same certificate, SNI callback, ALPN, cipher, and client-authentication policy:
+The installer adds a handoff-only Bandit child before the ordinary Phoenix
+endpoint child:
 
 ```elixir
 def start(_type, _args) do
-  project = File.cwd!()
-  https = Application.fetch_env!(:my_app, MyAppWeb.Endpoint)[:https]
-
   children = [
-    PhxPortHandoff.bandit_child_spec(MyAppWeb.Endpoint, project, "https", https),
+    {PhxPortHandoff,
+     otp_app: :my_app,
+     endpoint: MyAppWeb.Endpoint,
+     role: "https"},
     MyAppWeb.Endpoint
   ]
 
@@ -47,6 +47,10 @@ def start(_type, _args) do
   )
 end
 ```
+
+The child reads the endpoint's existing HTTPS options unchanged so both
+listeners use the same certificate, SNI callback, ALPN, cipher, and
+client-authentication policy. It returns `:ignore` when HTTPS is disabled.
 
 The ordinary endpoint still listens on its assigned phx-port HTTPS port for
 certificate verification, health checks, and direct access. The additional
@@ -67,19 +71,8 @@ does not bind TCP port 443 itself. It configures one Thousand Island acceptor
 because the current native receive path is deliberately serialized.
 
 In the explicit production Hosting Profile, set the same logical
-`PHX_PORT_WORKLOAD_ID` used by the Port Registry and pass it as an explicit
-Workload identity:
-
-```elixir
-identity = {:workload, System.fetch_env!("PHX_PORT_WORKLOAD_ID")}
-
-PhxPortHandoff.bandit_child_spec(
-  MyAppWeb.Endpoint,
-  identity,
-  "https",
-  https
-)
-```
+`PHX_PORT_WORKLOAD_ID` used by the Port Registry. The configured child reads
+the variable and uses it as the Workload identity automatically.
 
 The helper hashes `workload-id NUL role` without expanding it as a path and
 defaults to:
