@@ -4,6 +4,7 @@ elixir_hostname := "alias-alpha.phx-port.pollmann.rocks"
 go_hostname := "a.pollmann.rocks"
 python_hostname := "b.pollmann.rocks"
 node_hostname := "c.pollmann.rocks"
+default_listen := "0.0.0.0:443"
 
 default:
     @just --list
@@ -16,6 +17,38 @@ release:
 
 install:
     cargo install --path . --locked
+
+# Reinstall the optimized release binary over whatever is already installed
+install-release:
+    cargo install --path . --locked --force
+
+# Run the production ingress daemon in the foreground on a privileged port
+run-production listen=default_listen:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    binary="${CARGO_HOME:-$HOME/.cargo}/bin/phx-port"
+    config="${PHX_PORT_CONFIG:-$HOME/.config/phx-ports.toml}"
+    runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    user="${USER:-$(id -un)}"
+
+    if [[ ! -x "$binary" ]]; then
+      echo "no phx-port binary at $binary; run 'just install-release' first" >&2
+      exit 1
+    fi
+    if [[ ! -f "$config" ]]; then
+      echo "no port configuration at $config" >&2
+      exit 1
+    fi
+
+    # sudo scrubs the environment, so the daemon would otherwise resolve the
+    # root account's config and runtime paths instead of the target user's.
+    echo "$("$binary" --version 2>/dev/null || echo 'phx-port ?') listening on {{ listen }}, dropping to $user"
+    echo "Ctrl-C (SIGINT) and SIGTERM both drain in-flight connections before exiting."
+    exec sudo env \
+      HOME="$HOME" \
+      XDG_RUNTIME_DIR="$runtime_dir" \
+      PHX_PORT_CONFIG="$config" \
+      "$binary" daemon --run-as "$user" --listen "{{ listen }}"
 
 test:
     cargo test --locked

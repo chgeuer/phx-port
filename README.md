@@ -508,6 +508,21 @@ sudo phx-port daemon --run-as phx-port \
   --listen 0.0.0.0:443 --listen '[::]:443'
 ```
 
+For a personal deployment that runs as your own account, `just install-release`
+reinstalls the optimized binary over the existing one, and `just run-production`
+wraps the invocation above:
+
+```bash
+just install-release
+just run-production              # 0.0.0.0:443
+just run-production '[::]:443'   # override the listener
+```
+
+`sudo` scrubs the environment, so the target forwards `HOME`,
+`XDG_RUNTIME_DIR`, and `PHX_PORT_CONFIG` explicitly; without them the daemon
+would resolve root's configuration and runtime paths instead of yours. It
+checks for the installed binary and the port configuration before escalating.
+
 Every listener must be explicit and must exactly match the public config's
 `[ingress] listen` array. The daemon resolves the target account and
 supplementary groups, binds only those listeners, permanently sets the target
