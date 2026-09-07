@@ -46,6 +46,7 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(250);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROBES: usize = CERTIFICATE_PROBE_WORKERS;
+const MAX_RECONCILIATION_PROBES: usize = MAX_PROBES - ROUTE_SELECTION_WORKERS;
 const MAX_WAITING_CLIENTS: usize = 64;
 const MAX_NEGATIVE_ROUTES: usize = 1024;
 const MAX_VERIFIED_ROUTES: usize = 1024;
@@ -53,6 +54,7 @@ const MAX_ROUTE_CONFLICTS: usize = 1024;
 const MAX_ROUTE_DIAGNOSTICS: usize = 64;
 const NEGATIVE_TTL: Duration = Duration::from_secs(30);
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
+const RECONCILIATION_PASS_TIMEOUT: Duration = Duration::from_secs(1);
 const TLS_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 const TCP_FAILURE_THRESHOLD: u8 = 3;
 const DEVELOPMENT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -80,6 +82,36 @@ struct IngressShutdown {
     drain_window: Arc<OnceLock<DrainWindow>>,
     transition: Arc<Mutex<()>>,
     drain_timeout: Duration,
+}
+
+fn tls_connect_until(
+    connector: &TlsConnector,
+    hostname: &str,
+    stream: TcpStream,
+    deadline: Instant,
+    cancelled: Option<&AtomicBool>,
+) -> Result<native_tls::TlsStream<TcpStream>, String> {
+    stream
+        .set_nonblocking(true)
+        .map_err(|error| format!("cannot configure TLS probe: {error}"))?;
+    ensure_before_route_deadline(deadline)?;
+    let mut handshake = connector.connect(hostname, stream);
+    loop {
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            return Err("ingress is shutting down".to_string());
+        }
+        let remaining = route_deadline_remaining(deadline)?;
+        match handshake {
+            Ok(tls) => return Ok(tls),
+            Err(native_tls::HandshakeError::Failure(error)) => {
+                return Err(format!("TLS validation failed: {error}"));
+            }
+            Err(native_tls::HandshakeError::WouldBlock(pending)) => {
+                thread::sleep(remaining.min(Duration::from_millis(1)));
+                handshake = pending.handshake();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -306,12 +338,14 @@ fn current_unix_seconds() -> u64 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConfigReloadError {
     Invalid,
+    StateUnavailable,
 }
 
 impl ConfigReloadError {
     fn label(self) -> &'static str {
         match self {
             Self::Invalid => "config_invalid",
+            Self::StateUnavailable => "state_unavailable",
         }
     }
 }
@@ -380,23 +414,29 @@ impl DiscoveryFlight {
 struct ProbeLimiter {
     in_use: Mutex<usize>,
     available: Condvar,
+    limit: usize,
 }
 
 impl ProbeLimiter {
     fn new() -> Self {
+        Self::with_limit(MAX_PROBES)
+    }
+
+    fn with_limit(limit: usize) -> Self {
         Self {
             in_use: Mutex::new(0),
             available: Condvar::new(),
+            limit,
         }
     }
 
     fn acquire(self: &Arc<Self>, deadline: Instant) -> Option<ProbePermit> {
         let mut in_use = self.in_use.lock().ok()?;
-        while *in_use >= MAX_PROBES {
+        while *in_use >= self.limit {
             let remaining = deadline.checked_duration_since(Instant::now())?;
             let (next, timeout) = self.available.wait_timeout(in_use, remaining).ok()?;
             in_use = next;
-            if timeout.timed_out() && *in_use >= MAX_PROBES {
+            if timeout.timed_out() && *in_use >= self.limit {
                 return None;
             }
         }
@@ -562,6 +602,8 @@ impl std::fmt::Display for SourceDiagnosticEvent {
     }
 }
 
+type ProbeJob = Box<dyn FnOnce() + Send>;
+
 struct ProxyState {
     config: PathBuf,
     production_paths: Option<ProductionPaths>,
@@ -571,6 +613,9 @@ struct ProxyState {
     admission: AdmissionController,
     listeners: RwLock<Vec<SocketAddr>>,
     routes: RwLock<HashMap<String, ActiveRoute>>,
+    route_cache_transaction: Mutex<()>,
+    shutdown_requested: Arc<AtomicBool>,
+    reconciliation_cursor: AtomicUsize,
     conflicts: RwLock<BTreeMap<String, Vec<Backend>>>,
     conflict_capacity_drops: AtomicU64,
     route_capacity_rejections: AtomicU64,
@@ -586,6 +631,8 @@ struct ProxyState {
     queued_route_selections: Arc<AtomicUsize>,
     queued_connections: Arc<AtomicUsize>,
     probes: Arc<ProbeLimiter>,
+    reconciliation_probes: Arc<ProbeLimiter>,
+    probe_workers: Mutex<Option<BoundedWorkerPool<ProbeJob>>>,
     probe_connector_override: Option<TlsConnector>,
     allocator_reclaim_gate: RwLock<()>,
     connection_tasks_in_flight: AtomicUsize,
@@ -642,6 +689,9 @@ impl ProxyState {
             admission,
             listeners: RwLock::new(Vec::new()),
             routes: RwLock::new(HashMap::new()),
+            route_cache_transaction: Mutex::new(()),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            reconciliation_cursor: AtomicUsize::new(0),
             conflicts: RwLock::new(BTreeMap::new()),
             conflict_capacity_drops: AtomicU64::new(0),
             route_capacity_rejections: AtomicU64::new(0),
@@ -657,6 +707,8 @@ impl ProxyState {
             queued_route_selections: Arc::new(AtomicUsize::new(0)),
             queued_connections: Arc::new(AtomicUsize::new(0)),
             probes: Arc::new(ProbeLimiter::new()),
+            reconciliation_probes: Arc::new(ProbeLimiter::with_limit(MAX_RECONCILIATION_PROBES)),
+            probe_workers: Mutex::new(None),
             probe_connector_override,
             allocator_reclaim_gate: RwLock::new(()),
             connection_tasks_in_flight: AtomicUsize::new(0),
@@ -699,6 +751,80 @@ impl ProxyState {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn check_running_until(&self, deadline: Instant) -> Result<(), String> {
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return Err("ingress is shutting down".to_string());
+        }
+        ensure_before_route_deadline(deadline)
+    }
+
+    fn access_deadline(&self, deadline: Instant) -> port_registry::AccessDeadline<'_> {
+        port_registry::AccessDeadline {
+            deadline,
+            cancelled: &self.shutdown_requested,
+        }
+    }
+
+    fn cache_transaction_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+        loop {
+            self.check_running_until(deadline)?;
+            match self.route_cache_transaction.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    thread::sleep(
+                        route_deadline_remaining(deadline)?.min(Duration::from_millis(5)),
+                    );
+                }
+            }
+        }
+    }
+
+    fn submit_probe<T: Send + 'static>(
+        &self,
+        deadline: Instant,
+        probe: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Result<mpsc::Receiver<Result<T, String>>, String> {
+        self.check_running_until(deadline)?;
+        let permit = self
+            .probes
+            .acquire(deadline)
+            .ok_or_else(|| "certificate probe capacity unavailable".to_string())?;
+        self.check_running_until(deadline)?;
+        let mut workers = self
+            .probe_workers
+            .lock()
+            .map_err(|_| "certificate worker state poisoned".to_string())?;
+        self.check_running_until(deadline)?;
+        if workers.is_none() {
+            *workers = Some(BoundedWorkerPool::start(
+                "phx-port-probe",
+                MAX_PROBES,
+                MAX_PROBES,
+                |job: ProbeJob| job(),
+            )?);
+        }
+        let sender = workers.as_ref().unwrap().sender();
+        drop(workers);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let cancelled = Arc::clone(&self.shutdown_requested);
+        sender
+            .try_send(Box::new(move || {
+                let _permit = permit;
+                let result = if cancelled.load(Ordering::Acquire) {
+                    Err("ingress is shutting down".to_string())
+                } else {
+                    ensure_before_route_deadline(deadline).and_then(|()| probe())
+                };
+                let _ = result_tx.send(result);
+            }))
+            .map_err(|_| "certificate probe capacity unavailable".to_string())?;
+        Ok(result_rx)
     }
 
     fn public_snapshot(&self) -> Option<Arc<PublicIngressSnapshot>> {
@@ -878,8 +1004,9 @@ impl ProxyState {
             return flight.wait(deadline);
         }
 
-        ensure_before_route_deadline(deadline)?;
-        let result = discover(deadline);
+        let result = self
+            .check_running_until(deadline)
+            .and_then(|()| discover(deadline));
         flight.complete(result.clone());
         if let Ok(mut flights) = self.flights.lock() {
             flights.remove(hostname);
@@ -1114,18 +1241,25 @@ fn same_route_target(left: &RouteDeclaration, right: &RouteDeclaration) -> bool 
     left.workload == right.workload && left.role == right.role
 }
 
-fn record_config_reload_failure(state: &ProxyState, rejected_generation: u64) {
+fn record_config_reload_failure(
+    state: &ProxyState,
+    rejected_generation: u64,
+    reason: ConfigReloadError,
+) {
     let mut status = state
         .config_reload_status
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     status.last_rejected_generation = Some(rejected_generation);
-    if status.last_error == Some(ConfigReloadError::Invalid) {
+    if status.last_error == Some(reason) {
         return;
     }
-    status.last_error = Some(ConfigReloadError::Invalid);
+    status.last_error = Some(reason);
     status.rejected_reloads = status.rejected_reloads.saturating_add(1);
-    eprintln!("event=ingress_config_reload result=rejected reason=config_invalid");
+    eprintln!(
+        "event=ingress_config_reload result=rejected reason={}",
+        reason.label()
+    );
 }
 
 fn clear_config_reload_failure(state: &ProxyState) {
@@ -1148,13 +1282,65 @@ fn reload_public_profile(state: &ProxyState) -> ConfigReloadOutcome {
             return ConfigReloadOutcome::Unchanged(current_snapshot.generation);
         }
         Err(_) => {
-            record_config_reload_failure(state, current_snapshot.generation.saturating_add(1));
+            record_config_reload_failure(
+                state,
+                current_snapshot.generation.saturating_add(1),
+                ConfigReloadError::Invalid,
+            );
             return ConfigReloadOutcome::Rejected(current_snapshot.generation.saturating_add(1));
         }
     };
     let replacement_snapshot = replacement
         .public_snapshot()
         .expect("a public config reload returns a public snapshot");
+
+    let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+    let _transaction = match state.cache_transaction_until(deadline) {
+        Ok(transaction) => transaction,
+        Err(_) => {
+            record_config_reload_failure(
+                state,
+                replacement_snapshot.generation,
+                ConfigReloadError::StateUnavailable,
+            );
+            return ConfigReloadOutcome::Rejected(replacement_snapshot.generation);
+        }
+    };
+    let installed = state.hosting_profile();
+    if let Some(snapshot) = installed.public_snapshot()
+        && snapshot.generation != current_snapshot.generation
+    {
+        return ConfigReloadOutcome::Superseded(snapshot.generation);
+    }
+    // Serialize cache mutations with publication, but never hold a routing/profile
+    // lock while waiting on disk. A failed prune leaves the old generation intact.
+    if let Some((path, storage)) = state.route_cache_for_profile(&installed) {
+        let targets = replacement_snapshot
+            .routes
+            .iter()
+            .map(|(hostname, declaration)| {
+                (
+                    hostname.clone(),
+                    (declaration.workload.clone(), declaration.role.clone()),
+                )
+            })
+            .collect();
+        if route_cache::retain_targets_until(
+            path,
+            storage,
+            &targets,
+            Some(state.access_deadline(deadline)),
+        )
+        .is_err()
+        {
+            record_config_reload_failure(
+                state,
+                replacement_snapshot.generation,
+                ConfigReloadError::StateUnavailable,
+            );
+            return ConfigReloadOutcome::Rejected(replacement_snapshot.generation);
+        }
+    }
 
     let mut profile = state
         .hosting_profile
@@ -1211,21 +1397,6 @@ fn reload_public_profile(state: &ProxyState) -> ConfigReloadOutcome {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
-    if let Some((route_cache_path, route_cache_storage)) = state.route_cache() {
-        let targets = replacement_snapshot
-            .routes
-            .iter()
-            .map(|(hostname, declaration)| {
-                (
-                    hostname.clone(),
-                    (declaration.workload.clone(), declaration.role.clone()),
-                )
-            })
-            .collect();
-        if route_cache::retain_targets(route_cache_path, route_cache_storage, &targets).is_err() {
-            eprintln!("event=route_state_update result=failed");
-        }
-    }
     {
         let mut status = state
             .config_reload_status
@@ -1353,15 +1524,17 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         .as_ref()
         .map(|paths| paths.runtime_root.clone())
         .or_else(handoff::runtime_override);
-    let state = Arc::new(ProxyState::with_limits(
+    let shutdown = IngressShutdown::new(shutdown_drain_timeout);
+    let mut state = ProxyState::with_limits(
         registry,
         production_paths,
         hosting_profile,
         handoff_runtime,
         limits,
         None,
-    ));
-    let shutdown = IngressShutdown::new(shutdown_drain_timeout);
+    );
+    state.shutdown_requested = shutdown.requested_flag();
+    let state = Arc::new(state);
     let mut listeners = Vec::with_capacity(acquired_listeners.len());
 
     for acquired in acquired_listeners {
@@ -1430,12 +1603,20 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         let shutdown = shutdown.requested_flag();
         thread::spawn(move || {
             while !shutdown.load(Ordering::Acquire) {
-                thread::sleep(LIVENESS_INTERVAL);
+                let wake_at = Instant::now() + LIVENESS_INTERVAL;
+                while Instant::now() < wake_at && !shutdown.load(Ordering::Acquire) {
+                    thread::sleep(
+                        wake_at
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(20)),
+                    );
+                }
                 if shutdown.load(Ordering::Acquire) {
                     break;
                 }
+                let deadline = Instant::now() + RECONCILIATION_PASS_TIMEOUT;
                 reload_public_profile(&state);
-                reconcile_workloads(&state);
+                reconcile_workloads_until(&state, deadline);
                 reconcile_routes(&state);
             }
         })
@@ -1462,13 +1643,36 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     );
 
     route_workers.close();
-    let route_join_error = route_workers.join().err();
-    let _ = reconciler_thread.join();
+    let route_join = route_workers.join_until(drain_deadline);
+    let mut unfinished_workers = route_join.as_ref().copied().unwrap_or(0);
+    let mut route_join_error = route_join.err();
+    let probe_workers = state
+        .probe_workers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(workers) = probe_workers {
+        match workers.join_until(drain_deadline) {
+            Ok(unfinished) => unfinished_workers += unfinished,
+            Err(error) => {
+                route_join_error.get_or_insert(error);
+            }
+        }
+    }
+    unfinished_workers += usize::from(!join_thread_until(reconciler_thread, drain_deadline));
+    shutdown.finish();
+    #[cfg(unix)]
+    {
+        unfinished_workers += usize::from(!join_thread_until(control_thread, drain_deadline));
+    }
+    if let Some(metrics_thread) = metrics_thread {
+        unfinished_workers += usize::from(!join_thread_until(metrics_thread, drain_deadline));
+    }
 
     let remaining = state.admission.snapshot().global.in_use;
     let drain_result = if ingress_report.failure.is_some() || route_join_error.is_some() {
         "failed"
-    } else if ingress_report.forced_connections > 0 || remaining > 0 {
+    } else if ingress_report.forced_connections > 0 || remaining > 0 || unfinished_workers > 0 {
         "drain_timeout"
     } else {
         "complete"
@@ -1479,16 +1683,9 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         .min(u128::from(u64::MAX));
     eprintln!(
         "event=ingress_shutdown result={drain_result} duration_ms={duration_ms} \
-         forced_connections={} active_connections={remaining}",
+         forced_connections={} unfinished_workers={unfinished_workers} active_connections={remaining}",
         ingress_report.forced_connections
     );
-
-    shutdown.finish();
-    #[cfg(unix)]
-    let _ = control_thread.join();
-    if let Some(metrics_thread) = metrics_thread {
-        let _ = metrics_thread.join();
-    }
 
     #[cfg(unix)]
     if let Err(error) = std::fs::remove_file(&control_path)
@@ -1504,6 +1701,17 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     }
     eprintln!("TLS proxy stopped");
     Ok(())
+}
+
+fn join_thread_until<T>(worker: thread::JoinHandle<T>, deadline: Instant) -> bool {
+    while !worker.is_finished() && Instant::now() < deadline {
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(5)),
+        );
+    }
+    worker.is_finished() && worker.join().is_ok()
 }
 
 async fn serve_tokio_ingress(
@@ -1993,11 +2201,13 @@ impl HealthCheck {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ControlHealth {
     schema_version: u32,
     live: bool,
     ready: bool,
+    #[serde(default)]
+    draining: bool,
 }
 
 pub fn query_health(check: HealthCheck) -> Result<(String, bool), String> {
@@ -2577,6 +2787,15 @@ fn route_summary_for_profile(state: &ProxyState, profile: &HostingProfile) -> Ro
         .routes
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    route_summary_for_routes(state, profile, &routes, current_unix_seconds())
+}
+
+fn route_summary_for_routes(
+    state: &ProxyState,
+    profile: &HostingProfile,
+    routes: &HashMap<String, ActiveRoute>,
+    now_unix_seconds: u64,
+) -> RouteSummary {
     let Some(snapshot) = profile.public_snapshot() else {
         return RouteSummary {
             hosting_profile: profile.name(),
@@ -2590,7 +2809,6 @@ fn route_summary_for_profile(state: &ProxyState, profile: &HostingProfile) -> Ro
         };
     };
 
-    let now_unix_seconds = current_unix_seconds();
     let active_hostnames = routes
         .iter()
         .filter_map(|(hostname, active)| {
@@ -2737,6 +2955,7 @@ struct ControlJsonStatus {
     hosting_profile: &'static str,
     generation: u64,
     listeners: Vec<String>,
+    listeners_omitted: usize,
     declared_routes: usize,
     required_routes: usize,
     optional_routes: usize,
@@ -2756,33 +2975,29 @@ struct ControlJsonStatus {
 fn degraded_route_statuses(
     state: &ProxyState,
     profile: &HostingProfile,
+    routes: &HashMap<String, ActiveRoute>,
+    now_unix_seconds: u64,
 ) -> Vec<DegradedRouteStatus> {
     let Some(snapshot) = profile.public_snapshot() else {
         return Vec::new();
     };
-    let now_unix_seconds = current_unix_seconds();
-    let (active_hostnames, expired_hostnames) = state
-        .routes
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .fold(
-            (BTreeSet::new(), BTreeSet::new()),
-            |(mut active_hostnames, mut expired_hostnames), (hostname, active)| {
-                if snapshot.routes.get(hostname).is_some_and(|declaration| {
-                    active.declaration_generation == Some(snapshot.generation)
-                        && declaration.workload == active.backend.project
-                        && declaration.role == active.backend.role
-                }) {
-                    if active.certificate_is_valid_at(now_unix_seconds) {
-                        active_hostnames.insert(hostname.clone());
-                    } else {
-                        expired_hostnames.insert(hostname.clone());
-                    }
+    let (active_hostnames, expired_hostnames) = routes.iter().fold(
+        (BTreeSet::new(), BTreeSet::new()),
+        |(mut active_hostnames, mut expired_hostnames), (hostname, active)| {
+            if snapshot.routes.get(hostname).is_some_and(|declaration| {
+                active.declaration_generation == Some(snapshot.generation)
+                    && declaration.workload == active.backend.project
+                    && declaration.role == active.backend.role
+            }) {
+                if active.certificate_is_valid_at(now_unix_seconds) {
+                    active_hostnames.insert(hostname.clone());
+                } else {
+                    expired_hostnames.insert(hostname.clone());
                 }
-                (active_hostnames, expired_hostnames)
-            },
-        );
+            }
+            (active_hostnames, expired_hostnames)
+        },
+    );
     let failures = state
         .route_failures
         .read()
@@ -2825,17 +3040,13 @@ fn degraded_route_statuses(
 }
 
 fn declared_certificate_statuses(
-    state: &ProxyState,
     profile: &HostingProfile,
+    routes: &HashMap<String, ActiveRoute>,
+    now_unix_seconds: u64,
 ) -> (usize, Vec<DeclaredCertificateStatus>) {
     let Some(snapshot) = profile.public_snapshot() else {
         return (0, Vec::new());
     };
-    let now_unix_seconds = current_unix_seconds();
-    let routes = state
-        .routes
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut count = 0;
     let statuses = snapshot
         .routes
@@ -2864,10 +3075,16 @@ fn declared_certificate_statuses(
 
 fn render_json_control_status(state: &ProxyState, shutdown: &IngressShutdown) -> String {
     let profile = state.hosting_profile();
-    let route_summary = route_summary_for_profile(state, &profile);
-    let degraded_routes = degraded_route_statuses(state, &profile);
+    let routes = state
+        .routes
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let now = current_unix_seconds();
+    let route_summary = route_summary_for_routes(state, &profile, &routes, now);
+    let degraded_routes = degraded_route_statuses(state, &profile, &routes, now);
     let (certificate_route_count, certificate_routes) =
-        declared_certificate_statuses(state, &profile);
+        declared_certificate_statuses(&profile, &routes, now);
     let admission = state.admission.snapshot();
     let mut listeners = state
         .listeners
@@ -2895,7 +3112,7 @@ fn render_json_control_status(state: &ProxyState, shutdown: &IngressShutdown) ->
         .config_reload_status
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let status = ControlJsonStatus {
+    let mut status = ControlJsonStatus {
         schema_version: CONTROL_SCHEMA_VERSION,
         live: true,
         draining: shutdown.is_requested(),
@@ -2903,6 +3120,7 @@ fn render_json_control_status(state: &ProxyState, shutdown: &IngressShutdown) ->
         hosting_profile: route_summary.hosting_profile,
         generation: route_summary.config_generation,
         listeners,
+        listeners_omitted: 0,
         declared_routes: route_summary.declared_routes,
         required_routes: route_summary.required_routes,
         optional_routes: route_summary.optional_routes,
@@ -3007,8 +3225,82 @@ fn render_json_control_status(state: &ProxyState, shutdown: &IngressShutdown) ->
             route_capacity_rejections: state.route_capacity_rejections.load(Ordering::Relaxed),
         },
     };
+    drop(reload_status);
     let mut rendered =
         serde_json::to_string(&status).expect("control status contains only JSON-safe values");
+    let mut wire_size = rendered.len() + 1;
+    while wire_size as u64 > CONTROL_RESPONSE_LIMIT {
+        let degraded_size = status.degraded_routes.last().map_or(0, |route| {
+            serde_json::to_vec(route).expect("JSON-safe route").len()
+        });
+        let certificate_size = status.certificate_routes.last().map_or(0, |route| {
+            serde_json::to_vec(route)
+                .expect("JSON-safe certificate")
+                .len()
+        });
+        if degraded_size > 0 && degraded_size >= certificate_size {
+            status.degraded_routes.pop();
+            account_omitted_status_entry(
+                &mut wire_size,
+                &mut status.degraded_routes_omitted,
+                degraded_size,
+                status.degraded_routes.len(),
+            );
+        } else if certificate_size > 0 {
+            status.certificate_routes.pop();
+            account_omitted_status_entry(
+                &mut wire_size,
+                &mut status.certificate_routes_omitted,
+                certificate_size,
+                status.certificate_routes.len(),
+            );
+        } else {
+            // All other fields have fixed, bounded encodings.
+            let listener = status
+                .listeners
+                .pop()
+                .expect("fixed status fields fit the byte budget");
+            let size = serde_json::to_vec(&listener)
+                .expect("JSON-safe listener")
+                .len();
+            account_omitted_status_entry(
+                &mut wire_size,
+                &mut status.listeners_omitted,
+                size,
+                status.listeners.len(),
+            );
+        }
+    }
+    if wire_size != rendered.len() + 1 {
+        rendered = serde_json::to_string(&status).expect("JSON-safe bounded status");
+    }
+    rendered.push('\n');
+    debug_assert_eq!(rendered.len(), wire_size);
+    rendered
+}
+
+fn account_omitted_status_entry(
+    wire_size: &mut usize,
+    omitted: &mut usize,
+    entry_size: usize,
+    remaining: usize,
+) {
+    let previous_digits = omitted.to_string().len();
+    *omitted += 1;
+    *wire_size -= entry_size + usize::from(remaining > 0);
+    *wire_size += omitted.to_string().len() - previous_digits;
+}
+
+fn render_control_health(state: &ProxyState, shutdown: &IngressShutdown) -> String {
+    let ready = route_summary_for_profile(state, &state.hosting_profile()).ready;
+    let draining = shutdown.is_requested();
+    let health = ControlHealth {
+        schema_version: CONTROL_SCHEMA_VERSION,
+        live: true,
+        ready: ready && !draining,
+        draining,
+    };
+    let mut rendered = serde_json::to_string(&health).expect("JSON-safe health status");
     rendered.push('\n');
     rendered
 }
@@ -3419,7 +3711,8 @@ fn render_control_response(
                     state.delivered_handoff_failures.load(Ordering::Relaxed),
             )
         }
-        "STATUS JSON" | "CHECK LIVE" | "CHECK READY" => render_json_control_status(state, shutdown),
+        "STATUS JSON" => render_json_control_status(state, shutdown),
+        "CHECK LIVE" | "CHECK READY" => render_control_health(state, shutdown),
         "ROUTES" => {
             let profile = state.hosting_profile();
             let public_snapshot = profile.public_snapshot();
@@ -3623,6 +3916,11 @@ async fn prepare_handoff(
     tokio::task::spawn_blocking(move || {
         drop(queued);
         let _handoff_permit = permit;
+        // Blocking mode is for this thread's own synchronous PHXP work. It is not
+        // a contract with the workload: SCM_RIGHTS shares the open file
+        // description, so the receiver sees this mode, but `:gen_tcp.fdopen/2`
+        // sets O_NONBLOCK itself on adoption. Do not treat either side's mode as
+        // authoritative — see the freeze analysis in docs/adversarial-audit.md.
         handoff
             .client
             .set_nonblocking(false)
@@ -3894,14 +4192,14 @@ fn resolve_backend_until(
     state: &ProxyState,
     deadline: Instant,
 ) -> Result<Backend, String> {
-    ensure_before_route_deadline(deadline)?;
+    state.check_running_until(deadline)?;
     if let Some(snapshot) = state.public_snapshot() {
         let declaration = snapshot
             .routes
             .get(hostname)
             .cloned()
             .ok_or_else(|| format!("public ingress has no Route Declaration for {hostname}"))?;
-        let assignments = load_public_registry(state, &snapshot)?;
+        let assignments = load_public_registry_until(state, &snapshot, deadline)?;
         ensure_before_route_deadline(deadline)?;
         let backend = match registered_declared_backend(&assignments, &declaration) {
             Ok(backend) => backend,
@@ -3924,7 +4222,12 @@ fn resolve_backend_until(
     let (route_cache_path, route_cache_storage) = state
         .route_cache()
         .expect("development mode has combined route storage");
-    let cached = route_cache::load(route_cache_path, hostname, route_cache_storage)?;
+    let cached = route_cache::load_until(
+        route_cache_path,
+        hostname,
+        route_cache_storage,
+        Some(state.access_deadline(deadline)),
+    )?;
     ensure_before_route_deadline(deadline)?;
     let candidates = candidate_backends_until(&state.config, cached.as_ref(), deadline);
     observe_workloads(state, &candidates);
@@ -3949,23 +4252,6 @@ fn resolve_backend_until(
     })
 }
 
-fn activate_declared_route(
-    hostname: &str,
-    declaration: &RouteDeclaration,
-    generation: u64,
-    backend: Backend,
-    state: &ProxyState,
-) -> Result<Backend, String> {
-    activate_declared_route_until(
-        hostname,
-        declaration,
-        generation,
-        backend,
-        state,
-        Instant::now() + DISCOVERY_TIMEOUT,
-    )
-}
-
 fn activate_declared_route_until(
     hostname: &str,
     declaration: &RouteDeclaration,
@@ -3986,7 +4272,7 @@ fn activate_declared_route_until(
             set_route_failure(state, hostname, RouteFailure::VerificationFailed);
         })?;
     ensure_before_route_deadline(deadline)?;
-    install_active_route(
+    install_active_route_until(
         state,
         hostname,
         ProbeMatch {
@@ -3994,6 +4280,7 @@ fn activate_declared_route_until(
             certificate,
         },
         Some(generation),
+        deadline,
     )
     .inspect_err(|error| {
         if error.contains("capacity") {
@@ -4014,32 +4301,39 @@ fn probe_declared_backend_until(
     state: &ProxyState,
     deadline: Instant,
 ) -> Result<CertificateProof, String> {
-    ensure_before_route_deadline(deadline)?;
-    let permit = state.probes.acquire(deadline).ok_or_else(|| {
-        set_route_failure(state, hostname, RouteFailure::CapacityUnavailable);
-        "certificate probe capacity unavailable".to_string()
-    })?;
-    let (sender, receiver) = mpsc::sync_channel(1);
     let hostname = hostname.to_string();
     let backend = backend.clone();
     let connector = state.probe_connector_override.clone();
-    thread::Builder::new()
-        .name("phx-port-probe".to_string())
-        .spawn(move || {
-            let _permit = permit;
-            let result = probe_backend_until(&hostname, &backend, connector.as_ref(), deadline);
-            let _ = sender.send(result);
-        })
-        .map_err(|error| format!("cannot start bounded certificate probe: {error}"))?;
+    let cancelled = Arc::clone(&state.shutdown_requested);
+    let receiver = state.submit_probe(deadline, move || {
+        probe_backend_until_cancellable(
+            &hostname,
+            &backend,
+            connector.as_ref(),
+            deadline,
+            Some(&cancelled),
+        )
+    })?;
+    receive_probe_until(receiver, state, deadline)
+}
 
-    receiver
-        .recv_timeout(route_deadline_remaining(deadline)?)
-        .map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => "route selection timed out".to_string(),
-            mpsc::RecvTimeoutError::Disconnected => {
-                "certificate probe stopped before returning a result".to_string()
+fn receive_probe_until<T>(
+    receiver: mpsc::Receiver<Result<T, String>>,
+    state: &ProxyState,
+    deadline: Instant,
+) -> Result<T, String> {
+    loop {
+        state.check_running_until(deadline)?;
+        match receiver
+            .recv_timeout(route_deadline_remaining(deadline)?.min(Duration::from_millis(5)))
+        {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("certificate probe stopped before returning a result".to_string());
             }
-        })?
+        }
+    }
 }
 
 fn registered_declared_backend(
@@ -4062,11 +4356,19 @@ fn registered_declared_backend(
     })
 }
 
-fn load_public_registry(
+fn load_public_registry_until(
     state: &ProxyState,
     snapshot: &PublicIngressSnapshot,
+    deadline: Instant,
 ) -> Result<port_registry::LogicalAssignments, String> {
-    let assignments = match port_registry::read_logical_assignments(&state.config) {
+    state.check_running_until(deadline)?;
+    let assignments = match port_registry::read_until(
+        &state.config,
+        port_registry::RegistrySecurity::LogicalWorkload,
+        Some(state.access_deadline(deadline)),
+    )
+    .and_then(|document| port_registry::logical_assignments(&document))
+    {
         Ok(assignments) => assignments,
         Err(error) => {
             record_registry_snapshot_failure(state);
@@ -4233,15 +4535,26 @@ fn observe_workloads(state: &ProxyState, candidates: &[Backend]) -> Vec<Backend>
     Vec::new()
 }
 
+#[cfg(test)]
 fn reconcile_workloads(state: &ProxyState) {
+    reconcile_workloads_until(state, Instant::now() + RECONCILIATION_PASS_TIMEOUT);
+}
+
+fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
+    if state.check_running_until(deadline).is_err() {
+        return;
+    }
     if let Some(snapshot) = state.public_snapshot() {
-        reconcile_public_workloads(state, &snapshot);
+        reconcile_public_workloads(state, &snapshot, deadline);
         return;
     }
     let candidates = candidate_backends(&state.config, None);
     let added = observe_workloads(state, &candidates);
 
     for backend in added {
+        if state.shutdown_requested.load(Ordering::Acquire) {
+            return;
+        }
         if !supports_eager_discovery(&backend) {
             continue;
         }
@@ -4257,6 +4570,9 @@ fn reconcile_workloads(state: &ProxyState) {
         };
 
         for hostname in names {
+            if state.shutdown_requested.load(Ordering::Acquire) {
+                return;
+            }
             let incumbent = state
                 .routes
                 .read()
@@ -4264,9 +4580,13 @@ fn reconcile_workloads(state: &ProxyState) {
                 .and_then(|routes| routes.get(&hostname).cloned());
             if let Some(incumbent) = incumbent {
                 if incumbent.backend != backend
-                    && let Some(_permit) = state.probes.acquire(Instant::now() + DISCOVERY_TIMEOUT)
-                    && probe_backend(&hostname, &backend, state.probe_connector_override.as_ref())
-                        .is_ok()
+                    && probe_declared_backend_until(
+                        &hostname,
+                        &backend,
+                        state,
+                        Instant::now() + DISCOVERY_TIMEOUT,
+                    )
+                    .is_ok()
                 {
                     record_conflict(state, &hostname, vec![incumbent.backend, backend.clone()]);
                 }
@@ -4292,119 +4612,260 @@ fn reconcile_workloads(state: &ProxyState) {
     }
 }
 
-fn reconcile_public_workloads(state: &ProxyState, snapshot: &PublicIngressSnapshot) {
-    let assignments = match load_public_registry(state, snapshot) {
+enum ReconciledProbe {
+    Alive,
+    Unreachable,
+    Certificate(Result<CertificateProof, String>),
+}
+
+fn reconcile_public_workloads(
+    state: &ProxyState,
+    snapshot: &PublicIngressSnapshot,
+    deadline: Instant,
+) {
+    let assignments = match load_public_registry_until(state, snapshot, deadline) {
         Ok(assignments) => assignments,
         Err(_) => return,
     };
-
-    for (hostname, declaration) in &snapshot.routes {
-        let desired = match registered_declared_backend(&assignments, declaration) {
-            Ok(backend) => backend,
-            Err(_) => {
-                deactivate_route(state, hostname, false, "missing_registration");
-                set_route_failure(state, hostname, RouteFailure::MissingRegistration);
-                continue;
-            }
-        };
-        let active = state
-            .routes
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(hostname)
-            .cloned();
-        let active = match active {
-            Some(active)
-                if active.declaration_generation == Some(snapshot.generation)
-                    && active.backend == desired =>
-            {
-                Some(active)
-            }
-            Some(_) => {
-                deactivate_route(state, hostname, false, "declaration_changed");
-                None
-            }
-            None => None,
-        };
-
-        if let Some(active) = active {
-            let now_unix_seconds = current_unix_seconds();
-            if !active.certificate_is_valid_at(now_unix_seconds) {
-                deactivate_expired_route(state, hostname, now_unix_seconds);
-                continue;
-            }
-            if !is_port_open(i64::from(active.backend.port)) {
-                record_tcp_failure(state, hostname);
-                continue;
-            }
-            let recovered = active.tcp_failures > 0;
-            let tls_due = active.last_tls_check.elapsed() >= TLS_REVALIDATION_INTERVAL;
-            if recovered || tls_due {
-                revalidate_declared_route(state, snapshot, hostname, &active);
-            } else {
-                if let Ok(mut routes) = state.routes.write()
-                    && let Some(route) = routes.get_mut(hostname)
-                {
-                    route.tcp_failures = 0;
-                }
-                clear_route_failure(state, hostname);
-            }
-            continue;
-        }
-
-        let retry_suppressed = match state.negative.lock() {
-            Ok(mut negative) => {
-                let now = Instant::now();
-                negative.retain(|_, expires_at| *expires_at > now);
-                negative.contains_key(hostname)
-            }
-            Err(_) => return,
-        };
-        if retry_suppressed {
-            continue;
-        }
-        if activate_declared_route(hostname, declaration, snapshot.generation, desired, state)
-            .is_err()
+    let suppressed = {
+        let mut negative = state
+            .negative
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        negative.retain(|_, expires| *expires > now);
+        negative.keys().cloned().collect::<BTreeSet<_>>()
+    };
+    let declarations = snapshot.routes.iter().collect::<Vec<_>>();
+    if declarations.is_empty() {
+        return;
+    }
+    let start = state.reconciliation_cursor.load(Ordering::Relaxed) % declarations.len();
+    let mut examined = 0;
+    let launch_deadline = deadline.checked_sub(PROBE_TIMEOUT).unwrap_or(deadline);
+    while examined < declarations.len() && state.check_running_until(launch_deadline).is_ok() {
+        let mut pending = Vec::with_capacity(MAX_RECONCILIATION_PROBES);
+        while examined < declarations.len()
+            && pending.len() < MAX_RECONCILIATION_PROBES
+            && state.check_running_until(launch_deadline).is_ok()
         {
-            cache_negative(state, hostname);
+            let index = (start + examined) % declarations.len();
+            let (hostname, declaration) = declarations[index];
+            examined += 1;
+            state
+                .reconciliation_cursor
+                .store((index + 1) % declarations.len(), Ordering::Relaxed);
+            let profile = state
+                .hosting_profile
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if profile
+                .public_snapshot()
+                .is_none_or(|current| current.generation != snapshot.generation)
+            {
+                return;
+            }
+            let desired = match registered_declared_backend(&assignments, declaration) {
+                Ok(backend) => backend,
+                Err(_) => {
+                    deactivate_route(state, hostname, false, "missing_registration");
+                    set_route_failure(state, hostname, RouteFailure::MissingRegistration);
+                    continue;
+                }
+            };
+            let active = state
+                .routes
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(hostname)
+                .cloned();
+            let active = match active {
+                Some(active)
+                    if active.declaration_generation == Some(snapshot.generation)
+                        && active.backend == desired =>
+                {
+                    Some(active)
+                }
+                Some(_) => {
+                    deactivate_route(state, hostname, false, "declaration_changed");
+                    None
+                }
+                None => None,
+            };
+            if active
+                .as_ref()
+                .is_some_and(|active| !active.certificate_is_valid_at(current_unix_seconds()))
+            {
+                deactivate_expired_route(state, hostname, current_unix_seconds());
+                continue;
+            }
+            if active.is_none() && suppressed.contains(hostname) {
+                continue;
+            }
+            drop(profile);
+            let was_active = active.is_some();
+            let verify = active.as_ref().is_none_or(|active| {
+                active.tcp_failures > 0
+                    || active.last_tls_check.elapsed() >= TLS_REVALIDATION_INTERVAL
+            });
+            let job_hostname = hostname.clone();
+            let job_backend = desired.clone();
+            let connector = state.probe_connector_override.clone();
+            let cancelled = Arc::clone(&state.shutdown_requested);
+            let probe_deadline = deadline.min(Instant::now() + PROBE_TIMEOUT);
+            let Some(background_permit) = state.reconciliation_probes.acquire(probe_deadline)
+            else {
+                continue;
+            };
+            match state.submit_probe(probe_deadline, move || {
+                let _background_permit = background_permit;
+                if was_active
+                    && connect_backend_with_timeout(
+                        &job_backend,
+                        route_deadline_remaining(probe_deadline)?.min(Duration::from_millis(100)),
+                    )
+                    .is_err()
+                {
+                    return Ok(ReconciledProbe::Unreachable);
+                }
+                if verify {
+                    Ok(ReconciledProbe::Certificate(
+                        probe_backend_until_cancellable(
+                            &job_hostname,
+                            &job_backend,
+                            connector.as_ref(),
+                            probe_deadline,
+                            Some(&cancelled),
+                        ),
+                    ))
+                } else {
+                    Ok(ReconciledProbe::Alive)
+                }
+            }) {
+                Ok(receiver) => pending.push((hostname.clone(), desired, active, receiver)),
+                Err(_) => {
+                    if state.check_running_until(deadline).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        if pending.is_empty() {
+            break;
+        }
+        for (hostname, backend, active, receiver) in pending {
+            let result = receive_probe_until(receiver, state, deadline);
+            if state.check_running_until(deadline).is_err() {
+                return;
+            }
+            apply_reconciled_probe(
+                state, snapshot, &hostname, backend, active, result, deadline,
+            );
         }
     }
 }
 
-fn revalidate_declared_route(
+fn route_observation_matches(
+    current: Option<&ActiveRoute>,
+    observed: Option<&ActiveRoute>,
+) -> bool {
+    match (current, observed) {
+        (None, None) => true,
+        (Some(current), Some(observed)) => {
+            current.backend == observed.backend
+                && current.declaration_generation == observed.declaration_generation
+                && current.last_tls_check == observed.last_tls_check
+                && current.certificate.fingerprint == observed.certificate.fingerprint
+        }
+        _ => false,
+    }
+}
+
+fn apply_reconciled_probe(
     state: &ProxyState,
     snapshot: &PublicIngressSnapshot,
     hostname: &str,
-    route: &ActiveRoute,
+    backend: Backend,
+    observed: Option<ActiveRoute>,
+    result: Result<ReconciledProbe, String>,
+    deadline: Instant,
 ) {
-    let Some(_permit) = state.probes.acquire(Instant::now() + DISCOVERY_TIMEOUT) else {
-        set_route_failure(state, hostname, RouteFailure::CapacityUnavailable);
-        return;
-    };
-    let certificate = match probe_backend(
-        hostname,
-        &route.backend,
-        state.probe_connector_override.as_ref(),
-    ) {
-        Ok(certificate) => certificate,
-        Err(_) => {
-            deactivate_route(state, hostname, false, "verification_failed");
-            set_route_failure(state, hostname, RouteFailure::VerificationFailed);
-            return;
+    if let Ok(ReconciledProbe::Certificate(Ok(certificate))) = result {
+        let activated = install_active_route_observed_until(
+            state,
+            hostname,
+            ProbeMatch {
+                backend: backend.clone(),
+                certificate,
+            },
+            Some(snapshot.generation),
+            deadline.min(Instant::now() + DISCOVERY_TIMEOUT),
+            Some(&observed),
+        );
+        if activated.is_ok() {
+            clear_route_failure(state, hostname);
+            if observed.is_none() {
+                eprintln!(
+                    "event=route result=activated hostname={hostname} workload={} role={} backend_port={}",
+                    backend.project, backend.role, backend.port
+                );
+            }
         }
-    };
-    if install_active_route(
-        state,
-        hostname,
-        ProbeMatch {
-            backend: route.backend.clone(),
-            certificate,
-        },
-        Some(snapshot.generation),
-    )
-    .is_ok()
+        return;
+    }
+    let profile = state
+        .hosting_profile
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if profile
+        .public_snapshot()
+        .is_none_or(|current| current.generation != snapshot.generation)
     {
-        clear_route_failure(state, hostname);
+        return;
+    }
+    let mut routes = state
+        .routes
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !route_observation_matches(routes.get(hostname), observed.as_ref()) {
+        return;
+    }
+    match result {
+        Ok(ReconciledProbe::Alive) => {
+            if let Some(route) = routes.get_mut(hostname) {
+                route.tcp_failures = 0;
+            }
+            drop(routes);
+            clear_route_failure(state, hostname);
+        }
+        Ok(ReconciledProbe::Unreachable) => {
+            if let Some(route) = routes.get_mut(hostname) {
+                route.tcp_failures = route.tcp_failures.saturating_add(1);
+                if route.tcp_failures >= TCP_FAILURE_THRESHOLD {
+                    routes.remove(hostname);
+                    eprintln!(
+                        "event=route result=deactivated hostname={hostname} reason=backend_unavailable"
+                    );
+                }
+            }
+        }
+        Ok(ReconciledProbe::Certificate(Err(_))) => {
+            routes.remove(hostname);
+            drop(routes);
+            set_route_failure(state, hostname, RouteFailure::VerificationFailed);
+            if observed.is_none() {
+                cache_negative(state, hostname);
+            } else {
+                eprintln!(
+                    "event=route result=deactivated hostname={hostname} reason=verification_failed"
+                );
+            }
+        }
+        Err(_) => {
+            drop(routes);
+            set_route_failure(state, hostname, RouteFailure::CapacityUnavailable);
+        }
+        Ok(ReconciledProbe::Certificate(Ok(_))) => unreachable!(),
     }
 }
 
@@ -4416,9 +4877,11 @@ fn default_certificate_dns_names(
     state: &ProxyState,
     backend: &Backend,
 ) -> Result<Vec<String>, String> {
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    state.check_running_until(deadline)?;
     let _permit = state
         .probes
-        .acquire(Instant::now() + DISCOVERY_TIMEOUT)
+        .acquire(deadline)
         .ok_or_else(|| "probe capacity unavailable".to_string())?;
     let stream = connect_backend_with_timeout(backend, PROBE_TIMEOUT)
         .map_err(|error| format!("TCP connection failed: {error}"))?;
@@ -4429,9 +4892,13 @@ fn default_certificate_dns_names(
     let connector = builder
         .build()
         .map_err(|error| format!("cannot create TLS connector: {error}"))?;
-    let tls = connector
-        .connect("localhost", stream)
-        .map_err(|error| format!("no-SNI TLS handshake failed: {error}"))?;
+    let tls = tls_connect_until(
+        &connector,
+        "localhost",
+        stream,
+        deadline,
+        Some(&state.shutdown_requested),
+    )?;
     let certificate = tls
         .peer_certificate()
         .map_err(|error| format!("cannot inspect default certificate: {error}"))?
@@ -4467,7 +4934,7 @@ fn dns_names_from_certificate(der: &[u8]) -> Result<Vec<String>, String> {
 }
 
 fn reconcile_routes(state: &ProxyState) {
-    if state.public_snapshot().is_some() {
+    if state.shutdown_requested.load(Ordering::Acquire) || state.public_snapshot().is_some() {
         return;
     }
     let routes: Vec<(String, ActiveRoute)> = match state.routes.read() {
@@ -4479,6 +4946,9 @@ fn reconcile_routes(state: &ProxyState) {
     };
 
     for (hostname, route) in routes {
+        if state.shutdown_requested.load(Ordering::Acquire) {
+            return;
+        }
         let now_unix_seconds = current_unix_seconds();
         if !route.certificate_is_valid_at(now_unix_seconds) {
             deactivate_expired_route(state, &hostname, now_unix_seconds);
@@ -4507,13 +4977,12 @@ fn reconcile_routes(state: &ProxyState) {
 }
 
 fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRoute) {
-    if let Some(_permit) = state.probes.acquire(Instant::now() + DISCOVERY_TIMEOUT)
-        && let Ok(certificate) = probe_backend(
-            hostname,
-            &incumbent.backend,
-            state.probe_connector_override.as_ref(),
-        )
-    {
+    if let Ok(certificate) = probe_declared_backend_until(
+        hostname,
+        &incumbent.backend,
+        state,
+        Instant::now() + DISCOVERY_TIMEOUT,
+    ) {
         clear_conflict(state, hostname);
         let _ = install_active_route(
             state,
@@ -4527,6 +4996,9 @@ fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRou
         return;
     }
 
+    if state.shutdown_requested.load(Ordering::Acquire) {
+        return;
+    }
     let Some((route_cache_path, route_cache_storage)) = state.route_cache() else {
         return;
     };
@@ -4574,16 +5046,48 @@ fn install_active_route(
     matched: ProbeMatch,
     declaration_generation: Option<u64>,
 ) -> Result<(), String> {
+    install_active_route_until(
+        state,
+        hostname,
+        matched,
+        declaration_generation,
+        Instant::now() + DISCOVERY_TIMEOUT,
+    )
+}
+
+fn install_active_route_until(
+    state: &ProxyState,
+    hostname: &str,
+    matched: ProbeMatch,
+    declaration_generation: Option<u64>,
+    deadline: Instant,
+) -> Result<(), String> {
+    install_active_route_observed_until(
+        state,
+        hostname,
+        matched,
+        declaration_generation,
+        deadline,
+        None,
+    )
+}
+
+fn install_active_route_observed_until(
+    state: &ProxyState,
+    hostname: &str,
+    matched: ProbeMatch,
+    declaration_generation: Option<u64>,
+    deadline: Instant,
+    observed: Option<&Option<ActiveRoute>>,
+) -> Result<(), String> {
+    let _transaction = state.cache_transaction_until(deadline)?;
     let now_unix_seconds = current_unix_seconds();
     let expiry_state = matched.certificate.expiry_state_at(now_unix_seconds);
     if expiry_state == CertificateExpiryState::Expired {
         return Err("certificate expired before route activation".to_string());
     }
-    let profile = state
-        .hosting_profile
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match (declaration_generation, &*profile) {
+    let profile = state.hosting_profile();
+    match (declaration_generation, &profile) {
         (Some(generation), HostingProfile::Public(snapshot))
             if snapshot.generation == generation =>
         {
@@ -4614,10 +5118,15 @@ fn install_active_route(
     }
     let route_cache = state.route_cache_for_profile(&profile);
 
-    let mut routes = state
+    let routes = state
         .routes
-        .write()
+        .read()
         .map_err(|_| "route table lock poisoned".to_string())?;
+    if observed
+        .is_some_and(|observed| !route_observation_matches(routes.get(hostname), observed.as_ref()))
+    {
+        return Err("route changed while certificate proof was pending".to_string());
+    }
     if !routes.contains_key(hostname) && routes.len() >= MAX_VERIFIED_ROUTES {
         let _ = state.route_capacity_rejections.fetch_update(
             Ordering::AcqRel,
@@ -4653,15 +5162,33 @@ fn install_active_route(
         (Some(previous), Some(current)) => Some(previous.max(current)),
         (previous, current) => previous.or(current),
     };
-    if let Some((route_cache_path, route_cache_storage)) = route_cache {
-        route_cache::store(
+    drop(routes);
+    if !same_certificate && let Some((route_cache_path, route_cache_storage)) = route_cache {
+        route_cache::store_until(
             route_cache_path,
             route_cache_storage,
             hostname,
             &matched.backend.project,
             &matched.backend.role,
             &matched.certificate.fingerprint,
-        )?;
+            Some(state.access_deadline(deadline)),
+        )
+        .inspect_err(|_| eprintln!("event=route_state_update result=failed"))?;
+    }
+    state.check_running_until(deadline)?;
+    if matched.certificate.expiry_state_at(current_unix_seconds())
+        == CertificateExpiryState::Expired
+    {
+        return Err("certificate expired before route activation".to_string());
+    }
+    let mut routes = state
+        .routes
+        .write()
+        .map_err(|_| "route table lock poisoned".to_string())?;
+    if observed
+        .is_some_and(|observed| !route_observation_matches(routes.get(hostname), observed.as_ref()))
+    {
+        return Err("route changed while certificate proof was pending".to_string());
     }
     routes.insert(
         hostname.to_string(),
@@ -4744,6 +5271,8 @@ fn deactivate_expired_route(state: &ProxyState, hostname: &str, now_unix_seconds
 }
 
 fn deactivate_route(state: &ProxyState, hostname: &str, remove_cached: bool, reason: &'static str) {
+    let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+    let transaction = remove_cached.then(|| state.cache_transaction_until(deadline));
     let removed = state
         .routes
         .write()
@@ -4755,7 +5284,14 @@ fn deactivate_route(state: &ProxyState, hostname: &str, remove_cached: bool, rea
     }
     if remove_cached
         && let Some((route_cache_path, route_cache_storage)) = state.route_cache()
-        && route_cache::remove(route_cache_path, route_cache_storage, hostname).is_err()
+        && (transaction.as_ref().is_some_and(Result::is_err)
+            || route_cache::remove_until(
+                route_cache_path,
+                route_cache_storage,
+                hostname,
+                Some(state.access_deadline(deadline)),
+            )
+            .is_err())
     {
         eprintln!("event=route_state_update result=failed");
     }
@@ -4859,36 +5395,36 @@ fn probe_candidates_until(
     let launch_deadline = deadline.checked_sub(PROBE_TIMEOUT).unwrap_or(deadline);
 
     for backend in candidates {
-        if Instant::now() >= launch_deadline {
+        if state.check_running_until(launch_deadline).is_err() {
             break;
         }
         let sender = sender.clone();
         let hostname = hostname.to_string();
-        let probes = Arc::clone(&state.probes);
         let connector = state.probe_connector_override.clone();
-        let Some(permit) = probes.acquire(launch_deadline) else {
-            break;
-        };
-        if let Err(error) = thread::Builder::new()
-            .name("phx-port-probe".to_string())
-            .spawn(move || {
-                let _permit = permit;
-                match probe_backend_until(&hostname, &backend, connector.as_ref(), deadline) {
-                    Ok(certificate) => {
-                        let _ = sender.send(ProbeMatch {
-                            backend,
-                            certificate,
-                        });
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "Probe rejected {hostname} at 127.0.0.1:{} ({} {}): {error}",
-                            backend.port, backend.project, backend.role
-                        );
-                    }
+        let cancelled = Arc::clone(&state.shutdown_requested);
+        if let Err(error) = state.submit_probe(deadline, move || {
+            match probe_backend_until_cancellable(
+                &hostname,
+                &backend,
+                connector.as_ref(),
+                deadline,
+                Some(&cancelled),
+            ) {
+                Ok(certificate) => {
+                    let _ = sender.send(ProbeMatch {
+                        backend,
+                        certificate,
+                    });
                 }
-            })
-        {
+                Err(error) => {
+                    eprintln!(
+                        "Probe rejected {hostname} at 127.0.0.1:{} ({} {}): {error}",
+                        backend.port, backend.project, backend.role
+                    );
+                }
+            }
+            Ok(())
+        }) {
             eprintln!("Cannot start bounded certificate probe: {error}");
             break;
         }
@@ -4965,6 +5501,19 @@ fn probe_backend_until(
     connector_override: Option<&TlsConnector>,
     deadline: Instant,
 ) -> Result<CertificateProof, String> {
+    probe_backend_until_cancellable(hostname, backend, connector_override, deadline, None)
+}
+
+fn probe_backend_until_cancellable(
+    hostname: &str,
+    backend: &Backend,
+    connector_override: Option<&TlsConnector>,
+    deadline: Instant,
+    cancelled: Option<&AtomicBool>,
+) -> Result<CertificateProof, String> {
+    if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+        return Err("ingress is shutting down".to_string());
+    }
     let remaining = route_deadline_remaining(deadline)?;
     let stream = connect_backend_with_timeout(backend, remaining.min(PROBE_TIMEOUT))
         .map_err(|error| format!("TCP connection failed: {error}"))?;
@@ -4976,9 +5525,7 @@ fn probe_backend_until(
             TlsConnector::new().map_err(|error| format!("cannot create TLS connector: {error}"))?;
         &system_connector
     };
-    let tls = connector
-        .connect(hostname, stream)
-        .map_err(|error| format!("TLS validation failed: {error}"))?;
+    let tls = tls_connect_until(connector, hostname, stream, deadline, cancelled)?;
     ensure_before_route_deadline(deadline)?;
     let certificate = tls
         .peer_certificate()
@@ -5084,15 +5631,150 @@ mod tests {
     use toml_edit::value;
 
     fn tempdir() -> io::Result<TempDir> {
-        #[cfg(unix)]
-        let root = Path::new("/tmp").canonicalize()?;
-        #[cfg(not(unix))]
-        let root = std::env::temp_dir().canonicalize()?;
-        tempdir_in(root)
+        let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                #[cfg(unix)]
+                {
+                    PathBuf::from("/tmp")
+                }
+                #[cfg(not(unix))]
+                {
+                    std::env::temp_dir()
+                }
+            });
+        tempdir_in(root.canonicalize()?)
     }
 
     fn running_shutdown() -> IngressShutdown {
         IngressShutdown::new(Duration::from_secs(1))
+    }
+
+    #[test]
+    fn cache_persistence_does_not_lock_warm_routes_or_status() {
+        let directory = tempdir().unwrap();
+        let state = Arc::new(ProxyState::new(directory.path().join("ports.toml")));
+        let matched = || super::ProbeMatch {
+            backend: backend(),
+            certificate: active_route(backend()).certificate,
+        };
+        install_active_route(&state, "warm.example", matched(), None).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join("ports.toml.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let worker_state = Arc::clone(&state);
+        let writer = thread::spawn(move || {
+            install_active_route(&worker_state, "cold.example", matched(), None)
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state.route_cache_transaction.try_lock().is_ok() && state.routes.try_read().is_ok() {
+            assert!(Instant::now() < deadline, "cache update did not start");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reader_state = Arc::clone(&state);
+        let reader = thread::spawn(move || {
+            let status = render_control_response(&reader_state, &running_shutdown(), "STATUS JSON");
+            assert!(
+                reader_state
+                    .routes
+                    .read()
+                    .unwrap()
+                    .contains_key("warm.example")
+            );
+            sender.send(status).unwrap();
+        });
+        let response = receiver.recv_timeout(Duration::from_millis(100));
+        fs2::FileExt::unlock(&lock).unwrap();
+        writer.join().unwrap().unwrap();
+        reader.join().unwrap();
+        assert!(
+            response.is_ok(),
+            "cache persistence blocked the routing/status locks"
+        );
+        assert!(
+            route_cache::load(
+                &state.config,
+                "cold.example",
+                route_cache::Storage::CombinedRegistry
+            )
+            .unwrap()
+            .is_some(),
+            "successful publication must persist the new route"
+        );
+    }
+
+    #[test]
+    fn unchanged_certificate_refresh_does_not_rewrite_cache() {
+        let directory = tempdir().unwrap();
+        let state = Arc::new(ProxyState::new(directory.path().join("ports.toml")));
+        let matched = ProbeMatch {
+            backend: backend(),
+            certificate: active_route(backend()).certificate,
+        };
+        install_active_route(
+            &state,
+            "warm.example",
+            ProbeMatch {
+                backend: matched.backend.clone(),
+                certificate: matched.certificate.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        let contents = fs::read(&state.config).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join("ports.toml.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let worker_state = Arc::clone(&state);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            sender
+                .send(install_active_route(
+                    &worker_state,
+                    "warm.example",
+                    matched,
+                    None,
+                ))
+                .unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_millis(100));
+        fs2::FileExt::unlock(&lock).unwrap();
+        worker.join().unwrap();
+        result
+            .expect("unchanged proof unnecessarily waited for the cache file")
+            .unwrap();
+        assert_eq!(contents, fs::read(&state.config).unwrap());
+    }
+
+    #[test]
+    fn expired_discovery_leader_always_completes_and_removes_its_flight() {
+        let state = Arc::new(ProxyState::new(PathBuf::from("unused")));
+        let flights = state.flights.lock().unwrap();
+        let worker_state = Arc::clone(&state);
+        let worker = thread::spawn(move || {
+            worker_state.discover_once_until(
+                "expired.example",
+                Instant::now() + Duration::from_millis(50),
+                |_| panic!("an expired leader must not probe"),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state.waiting_clients.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(60));
+        drop(flights);
+        assert!(worker.join().unwrap().is_err());
+        assert!(state.flights.lock().unwrap().is_empty());
+        assert_eq!(state.waiting_clients.load(Ordering::Acquire), 0);
     }
 
     fn backend() -> Backend {
@@ -5439,6 +6121,172 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn silent_public_workloads(count: usize) -> (TempDir, TcpListener, ProxyState) {
+        let directory = tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let registry = write_logical_registry(
+            directory.path(),
+            &[("silent", listener.local_addr().unwrap().port())],
+        );
+        let HostingProfile::Public(mut snapshot) = public_profile("silent-0.example", "silent")
+        else {
+            unreachable!()
+        };
+        let declaration = snapshot.routes.values().next().unwrap().clone();
+        Arc::make_mut(&mut snapshot).routes = (0..count)
+            .map(|index| {
+                let mut declaration = declaration.clone();
+                declaration.hostname = format!("silent-{index}.example");
+                (declaration.hostname.clone(), declaration)
+            })
+            .collect();
+        let state = ProxyState::new_with_profile_and_connector(
+            registry,
+            HostingProfile::Public(snapshot),
+            TlsConnector::new().unwrap(),
+        );
+        (directory, listener, state)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_reconciliation_does_not_start_workload_probes() {
+        let (_directory, listener, state) = silent_public_workloads(8);
+        state.shutdown_requested.store(true, Ordering::Release);
+        let started = Instant::now();
+        reconcile_workloads(&state);
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "reconciliation connected after shutdown"
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_probes_silent_workloads_concurrently() {
+        let (_directory, _listener, state) = silent_public_workloads(8);
+        let started = Instant::now();
+        reconcile_workloads(&state);
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "eight independent 200ms probes ran serially: {:?}",
+            started.elapsed()
+        );
+        assert!(state.routes.read().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reconciliation_resumes_after_the_previous_batch() {
+        let (_directory, _listener, state) =
+            silent_public_workloads(super::MAX_RECONCILIATION_PROBES + 1);
+        let snapshot = state.public_snapshot().unwrap();
+        let last = snapshot.routes.keys().last().unwrap();
+        super::reconcile_workloads_until(&state, Instant::now() + Duration::from_millis(300));
+        assert_eq!(
+            state.reconciliation_cursor.load(Ordering::Relaxed),
+            super::MAX_RECONCILIATION_PROBES
+        );
+        assert!(!state.negative.lock().unwrap().contains_key(last));
+        super::reconcile_workloads_until(&state, Instant::now() + Duration::from_millis(300));
+        assert!(
+            state.negative.lock().unwrap().contains_key(last),
+            "later declarations were starved"
+        );
+    }
+
+    #[test]
+    fn foreground_probes_keep_capacity_during_background_reconciliation() {
+        let state = ProxyState::new(PathBuf::from("unused"));
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut background = Vec::new();
+        for _ in 0..super::MAX_RECONCILIATION_PROBES {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let permit = state.reconciliation_probes.acquire(deadline).unwrap();
+            let gate = Arc::clone(&gate);
+            background.push(
+                state
+                    .submit_probe(deadline, move || {
+                        let _permit = permit;
+                        let (lock, changed) = &*gate;
+                        let _ = changed
+                            .wait_timeout_while(
+                                lock.lock().unwrap(),
+                                Duration::from_secs(2),
+                                |open| !*open,
+                            )
+                            .unwrap();
+                        Ok(())
+                    })
+                    .unwrap(),
+            );
+        }
+        assert!(
+            state
+                .reconciliation_probes
+                .acquire(Instant::now() + Duration::from_millis(10))
+                .is_none()
+        );
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let foreground = (0..super::ROUTE_SELECTION_WORKERS)
+            .map(|_| state.submit_probe(deadline, || Ok(())).unwrap())
+            .collect::<Vec<_>>();
+        for receiver in foreground {
+            super::receive_probe_until(receiver, &state, deadline).unwrap();
+        }
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        for receiver in background {
+            super::receive_probe_until(receiver, &state, Instant::now() + Duration::from_secs(1))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn stale_reconciliation_cannot_remove_a_refreshed_route() {
+        let directory = tempdir().unwrap();
+        let state = ProxyState::new_with_profile(
+            directory.path().join("ports.toml"),
+            public_profile("www.example.test", "web"),
+        );
+        let backend = Backend {
+            project: "web".into(),
+            role: "https".into(),
+            port: 4401,
+        };
+        let mut observed = active_route(backend.clone());
+        observed.declaration_generation = Some(1);
+        let mut refreshed = observed.clone();
+        refreshed.certificate.fingerprint = "BB:CC".into();
+        refreshed.last_tls_check = Instant::now();
+        state
+            .routes
+            .write()
+            .unwrap()
+            .insert("www.example.test".into(), refreshed);
+        super::apply_reconciled_probe(
+            &state,
+            &state.public_snapshot().unwrap(),
+            "www.example.test",
+            backend,
+            Some(observed),
+            Ok(super::ReconciledProbe::Certificate(Err(
+                "old probe failed".into()
+            ))),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert_eq!(
+            state.routes.read().unwrap()["www.example.test"]
+                .certificate
+                .fingerprint,
+            "BB:CC"
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn late_public_workload_activates_only_after_registration_and_certificate_proof() {
         const HOSTNAME: &str = "late.example.test";
@@ -5671,12 +6519,125 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn handoff_connect_timeout_returns_fallback_and_releases_admission() {
+        let directory = tempdir().unwrap();
+        fs::create_dir(directory.path().join("handoff")).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let runtime_path = directory
+            .path()
+            .strip_prefix(&cwd)
+            .unwrap_or(directory.path())
+            .to_path_buf();
+        let backend = Backend {
+            project: "/project".into(),
+            role: "https".into(),
+            port: 1,
+        };
+        let path = handoff::endpoint_path(
+            EndpointIdentity::Development(&backend.project),
+            "https",
+            Some(&runtime_path),
+        )
+        .unwrap();
+        let address = UnixAddr::new(&path).unwrap();
+        let listener = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        bind(listener.as_raw_fd(), &address).unwrap();
+        listen(&listener, Backlog::new(1).unwrap()).unwrap();
+        let queued = (0..2)
+            .map(|_| {
+                let socket = socket(
+                    AddressFamily::Unix,
+                    SockType::SeqPacket,
+                    SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+                    None,
+                )
+                .unwrap();
+                nix::sys::socket::connect(socket.as_raw_fd(), &address).unwrap();
+                socket
+            })
+            .collect::<Vec<_>>();
+        let limits = IngressLimits {
+            active_connections: 1,
+            pre_routing_connections: 1,
+            relay_connections: 1,
+            handoff_negotiations: 1,
+            ..IngressLimits::default()
+        }
+        .validate(
+            SystemCapacity {
+                file_descriptors: None,
+                tasks: None,
+            },
+            1,
+        )
+        .unwrap();
+        let state = Arc::new(ProxyState::with_limits(
+            directory.path().join("ports.toml"),
+            None,
+            HostingProfile::Development,
+            Some(runtime_path),
+            limits,
+            None,
+        ));
+        let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = TcpStream::connect(frontend.local_addr().unwrap()).unwrap();
+        let (client, source) = frontend.accept().unwrap();
+        let job = HandoffJob {
+            client,
+            accepted_at: Instant::now(),
+            admission: state.admission.try_admit(source.ip()).unwrap(),
+            hostname: "www.example.test".into(),
+            peeked_length: 0,
+            backend,
+            cached: true,
+            relay_idle_timeout: None,
+        };
+        drop(peer);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                prepare_handoff(job, Arc::clone(&state)),
+            )
+            .await
+        });
+        if result.is_err() {
+            drop(listener);
+            drop(queued);
+            runtime.shutdown_timeout(Duration::from_secs(1));
+            panic!("handoff connect retained its admission beyond the connect deadline");
+        }
+        let fallback = result
+            .unwrap()
+            .unwrap()
+            .expect("pre-delivery failure must allow relay");
+        assert_eq!(state.handoff_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(state.admission.snapshot().handoff.in_use, 0);
+        drop(fallback);
+        let admission = state.admission.snapshot();
+        assert_eq!(admission.global.in_use, 0);
+        assert_eq!(admission.pre_routing.in_use, 0);
+        assert!(state.admission.try_admit(source.ip()).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn saturated_async_handoff_falls_back_without_queueing() {
         const PROJECT: &str = "/project";
 
         let directory = tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let runtime_directory = directory.path().join("runtime");
+        let runtime_directory = handoff::short_test_runtime(&directory.path().join("runtime"));
         fs::create_dir(&runtime_directory).unwrap();
         fs::set_permissions(&runtime_directory, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(runtime_directory.join("handoff")).unwrap();
@@ -5822,7 +6783,7 @@ mod tests {
 
         let directory = tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let runtime_directory = directory.path().join("runtime");
+        let runtime_directory = handoff::short_test_runtime(&directory.path().join("runtime"));
         fs::create_dir(&runtime_directory).unwrap();
         fs::set_permissions(&runtime_directory, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(runtime_directory.join("handoff")).unwrap();
@@ -5995,7 +6956,7 @@ mod tests {
 
         let directory = tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let runtime = directory.path().join("runtime");
+        let runtime = handoff::short_test_runtime(&directory.path().join("runtime"));
         fs::create_dir(&runtime).unwrap();
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(runtime.join("handoff")).unwrap();
@@ -7331,6 +8292,115 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reload_pruning_is_ordered_after_pending_cache_writes() {
+        const HOSTNAME: &str = "www.example.com";
+        let directory = tempdir().unwrap();
+        let registry = write_logical_registry(directory.path(), &[("web", 4401)]);
+        let ingress_config = directory.path().join("ingress.toml");
+        fs::write(&ingress_config, "[ingress]\nmode = \"public\"\n[ingress.hosts.\"www.example.com\"]\nworkload = \"web\"\nrole = \"https\"\n").unwrap();
+        let profile = HostingProfile::load(Some(ingress_config.clone())).unwrap();
+        let state = Arc::new(ProxyState::new_with_production_paths(
+            profile,
+            ProductionPaths {
+                port_registry: registry,
+                route_cache: directory.path().join("routes.toml"),
+                runtime_root: directory.path().join("runtime"),
+            },
+        ));
+        let backend = Backend {
+            project: "web".into(),
+            role: "https".into(),
+            port: 4401,
+        };
+        let proof = |fingerprint: &str| CertificateProof {
+            fingerprint: fingerprint.into(),
+            not_after_unix_seconds: u64::MAX,
+        };
+        install_active_route(
+            &state,
+            HOSTNAME,
+            ProbeMatch {
+                backend: backend.clone(),
+                certificate: proof("AA:BB"),
+            },
+            Some(1),
+        )
+        .unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join("routes.toml.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        fs::write(&ingress_config, "[ingress]\nmode = \"public\"\n[ingress.hosts.\"replacement.example.com\"]\nworkload = \"web\"\nrole = \"https\"\n").unwrap();
+        assert_eq!(
+            reload_public_profile(&state),
+            super::ConfigReloadOutcome::Rejected(2)
+        );
+        assert_eq!(state.public_snapshot().unwrap().generation, 1);
+        assert!(state.routes.read().unwrap().contains_key(HOSTNAME));
+        assert_eq!(
+            state.config_reload_status.lock().unwrap().last_error,
+            Some(super::ConfigReloadError::StateUnavailable)
+        );
+        let writer_state = Arc::clone(&state);
+        let writer_backend = backend.clone();
+        let writer = thread::spawn(move || {
+            install_active_route(
+                &writer_state,
+                HOSTNAME,
+                ProbeMatch {
+                    backend: writer_backend,
+                    certificate: proof("CC:DD"),
+                },
+                Some(1),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state.route_cache_transaction.try_lock().is_ok() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let reload_state = Arc::clone(&state);
+        let reloader = thread::spawn(move || reload_public_profile(&reload_state));
+        let routing_readable =
+            state.routes.try_read().is_ok() && state.hosting_profile.try_read().is_ok();
+        fs2::FileExt::unlock(&lock).unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(
+            reloader.join().unwrap(),
+            super::ConfigReloadOutcome::Accepted(2)
+        );
+        assert!(routing_readable, "cache update held routing locks");
+        assert!(!state.routes.read().unwrap().contains_key(HOSTNAME));
+        let cache = &state.production_paths.as_ref().unwrap().route_cache;
+        assert!(
+            route_cache::load(cache, HOSTNAME, route_cache::Storage::SeparateState)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            install_active_route(
+                &state,
+                HOSTNAME,
+                ProbeMatch {
+                    backend,
+                    certificate: proof("EE:FF"),
+                },
+                Some(1)
+            )
+            .is_err()
+        );
+        assert!(
+            route_cache::load(cache, HOSTNAME, route_cache::Storage::SeparateState)
+                .unwrap()
+                .is_none(),
+            "a stale proof resurrected a reload tombstone"
+        );
+    }
+
     #[test]
     fn reload_is_atomic_and_stale_certificate_results_cannot_cross_generations() {
         let directory = tempdir().unwrap();
@@ -7482,6 +8552,76 @@ mod tests {
     }
 
     #[test]
+    fn machine_status_counts_and_omissions_share_one_route_snapshot() {
+        let HostingProfile::Public(mut profile) = public_profile("route-0.example", "web") else {
+            unreachable!()
+        };
+        let declaration = profile.routes.values().next().unwrap().clone();
+        Arc::make_mut(&mut profile).routes = (0..128)
+            .map(|index| {
+                let mut declaration = declaration.clone();
+                declaration.hostname = format!("route-{index}.example");
+                (declaration.hostname.clone(), declaration)
+            })
+            .collect();
+        let state = Arc::new(ProxyState::new_with_profile(
+            PathBuf::from("unused"),
+            HostingProfile::Public(profile),
+        ));
+        let active = state
+            .public_snapshot()
+            .unwrap()
+            .routes
+            .keys()
+            .map(|hostname| {
+                let mut route = active_route(Backend {
+                    project: "web".into(),
+                    role: "https".into(),
+                    port: 4401,
+                });
+                route.declaration_generation = Some(1);
+                (hostname.clone(), route)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let writer_state = Arc::clone(&state);
+        let writer = thread::spawn(move || {
+            for _ in 0..1000 {
+                *writer_state.routes.write().unwrap() = active.clone();
+                thread::yield_now();
+                writer_state.routes.write().unwrap().clear();
+                thread::yield_now();
+            }
+        });
+        let mut consistent = true;
+        for _ in 0..128 {
+            let status = render_control_response(&state, &running_shutdown(), "STATUS JSON");
+            let status = serde_json::from_str::<serde_json::Value>(&status).unwrap();
+            consistent &= status["active_routes"] == status["certificate_route_count"];
+            for (entries, omitted, total) in [
+                (
+                    "certificate_routes",
+                    "certificate_routes_omitted",
+                    "certificate_route_count",
+                ),
+                (
+                    "degraded_routes",
+                    "degraded_routes_omitted",
+                    "degraded_route_count",
+                ),
+            ] {
+                consistent &= status[entries].as_array().unwrap().len() as u64
+                    + status[omitted].as_u64().unwrap()
+                    == status[total].as_u64().unwrap();
+            }
+        }
+        writer.join().unwrap();
+        assert!(
+            consistent,
+            "route details and omitted counts came from different snapshots"
+        );
+    }
+
+    #[test]
     fn machine_status_bounds_degraded_route_details_and_response_bytes() {
         let directory = tempdir().unwrap();
         let routes = (0..MAX_ROUTE_DECLARATIONS)
@@ -7580,6 +8720,67 @@ mod tests {
             MAX_ROUTE_DECLARATIONS
         );
         assert!(!metrics.contains("attacker-controlled.example"));
+        state
+            .routes
+            .write()
+            .unwrap()
+            .retain(|hostname, _| snapshot.routes.keys().take(64).any(|name| name == hostname));
+        let rendered = render_control_response(&state, &running_shutdown(), "STATUS JSON");
+        assert!(
+            rendered.len() as u64 <= CONTROL_RESPONSE_LIMIT,
+            "mixed active/degraded status exceeds the control byte budget: {}",
+            rendered.len()
+        );
+        let status = serde_json::from_str::<serde_json::Value>(&rendered).unwrap();
+        for (details, total, omitted) in [
+            (
+                "certificate_routes",
+                "certificate_route_count",
+                "certificate_routes_omitted",
+            ),
+            (
+                "degraded_routes",
+                "degraded_route_count",
+                "degraded_routes_omitted",
+            ),
+        ] {
+            assert_eq!(
+                status[details].as_array().unwrap().len() as u64
+                    + status[omitted].as_u64().unwrap(),
+                status[total].as_u64().unwrap()
+            );
+        }
+        for command in ["CHECK LIVE", "CHECK READY"] {
+            let health = render_control_response(&state, &running_shutdown(), command);
+            assert!(
+                health.len() < 256,
+                "health must not include route diagnostics"
+            );
+            let health = serde_json::from_str::<serde_json::Value>(&health).unwrap();
+            assert_eq!(health["live"], true);
+            assert_eq!(health["ready"], status["ready"]);
+            assert_eq!(health["draining"], false);
+        }
+        let shutdown = running_shutdown();
+        shutdown.request();
+        let health = render_control_response(&state, &shutdown, "CHECK READY");
+        let health = serde_json::from_str::<serde_json::Value>(&health).unwrap();
+        assert_eq!(health["live"], true);
+        assert_eq!(health["ready"], false);
+        assert_eq!(health["draining"], true);
+
+        *state.listeners.write().unwrap() = (1..=8192)
+            .map(|port| SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port))
+            .collect();
+        let rendered = render_control_response(&state, &running_shutdown(), "STATUS JSON");
+        assert!(rendered.len() as u64 <= CONTROL_RESPONSE_LIMIT);
+        let status = serde_json::from_str::<serde_json::Value>(&rendered).unwrap();
+        assert!(status["listeners_omitted"].as_u64().unwrap() > 0);
+        assert_eq!(
+            status["listeners"].as_array().unwrap().len() as u64
+                + status["listeners_omitted"].as_u64().unwrap(),
+            8192
+        );
         for forbidden in [
             "source=",
             "connection_id",

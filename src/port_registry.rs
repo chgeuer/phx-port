@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use toml_edit::{DocumentMut, value};
 
 #[cfg(unix)]
@@ -16,6 +18,56 @@ const MAX_ROLE_LENGTH: usize = 128;
 const MAX_PRIVATE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 pub type LogicalAssignments = BTreeMap<(String, String), u16>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct AccessDeadline<'a> {
+    pub deadline: Instant,
+    pub cancelled: &'a AtomicBool,
+}
+
+impl AccessDeadline<'_> {
+    fn remaining(self) -> Result<Duration, String> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err("registry operation cancelled during shutdown".to_string());
+        }
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| "registry operation timed out".to_string())
+    }
+}
+
+fn lock_for_access(
+    lock: &File,
+    path: &Path,
+    exclusive: bool,
+    deadline: Option<AccessDeadline<'_>>,
+) -> Result<(), String> {
+    let Some(deadline) = deadline else {
+        return if exclusive {
+            FileExt::lock_exclusive(lock)
+        } else {
+            FileExt::lock_shared(lock)
+        }
+        .map_err(|error| format!("cannot lock {}: {error}", path.display()));
+    };
+    loop {
+        let remaining = deadline.remaining()?;
+        let result = if exclusive {
+            FileExt::try_lock_exclusive(lock)
+        } else {
+            FileExt::try_lock_shared(lock)
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(format!("cannot lock {}: {error}", path.display())),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistrySecurity {
@@ -77,10 +129,20 @@ pub fn validate_role(role: &str) -> Result<(), String> {
 }
 
 pub fn read(path: &Path, security: RegistrySecurity) -> Result<DocumentMut, String> {
+    read_until(path, security, None)
+}
+
+pub(crate) fn read_until(
+    path: &Path,
+    security: RegistrySecurity,
+    deadline: Option<AccessDeadline<'_>>,
+) -> Result<DocumentMut, String> {
+    if let Some(deadline) = deadline {
+        deadline.remaining()?;
+    }
     let path = prepare_path(path, security)?;
     let lock = open_lock(&path, security)?;
-    FileExt::lock_shared(&lock)
-        .map_err(|error| format!("cannot lock {} for reading: {error}", path.display()))?;
+    lock_for_access(&lock, &path, false, deadline)?;
     let result = load(&path, security);
     unlock(lock, &path, result)
 }
@@ -106,16 +168,30 @@ pub fn update<R>(
     security: RegistrySecurity,
     update: impl FnOnce(&mut DocumentMut) -> Result<R, String>,
 ) -> Result<R, String> {
+    update_until(path, security, None, update)
+}
+
+pub(crate) fn update_until<R>(
+    path: &Path,
+    security: RegistrySecurity,
+    deadline: Option<AccessDeadline<'_>>,
+    update: impl FnOnce(&mut DocumentMut) -> Result<R, String>,
+) -> Result<R, String> {
+    if let Some(deadline) = deadline {
+        deadline.remaining()?;
+    }
     let path = prepare_path(path, security)?;
     let lock = open_lock(&path, security)?;
-    FileExt::lock_exclusive(&lock)
-        .map_err(|error| format!("cannot lock {} for update: {error}", path.display()))?;
+    lock_for_access(&lock, &path, true, deadline)?;
 
     let result = (|| {
         let mut document = load(&path, security)?;
         let result = update(&mut document)?;
         if security == RegistrySecurity::LogicalWorkload {
             validate_logical_assignments(&document)?;
+        }
+        if let Some(deadline) = deadline {
+            deadline.remaining()?;
         }
         write_atomic(&path, &document, security)?;
         Ok(result)
@@ -658,7 +734,7 @@ fn validate_logical_assignments(document: &DocumentMut) -> Result<(), String> {
     logical_assignments(document).map(|_| ())
 }
 
-fn logical_assignments(document: &DocumentMut) -> Result<LogicalAssignments, String> {
+pub(crate) fn logical_assignments(document: &DocumentMut) -> Result<LogicalAssignments, String> {
     let ports = document
         .get("ports")
         .and_then(|ports| ports.as_table())

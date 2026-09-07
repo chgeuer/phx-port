@@ -58,7 +58,16 @@ pub fn prepare(path: &Path) -> Result<(), String> {
 }
 
 pub fn load(path: &Path, hostname: &str, storage: Storage) -> Result<Option<CachedRoute>, String> {
-    let document = read_for_use(path, storage)?;
+    load_until(path, hostname, storage, None)
+}
+
+pub(crate) fn load_until(
+    path: &Path,
+    hostname: &str,
+    storage: Storage,
+    deadline: Option<port_registry::AccessDeadline<'_>>,
+) -> Result<Option<CachedRoute>, String> {
+    let document = read_for_use(path, storage, deadline)?;
     cached_route(&document, hostname)
 }
 
@@ -90,12 +99,16 @@ fn cached_route(document: &DocumentMut, hostname: &str) -> Result<Option<CachedR
     }))
 }
 
-fn read_for_use(path: &Path, storage: Storage) -> Result<DocumentMut, String> {
-    let document = port_registry::read(path, storage.security())?;
+fn read_for_use(
+    path: &Path,
+    storage: Storage,
+    deadline: Option<port_registry::AccessDeadline<'_>>,
+) -> Result<DocumentMut, String> {
+    let document = port_registry::read_until(path, storage.security(), deadline)?;
     match validate_document(&document, storage) {
         Ok(()) => Ok(document),
         Err(error) if storage == Storage::SeparateState => Err(error),
-        Err(_) => port_registry::update(path, storage.security(), |current| {
+        Err(_) => port_registry::update_until(path, storage.security(), deadline, |current| {
             if discard_invalid_combined_routes(current, storage) {
                 eprintln!("event=route_state_rebuild result=discarded_invalid_development_cache");
             }
@@ -112,6 +125,7 @@ fn discard_invalid_combined_routes(document: &mut DocumentMut, storage: Storage)
     false
 }
 
+#[cfg(test)]
 pub fn store(
     path: &Path,
     storage: Storage,
@@ -119,6 +133,26 @@ pub fn store(
     project: &str,
     role: &str,
     certificate_fingerprint: &str,
+) -> Result<(), String> {
+    store_until(
+        path,
+        storage,
+        hostname,
+        project,
+        role,
+        certificate_fingerprint,
+        None,
+    )
+}
+
+pub(crate) fn store_until(
+    path: &Path,
+    storage: Storage,
+    hostname: &str,
+    project: &str,
+    role: &str,
+    certificate_fingerprint: &str,
+    deadline: Option<port_registry::AccessDeadline<'_>>,
 ) -> Result<(), String> {
     if storage == Storage::SeparateState {
         validate_route_fields(hostname, project, role, certificate_fingerprint)?;
@@ -130,7 +164,7 @@ pub fn store(
         .try_into()
         .unwrap_or(i64::MAX);
 
-    port_registry::update(path, storage.security(), |document| {
+    port_registry::update_until(path, storage.security(), deadline, |document| {
         discard_invalid_combined_routes(document, storage);
         if !document.contains_table(TABLE) {
             document[TABLE] = toml_edit::table();
@@ -170,8 +204,18 @@ pub fn store(
     })
 }
 
+#[cfg(test)]
 pub fn remove(path: &Path, storage: Storage, hostname: &str) -> Result<(), String> {
-    port_registry::update(path, storage.security(), |document| {
+    remove_until(path, storage, hostname, None)
+}
+
+pub(crate) fn remove_until(
+    path: &Path,
+    storage: Storage,
+    hostname: &str,
+    deadline: Option<port_registry::AccessDeadline<'_>>,
+) -> Result<(), String> {
+    port_registry::update_until(path, storage.security(), deadline, |document| {
         discard_invalid_combined_routes(document, storage);
         if let Some(routes) = document.get_mut(TABLE).and_then(|item| item.as_table_mut()) {
             routes.remove(hostname);
@@ -180,12 +224,13 @@ pub fn remove(path: &Path, storage: Storage, hostname: &str) -> Result<(), Strin
     })
 }
 
-pub fn retain_targets(
+pub(crate) fn retain_targets_until(
     path: &Path,
     storage: Storage,
     targets: &BTreeMap<String, (String, String)>,
+    deadline: Option<port_registry::AccessDeadline<'_>>,
 ) -> Result<(), String> {
-    port_registry::update(path, storage.security(), |document| {
+    port_registry::update_until(path, storage.security(), deadline, |document| {
         discard_invalid_combined_routes(document, storage);
         if let Some(routes) = document.get_mut(TABLE).and_then(|item| item.as_table_mut()) {
             routes.retain(|hostname, item| {
@@ -224,7 +269,7 @@ pub fn remove_for_registration(document: &mut DocumentMut, project: &str, role: 
 }
 
 pub fn print(path: &Path, storage: Storage) -> Result<(), String> {
-    let document = read_for_use(path, storage)?;
+    let document = read_for_use(path, storage, None)?;
     let Some(routes) = document.get(TABLE).and_then(|item| item.as_table()) else {
         eprintln!("No discovered TLS routes.");
         return Ok(());

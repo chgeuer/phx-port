@@ -51,7 +51,10 @@ fn harness_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn tempdir() -> std::io::Result<TempDir> {
-    tempdir_in(Path::new("/tmp").canonicalize()?)
+    let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "/tmp".into());
+    tempdir_in(root.canonicalize()?)
 }
 
 fn wait_until(description: &str, mut condition: impl FnMut() -> bool) {
@@ -1396,6 +1399,52 @@ fn relay_handoff_and_phxp_failures_are_end_to_end() {
     post_receiver.finish();
     let stderr = daemon.stop();
     assert!(!stderr.contains("undeclared.phase8.test"));
+}
+
+#[test]
+fn sigterm_drains_an_established_tls_relay() {
+    let _guard = harness_lock();
+    const HOSTNAME: &str = "sigterm.phase8.test";
+    let ca = TestCa::new();
+    let identity = ca.issue(HOSTNAME, Duration::from_secs(60 * 24 * 60 * 60));
+    let backend = TestBackend::start(&identity, HOSTNAME);
+    let host = HarnessHost::new(
+        &ca.root_pem,
+        vec![Route::new(HOSTNAME, "sigterm-workload", backend.port())],
+        HarnessLimits::default(),
+        false,
+    );
+    let mut daemon = host.start();
+    daemon.wait_until_ready();
+    let mut peer = connect_tls(&ca.connector(), HOSTNAME, daemon.address_v4()).unwrap();
+    peer.write_all(b"before").unwrap();
+    let mut before = [0; 6];
+    peer.read_exact(&mut before).unwrap();
+    assert_eq!(&before, b"before");
+
+    let signalled =
+        unsafe { nix::libc::kill(daemon.pid() as nix::libc::pid_t, nix::libc::SIGTERM) };
+    assert_eq!(signalled, 0);
+    wait_until("SIGTERM to enter drain", || {
+        daemon.status()["draining"] == true
+    });
+    assert!(daemon.child.as_mut().unwrap().try_wait().unwrap().is_none());
+    peer.write_all(b"after").unwrap();
+    let mut after = [0; 5];
+    peer.read_exact(&mut after).unwrap();
+    assert_eq!(&after, b"after");
+    drop(peer);
+
+    wait_until("SIGTERM drain to complete", || {
+        daemon.child.as_mut().unwrap().try_wait().unwrap().is_some()
+    });
+    assert!(daemon.child.take().unwrap().wait().unwrap().success());
+    let stderr = fs::read_to_string(&daemon.host.stderr).unwrap();
+    assert_eq!(stderr.matches("event=ingress_shutdown ").count(), 1);
+    assert!(
+        stderr.contains("event=ingress_shutdown result=complete "),
+        "{stderr}"
+    );
 }
 
 #[test]

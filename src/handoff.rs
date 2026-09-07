@@ -5,6 +5,77 @@ use std::path::{Path, PathBuf};
 
 const PRODUCTION_RUNTIME_ROOT: &str = "/run/phx-port";
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn short_test_runtime(path: &Path) -> PathBuf {
+    path.strip_prefix(std::env::current_dir().unwrap())
+        .unwrap_or(path)
+        .to_path_buf()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn connect_until(
+    socket: &std::os::fd::OwnedFd,
+    address: &nix::sys::socket::UnixAddr,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    use nix::errno::Errno;
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use nix::poll::{PollFd, PollFlags, poll};
+    use nix::sys::socket::{connect, getsockopt, sockopt};
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::time::{Duration, Instant};
+
+    let flags = fcntl(socket, FcntlArg::F_GETFL)
+        .map(OFlag::from_bits_truncate)
+        .map_err(|error| format!("cannot inspect handoff socket flags: {error}"))?;
+    fcntl(socket, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+        .map_err(|error| format!("cannot configure nonblocking handoff connect: {error}"))?;
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| "handoff endpoint connect timed out".to_string())
+    };
+    loop {
+        remaining()?;
+        match connect(socket.as_raw_fd(), address) {
+            Ok(()) | Err(Errno::EISCONN) => break,
+            Err(Errno::EINTR) => continue,
+            Err(Errno::EAGAIN) => {
+                // A full AF_UNIX accept queue has not initiated a connection. POLLOUT
+                // can be immediately ready here; retry connect instead of busy-polling.
+                std::thread::sleep(remaining()?.min(Duration::from_millis(5)));
+            }
+            Err(Errno::EINPROGRESS | Errno::EALREADY) => {
+                loop {
+                    let timeout_ms = remaining()?.as_millis().clamp(1, u16::MAX as u128) as u16;
+                    let mut fds = [PollFd::new(socket.as_fd(), PollFlags::POLLOUT)];
+                    match poll(&mut fds, timeout_ms) {
+                        Ok(0) | Err(Errno::EINTR) => continue,
+                        Err(error) => return Err(format!("handoff connect poll failed: {error}")),
+                        Ok(_) => {}
+                    }
+                    let error = getsockopt(socket, sockopt::SocketError)
+                        .map_err(|error| format!("cannot inspect handoff connect: {error}"))?;
+                    if error != 0 {
+                        return Err(format!(
+                            "cannot connect to handoff endpoint: {}",
+                            Errno::from_raw(error)
+                        ));
+                    }
+                    break;
+                }
+                break;
+            }
+            Err(error) => return Err(format!("cannot connect to handoff endpoint: {error}")),
+        }
+    }
+    remaining()?;
+    fcntl(socket, FcntlArg::F_SETFL(flags))
+        .map_err(|error| format!("cannot restore handoff socket flags: {error}"))?;
+    Ok(())
+}
+
 pub enum Outcome {
     Unavailable(TcpStream),
     Transferred,
@@ -181,8 +252,8 @@ mod platform {
     use super::{Outcome, TcpStream};
     use crate::handoff_protocol::{self, Handoff, MAX_PACKET_LENGTH, Message};
     use nix::sys::socket::{
-        AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr, connect, getsockopt,
-        recv, send, sendmsg, socket, sockopt,
+        AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr, getsockopt, recv,
+        send, sendmsg, socket, sockopt,
     };
     use std::io::IoSlice;
     use std::os::fd::{AsRawFd, OwnedFd};
@@ -260,8 +331,11 @@ mod platform {
             None,
         )
         .map_err(|error| format!("cannot create handoff socket: {error}"))?;
-        connect(socket.as_raw_fd(), &address)
-            .map_err(|error| format!("cannot connect to handoff endpoint: {error}"))?;
+        super::connect_until(
+            &socket,
+            &address,
+            std::time::Instant::now() + CONTROL_TIMEOUT,
+        )?;
         let timeout = nix::sys::time::TimeVal::new(
             CONTROL_TIMEOUT.as_secs() as i64,
             i64::from(CONTROL_TIMEOUT.subsec_micros()),
@@ -333,6 +407,48 @@ mod platform {
         use tempfile::tempdir;
 
         #[test]
+        fn full_accept_queue_obeys_connect_timeout() {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("queue.sock");
+            let address = UnixAddr::new(&path).unwrap();
+            let listener = socket(
+                AddressFamily::Unix,
+                SockType::SeqPacket,
+                SockFlag::SOCK_CLOEXEC,
+                None,
+            )
+            .unwrap();
+            bind(listener.as_raw_fd(), &address).unwrap();
+            listen(&listener, Backlog::new(1).unwrap()).unwrap();
+            let queued = (0..2)
+                .map(|_| {
+                    let socket = socket(
+                        AddressFamily::Unix,
+                        SockType::SeqPacket,
+                        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+                        None,
+                    )
+                    .unwrap();
+                    nix::sys::socket::connect(socket.as_raw_fd(), &address).unwrap();
+                    socket
+                })
+                .collect::<Vec<_>>();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let worker = thread::spawn(move || {
+                let _ = sender.send(super::connect_endpoint(&path));
+            });
+            let result = receiver
+                .recv_timeout(super::CONTROL_TIMEOUT + std::time::Duration::from_millis(500));
+            drop(listener);
+            drop(queued);
+            worker.join().unwrap();
+            let error = result
+                .expect("full Unix accept queue outlived the connect deadline")
+                .expect_err("a full accept queue must not connect");
+            assert!(error.contains("timed out"), "{error}");
+        }
+
+        #[test]
         fn endpoint_name_hashes_canonical_project_and_role() {
             let hash = endpoint_hash("/srv/contoso", "https");
             let path = endpoint_path_in(Path::new("/run/user/1000"), true, &hash);
@@ -347,7 +463,7 @@ mod platform {
             let endpoint = endpoint_path(
                 EndpointIdentity::Production("contoso-web"),
                 "https",
-                Some(directory.path()),
+                Some(&crate::handoff::short_test_runtime(directory.path())),
             )
             .unwrap();
             let listener = socket(
@@ -434,7 +550,7 @@ mod platform {
                     accepted,
                     EndpointIdentity::Production("contoso-web"),
                     "https",
-                    Some(directory.path()),
+                    Some(&crate::handoff::short_test_runtime(directory.path())),
                     "www.contoso.com",
                     12,
                     connection_id,
@@ -455,8 +571,7 @@ mod platform {
     use crate::handoff_stream::read_frame;
     use nix::fcntl::{FcntlArg, FdFlag, fcntl};
     use nix::sys::socket::{
-        AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr, connect, sendmsg,
-        socket,
+        AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr, sendmsg, socket,
     };
     use std::io::{IoSlice, Write};
     use std::os::fd::{AsFd, AsRawFd};
@@ -542,8 +657,11 @@ mod platform {
         .map_err(|error| format!("cannot create handoff socket: {error}"))?;
         set_cloexec(&socket)?;
         set_no_sigpipe(&socket)?;
-        connect(socket.as_raw_fd(), &address)
-            .map_err(|error| format!("cannot connect to handoff endpoint: {error}"))?;
+        super::connect_until(
+            &socket,
+            &address,
+            std::time::Instant::now() + CONTROL_TIMEOUT,
+        )?;
 
         let stream = UnixStream::from(socket);
         stream
@@ -673,7 +791,7 @@ mod platform {
             let endpoint = endpoint_path(
                 EndpointIdentity::Production("contoso-web"),
                 "https",
-                Some(directory.path()),
+                Some(&crate::handoff::short_test_runtime(directory.path())),
             )
             .unwrap();
             let listener = socket(
@@ -774,7 +892,7 @@ mod platform {
                     accepted,
                     EndpointIdentity::Production("contoso-web"),
                     "https",
-                    Some(directory.path()),
+                    Some(&crate::handoff::short_test_runtime(directory.path())),
                     "www.contoso.com",
                     12,
                     connection_id,

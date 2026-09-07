@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +14,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::{TempDir, tempdir_in};
 
 fn tempdir() -> std::io::Result<TempDir> {
-    tempdir_in(Path::new("/tmp").canonicalize()?)
+    let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "/tmp".into());
+    tempdir_in(root.canonicalize()?)
 }
 
 fn reserve_address() -> SocketAddr {

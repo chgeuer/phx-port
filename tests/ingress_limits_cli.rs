@@ -30,7 +30,6 @@ mod unix {
     use std::io::{ErrorKind, Read, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
     use std::os::unix::net::UnixStream;
-    use std::path::Path;
     use std::process::{Child, Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -42,8 +41,10 @@ mod unix {
     };
 
     fn tempdir() -> std::io::Result<TempDir> {
-        let root = Path::new("/tmp").canonicalize()?;
-        tempdir_in(root)
+        let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "/tmp".into());
+        tempdir_in(root.canonicalize()?)
     }
 
     struct Daemon {
@@ -325,6 +326,39 @@ mod unix {
             !stderr.contains("TLS proxy connection rejected"),
             "per-connection rejection details leaked to stderr:\n{stderr}"
         );
+    }
+
+    #[test]
+    fn sigterm_uses_coordinated_shutdown() {
+        let address = reserve_address();
+        let mut daemon = Daemon::start(address);
+        let client = TcpStream::connect(address).unwrap();
+        daemon.wait_for_count("pre_routing_connections", 1);
+        let child = daemon.child.as_mut().unwrap();
+        let result = unsafe { nix::libc::kill(child.id() as nix::libc::pid_t, nix::libc::SIGTERM) };
+        assert_eq!(result, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "SIGTERM did not cancel pre-routing"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let output = daemon.child.take().unwrap().wait_with_output().unwrap();
+        drop(client);
+        assert!(
+            output.status.success(),
+            "SIGTERM bypassed shutdown: {}",
+            output.status
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            stderr.matches("event=ingress_shutdown ").count(),
+            1,
+            "{stderr}"
+        );
+        assert!(stderr.contains("active_connections=0"), "{stderr}");
     }
 
     #[test]

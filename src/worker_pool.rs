@@ -2,6 +2,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 const CONNECTION_WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
 
@@ -87,10 +88,40 @@ impl<Job: Send + 'static> BoundedWorkerPool<Job> {
         for worker in self.workers {
             panicked |= worker.join().is_err();
         }
+
         if panicked {
             Err("bounded connection worker exited unexpectedly".to_string())
         } else {
             Ok(())
+        }
+    }
+
+    pub(crate) fn join_until(mut self, deadline: Instant) -> Result<usize, String> {
+        self.close();
+        let mut panicked = false;
+        loop {
+            let mut index = 0;
+            while index < self.workers.len() {
+                if self.workers[index].is_finished() {
+                    panicked |= self.workers.swap_remove(index).join().is_err();
+                } else {
+                    index += 1;
+                }
+            }
+            if self.workers.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(5)),
+            );
+        }
+        if panicked {
+            Err("bounded connection worker exited unexpectedly".to_string())
+        } else {
+            // A stuck OS operation must not extend the process drain deadline.
+            Ok(self.workers.len())
         }
     }
 }
@@ -101,7 +132,32 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{self, TrySendError};
     use std::sync::{Arc, Condvar, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn join_deadline_does_not_wait_for_a_blocked_job() {
+        let (started, ready) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::sync_channel(1);
+        let wait = Mutex::new(wait);
+        let (finished, done) = mpsc::sync_channel(1);
+        let pool = BoundedWorkerPool::start("deadline-test", 1, 1, move |()| {
+            started.send(()).unwrap();
+            wait.lock().unwrap().recv().unwrap();
+            finished.send(()).unwrap();
+        })
+        .unwrap();
+        pool.sender().send(()).unwrap();
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            pool.join_until(started + Duration::from_millis(50))
+                .unwrap(),
+            1
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
 
     #[test]
     fn worker_and_queue_bounds_are_exact() {
