@@ -2,7 +2,9 @@
 compile_error!("phx_port_handoff_native requires Linux or macOS");
 
 #[cfg(target_os = "macos")]
-use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+use nix::fcntl::FdFlag;
+#[cfg(target_os = "macos")]
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 #[cfg(target_os = "macos")]
 use nix::sys::socket::accept as socket_accept;
 use nix::sys::socket::{
@@ -27,7 +29,6 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 const MAGIC: &[u8; 4] = b"PHXP";
@@ -42,7 +43,6 @@ const TYPE_ADOPTED: u8 = 4;
 const TYPE_REJECTED: u8 = 5;
 const REJECT_INVALID_DESCRIPTOR: u16 = 1;
 const REJECT_DUPLICATE_ID: u16 = 2;
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(target_os = "linux")]
@@ -55,6 +55,7 @@ mod atoms {
         ok,
         closed,
         error,
+        eagain,
         econnaborted,
         inet,
         inet6,
@@ -127,12 +128,12 @@ fn effective_uid() -> u32 {
     nix::unistd::geteuid().as_raw()
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn listen(env: Env<'_>, path: String) -> NifResult<(Atom, ResourceArc<Broker>)> {
     listen_with_policy(env, path, false)
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn listen_derived(env: Env<'_>, path: String) -> NifResult<(Atom, ResourceArc<Broker>)> {
     listen_with_policy(env, path, true)
 }
@@ -177,31 +178,29 @@ fn listen_with_policy(
     Ok((atoms::ok(), broker))
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn close_listener(broker: ResourceArc<Broker>) -> NifResult<Atom> {
     broker.close();
     Ok(atoms::ok())
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn accept(
+fn try_accept(
     broker: ResourceArc<Broker>,
 ) -> NifResult<(Atom, ResourceArc<Receipt>, i32, Atom, String, u32)> {
-    let mut control = loop {
-        if broker.closed.load(Ordering::Acquire) {
+    if broker.closed.load(Ordering::Acquire) {
+        return Err(Error::Term(Box::new(atoms::closed())));
+    }
+    let mut control = match accept_control(&broker.listener) {
+        Ok(Some(control)) => control,
+        Ok(None) => return Err(Error::Term(Box::new(atoms::eagain()))),
+        Err(_error) if broker.closed.load(Ordering::Acquire) => {
             return Err(Error::Term(Box::new(atoms::closed())));
         }
-        match accept_control(&broker.listener) {
-            Ok(Some(control)) => break control,
-            Ok(None) => thread::sleep(ACCEPT_RETRY_DELAY),
-            Err(_error) if broker.closed.load(Ordering::Acquire) => {
-                return Err(Error::Term(Box::new(atoms::closed())));
-            }
-            Err(error) => {
-                return Err(failure(format!(
-                    "cannot accept handoff connection: {error}"
-                )));
-            }
+        Err(error) => {
+            return Err(failure(format!(
+                "cannot accept handoff connection: {error}"
+            )));
         }
     };
     if broker.closed.load(Ordering::Acquire) {
@@ -263,6 +262,13 @@ fn accept(
         ));
     }
 
+    // The descriptor's O_NONBLOCK state is deliberately left alone. SCM_RIGHTS
+    // shares the sender's open file description instead of copying it, and
+    // O_NONBLOCK lives on that description, so the mode we observe here is the
+    // sender's and either side can still change it afterwards. Normalizing it
+    // is pointless: `:gen_tcp.fdopen/2` sets O_NONBLOCK itself on adoption, and
+    // an in-BEAM sender can clear it again later regardless. See the freeze
+    // analysis in docs/adversarial-audit.md before adding an fcntl here.
     {
         let mut ids = broker
             .connection_ids
@@ -333,13 +339,13 @@ fn close_client(receipt: ResourceArc<Receipt>) -> NifResult<Atom> {
     Ok(atoms::ok())
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn adopted(receipt: ResourceArc<Receipt>) -> NifResult<Atom> {
     respond(&receipt, TYPE_ADOPTED, 0)?;
     Ok(atoms::ok())
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn rejected(receipt: ResourceArc<Receipt>, reason_code: u16) -> NifResult<Atom> {
     if reason_code == 0 {
         return Err(failure("rejection reason must be nonzero"));

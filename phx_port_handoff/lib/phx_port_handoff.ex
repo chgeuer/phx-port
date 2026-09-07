@@ -40,14 +40,14 @@ defmodule PhxPortHandoff do
     role = Keyword.get(options, :role, "https")
 
     case Application.fetch_env!(otp_app, endpoint)[:https] do
-      nil ->
+      disabled when disabled in [nil, false] ->
         :ignore
 
       https ->
         identity = Keyword.get_lazy(options, :identity, &handoff_identity/0)
 
         %{start: {module, function, arguments}} =
-          bandit_child_spec(endpoint, identity, role, https)
+          bandit_child_spec(endpoint, identity, role, Keyword.put_new(https, :otp_app, otp_app))
 
         apply(module, function, arguments)
     end
@@ -179,6 +179,21 @@ defmodule PhxPortHandoff do
     end
   end
 
+  # `{:inet_backend, :inet}` is deliberate; see docs/socket-forwarding-design.md.
+  #
+  # Do not add an O_NONBLOCK normalization here. It looks necessary, because a
+  # descriptor arrives however the sender left it, but `inet_drv` already issues
+  # `fcntl(fd, F_SETFL, O_RDWR|O_NONBLOCK)` on adoption. A previous fix added a
+  # NIF to re-apply it and was reverted as redundant.
+  #
+  # The related gotcha, if you are chasing a frozen node: SCM_RIGHTS *shares* the
+  # open file description rather than copying it, and O_NONBLOCK lives on that
+  # description. A PHXP sender running in the *same* BEAM can therefore clear the
+  # flag behind `inet_drv`'s back, after which the driver blocks in `recv(2)` on a
+  # normal scheduler and, with an in-VM peer, wedges the whole VM. That is a
+  # test-harness topology only — the real ingress is a separate OS process — so
+  # write handoff tests with an out-of-process sender. Full analysis and the
+  # reproductions are in docs/adversarial-audit.md.
   defp fdopen(receipt, fd, address_family) when address_family in [:inet, :inet6] do
     options = [
       {:inet_backend, :inet},

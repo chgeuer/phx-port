@@ -119,6 +119,41 @@ defmodule PhxPortHandoffTest do
     assert :ok = Native.close_listener(broker)
   end
 
+  test "explicitly disabled HTTPS ignores the configured child" do
+    endpoint = __MODULE__.DisabledEndpoint
+    Application.put_env(:phx_port_handoff, endpoint, https: false)
+    on_exit(fn -> Application.delete_env(:phx_port_handoff, endpoint) end)
+
+    assert :ignore =
+             PhxPortHandoff.start_link(
+               otp_app: :phx_port_handoff,
+               endpoint: endpoint
+             )
+  end
+
+  test "idle accepts leave dirty I/O schedulers available for unrelated work" do
+    brokers =
+      for _ <- 1..(:erlang.system_info(:dirty_io_schedulers) + 1) do
+        {:ok, broker} = Native.listen(endpoint_path())
+        broker
+      end
+
+    accepts = Enum.map(brokers, fn broker -> Task.async(fn -> Native.accept(broker) end) end)
+    Process.sleep(100)
+    file_operation = Task.async(fn -> File.stat!(__ENV__.file).type end)
+
+    result =
+      try do
+        Task.yield(file_operation, 1_000)
+      after
+        Enum.each(brokers, &Native.close_listener/1)
+        Enum.each(accepts, fn accept -> assert {:error, :closed} = Task.await(accept) end)
+        Task.shutdown(file_operation)
+      end
+
+    assert {:ok, :regular} = result
+  end
+
   test "explicit endpoint validates only its private parent directory" do
     root = Path.join("/tmp", "phxp-explicit-#{:os.getpid()}-#{System.unique_integer()}")
     path = Path.join([root, "handoff", "receiver.sock"])
