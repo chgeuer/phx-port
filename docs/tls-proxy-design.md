@@ -418,8 +418,14 @@ one whose daemon responds.
 configured admission capacity, fixed worker and queue bounds, bounded
 rejection-reason counters, discovery resource usage, connection/discovery
 counters, handoff capacity skips, and handoff outcomes.
-`status --json`, `check --live`, and `check --ready` emit bounded schema-version
-1 JSON, including an explicit drain state. Health checks exit 0 when the
+`status --json` emits schema-version 1 JSON within a **total 64 KiB wire budget**,
+including the trailing newline. Route detail arrays share that budget; their
+total counts remain intact and `degraded_routes_omitted` and
+`certificate_routes_omitted` report omitted entries. An unusually large
+listener list is bounded too, with `listeners_omitted`.
+`check --live` and `check --ready` return small schema-version 1 objects containing
+only `schema_version`, `live`, `ready`, and `draining`, independently of the
+diagnostic arrays. Health checks exit 0 when the
 selected condition is true and 1 when it is false or cannot be queried.
 Liveness remains true while the event loop drains; readiness becomes false.
 Admission saturation writes fixed-schema `event=ingress_overload` records to

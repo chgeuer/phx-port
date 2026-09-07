@@ -317,8 +317,11 @@ to distinguish listener state, raw sockets, and negotiated TLS sockets.
 The implemented `PhxPortHandoff.Transport` is handoff-only. It uses the same
 raw and negotiated socket callbacks described below but creates only the
 protected Unix-domain handoff listener. Its child-spec helper configures one
-acceptor because entry into the blocking native accept NIF is serialized; this
-avoids exhausting the dirty I/O scheduler pool.
+acceptor because entry into the native accept NIF is serialized by a global
+lock. The NIF itself never blocks: it returns `{:error, :eagain}` when no
+connection is pending, and the caller takes the retry delay on an ordinary
+scheduler. An idle acceptor therefore holds no dirty I/O scheduler, so it
+cannot stall unrelated file, port, or NIF work that shares that pool.
 
 ### Future `listen/2`
 
@@ -362,10 +365,10 @@ appropriate.
 ### `handshake/1`
 
 Both ordinary and handed-off connections reach this callback as raw connected
-sockets. The callback performs a server-side upgrade:
+sockets. The callback performs a server-side upgrade under a finite deadline:
 
 ```elixir
-case :ssl.handshake(raw_socket, tls_options) do
+case :ssl.handshake(raw_socket, tls_options, handshake_timeout) do
   {:ok, ssl_socket} ->
     {:ok, negotiated_socket(ssl_socket)}
 
@@ -373,9 +376,18 @@ case :ssl.handshake(raw_socket, tls_options) do
     {:ok, negotiated_socket(ssl_socket)}
 
   other ->
+    close(raw_socket)
     other
 end
 ```
+
+The deadline is mandatory. `:ssl.handshake/2` delegates to a timeout of
+`:infinity`, so a peer that opens a connection and never completes the
+handshake would hold an accepted descriptor and its Thousand Island connection
+slot forever. The ingress has already released its own admission permit by the
+time the workload handshakes, so the workload is the only place this exposure
+can be bounded. `:handshake_timeout` defaults to 5,000 ms and must be a
+positive integer; the raw socket is closed on every handshake failure.
 
 OTP 29 accepts a `:gen_tcp` socket in the server-side handshake, making an FD
 wrapped with `:gen_tcp.fdopen/2` suitable for this upgrade path.

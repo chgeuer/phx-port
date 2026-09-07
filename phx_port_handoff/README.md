@@ -50,7 +50,15 @@ end
 
 The child reads the endpoint's existing HTTPS options unchanged so both
 listeners use the same certificate, SNI callback, ALPN, cipher, and
-client-authentication policy. It returns `:ignore` when HTTPS is disabled.
+client-authentication policy. Relative `:certfile` and `:keyfile` paths resolve
+against the configured `:otp_app`. It returns `:ignore` when HTTPS is unset or
+explicitly `false`.
+
+A handed-off connection must complete its TLS handshake within
+`:handshake_timeout` milliseconds, which defaults to `5_000`. A peer that
+stalls mid-handshake is disconnected and its descriptor closed rather than
+holding an accepted slot. Set it in the endpoint's `https:` options to
+override; `:infinity` and non-positive values are rejected at listen time.
 
 The ordinary endpoint still listens on its assigned phx-port HTTPS port for
 certificate verification, health checks, and direct access. The additional
@@ -121,5 +129,8 @@ descriptors across restarts.
 - The package starts a second, handoff-only Bandit supervisor. A future hybrid
   accept broker may combine direct TCP and handed-off accepts under one
   Thousand Island server.
-- One serialized dirty-I/O accept call is used. The native listener is
-  nonblocking so shutdown and supervised restart work consistently on Darwin.
+- One serialized accept call is used. The native listener is nonblocking, so
+  shutdown and supervised restart work consistently on Darwin. The dirty-I/O
+  NIF returns `{:error, :eagain}` immediately when no connection is pending
+  and the retry delay is taken on an ordinary scheduler, so idle acceptors do
+  not occupy a dirty-I/O scheduler and starve unrelated file or port work.

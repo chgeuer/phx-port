@@ -52,7 +52,10 @@ MyAppWeb.Endpoint
 ```
 
 The child reads the endpoint's HTTPS options unchanged, derives the path or
-Workload identity, and returns `:ignore` when HTTPS is disabled. The package
+Workload identity, and returns `:ignore` when HTTPS is unset or explicitly
+`false`. Relative `:certfile` and `:keyfile` paths resolve against `:otp_app`.
+Handed-off connections must finish the TLS handshake within
+`:handshake_timeout` milliseconds (default `5_000`). The package
 intentionally pins Rustler 0.36. Rustler 0.38 is unsupported.
 
 ## Manual fallback

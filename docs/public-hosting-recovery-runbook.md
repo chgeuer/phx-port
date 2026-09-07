@@ -112,11 +112,33 @@ phx-port proxy status --json
 phx-port proxy check --ready
 ```
 
-Public shutdown stops admission, cancels pre-routing work, resolves PHXP
+Both SIGINT and SIGTERM enter the same coordinated shutdown path as an
+authorized `proxy stop`. Public shutdown stops admission, cancels pre-routing work, resolves PHXP
 ownership, and drains relays for at most 60 seconds. Handed-off connections
 remain Workload-owned. Remaining relays close at the deadline. The supplied
 systemd and launchd stop deadlines allow five additional seconds for process
 cleanup.
+
+Route, certificate-probe, reconciliation, control, and metrics worker joins
+share the drain deadline; the shutdown event reports `unfinished_workers` if
+a worker cannot finish before it. A stuck OS operation is not joined
+indefinitely. The existing bounded PHXP shutdown grace preserves its
+irreversible descriptor-delivery boundary.
+
+Public reconciliation uses at most 24 of the 32 shared certificate-worker
+slots, reserving eight for foreground route selection, and one-second passes,
+resuming at the next declaration rather than starving later
+names. Probe socket I/O has an absolute deadline and observes shutdown.
+PHXP endpoint connects are nonblocking with a one-second deadline on both
+Linux and macOS; a full Unix accept queue can cause pre-delivery relay fallback,
+not an indefinite wait holding admission.
+
+Derived-cache writes never hold the profile or route-table locks. Unchanged
+certificate refreshes update in-memory verification time without rewriting
+the cache. Cache mutations and configuration publication are serialized:
+if pruning cannot complete in time, reload reports `state_unavailable` and
+keeps the previous generation intact; the periodic reload retries. A removed
+declaration cannot be re-persisted by a proof from an older accepted generation.
 
 On Linux:
 

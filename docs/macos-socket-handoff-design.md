@@ -656,10 +656,11 @@ Darwin-specific code supplies:
 - `recvmsg` plus explicit `FD_CLOEXEC`; and
 - `getpeereid`.
 
-The blocking accept remains a dirty I/O NIF as today. Closing the broker must
-wake or terminate a blocked Darwin accept and allow the supervised listener to
-restart. Validate this explicitly; do not assume Linux `shutdown` behavior is
-identical.
+Accept remains a nonblocking dirty I/O NIF as today: it returns
+`{:error, :eagain}` when no connection is pending, and the caller waits on an
+ordinary scheduler. Closing the broker must make the next Darwin accept report
+closure and allow the supervised listener to restart. Validate this
+explicitly; do not assume Linux `shutdown` behavior is identical.
 
 ### Descriptor import
 

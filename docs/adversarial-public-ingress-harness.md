@@ -36,6 +36,18 @@ the same mixed handoff/relay and overload assertions at local scale but is not
 Q26 capacity evidence. Consequently, `--all` reports 19 passed scenarios, 20
 exercised scenarios, and `q26_qualified: false`.
 
+Focused Cargo regressions additionally cover SIGTERM coordination, a blocked
+derived-cache lock with concurrent warm-route/status access, cache pruning
+ordered against pending proof writes, cancelled and fairly resumed
+reconciliation, bounded native-worker joins, full Unix accept queues and
+admission recovery, and mixed maximum-length active/degraded JSON diagnostics.
+The proxy and public-ingress integration fixtures accept a private
+`PHX_PORT_TEST_TMPDIR` override. Set `TMPDIR` as well for fixtures that use
+`tempfile` directly. The default short Unix test root is retained because
+macOS's usual temporary directory can exceed Unix socket pathname limits.
+These bounded regressions are correctness checks, not new Q26 qualification
+or evidence of macOS runtime behavior from a Linux run.
+
 `--qualification` selects the accepted Q26 values: 25,000 confirmed handoffs,
 5,000 admitted relays, 7,500 unchanged long-lived connections distributed
 across both ownership modes, at least 1,000 newly accepted connections per
