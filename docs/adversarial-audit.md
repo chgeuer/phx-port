@@ -319,15 +319,52 @@ Reproduction harnesses and captured results are in `evidence/`:
 | `evidence/handoff-queue-audit-results.jsonl` | Recorded PHXP queue results from the audited revision |
 | `evidence/handoff-reliability-evidence.md` | Detailed Elixir/native handoff findings |
 | `evidence/freeze_repro.exs` | The in-VM PHXP sender that wedges the node on Linux |
-| `evidence/invm_peer_sender.py` + `evidence/invm_peer_starvation.exs` | Out-of-VM sender, in-VM stalled peer — stays healthy |
-| `evidence/invm_peer_sender.py` + `evidence/invm_tls_starvation.exs` | Out-of-VM sender, in-VM TLS handshake — stays healthy |
-| `evidence/stalled_handoff_sender.py` + `evidence/out_of_vm_starvation.exs` | Fully out-of-VM production topology — stays healthy |
+| `evidence/invm_peer_sender.py` + `evidence/invm_peer_starvation.exs` | Out-of-VM sender, in-VM stalled TCP peers |
+| `evidence/invm_peer_sender.py` + `evidence/invm_tls_starvation.exs` | Out-of-VM sender, in-VM verified TLS handshakes and idle TLS peers |
+| `evidence/stalled_handoff_sender.py` + `evidence/out_of_vm_starvation.exs` | Fully out-of-VM sender and stalled peers |
 
-The four starvation probes run under `ELIXIR_ERL_OPTIONS="+S 2:2" mix run`
-from `phx_port_handoff/` and take `<count> <blocking>` arguments; they write a
-verdict to `/tmp/oov-verdict` and print scheduler tick counts. A missing
-verdict means the VM wedged. Use `ELIXIR_ERL_OPTIONS` rather than
-`elixir --erl`, which mangles `System.argv/0`.
+The three external-sender scheduler probes share `evidence/scheduler_probe.exs`.
+Run each in a fresh VM from `phx_port_handoff/`, always with an external watchdog:
+
+```bash
+MIX_ENV=test ELIXIR_ERL_OPTIONS="+S 2:2" timeout --kill-after=10s 180s \
+  mix run ../docs/evidence/out_of_vm_starvation.exs 2 1
+```
+
+Substitute `invm_peer_starvation.exs` or `invm_tls_starvation.exs` for the other
+two topologies. Arguments are `<count:1..64> <blocking:0|1>`; the PHXP sender
+remains outside the VM in every case. `freeze_repro.exs` is a deliberately
+freezing forensic artifact, not an ordinary test or one of these safe probes.
+Use `ELIXIR_ERL_OPTIONS` rather than `elixir --erl`, which mangles `System.argv/0`.
+
+A healthy result now requires the sender's reported PID to match the spawned
+OS process, all requested real `ADOPTED` acknowledgements, and the same number
+of receiver-side Thousand Island connection starts. The receiver must retain
+that population through the entire three-second heartbeat window, without a
+connection-stop event. Socket liveness is also sampled every 50 ms: the external
+sender observes its own peers continuously between samples, and the VM checks
+in-VM TCP/TLS peers. The TLS variant completes certificate- and exact-hostname-
+verified handshakes using an in-memory generated test CA before measuring idle
+TLS connections. No real certificates or private keys are used.
+
+Only after the sender processes `STOP` and exits successfully can the probe
+report `schedulers_healthy` (exit 0) or `SCHEDULERS_STARVED` (exit 1, fewer than
+ten ticks). Missing/failed startup, insufficient adoption, early socket closure,
+or failed child completion produces `inconclusive` (exit 2), never healthy.
+Unexpected exceptions and external watchdog expiry also invalidate a run; a
+missing verdict alone is not proof of a VM freeze. The old tick-only scripts
+could emit healthy without any sender, so they were unsuitable for unattended
+evidence. This does not invalidate the historical manually observed results
+in the topology table below.
+
+Each run announces a new private `PROBE_DIRECTORY` containing `sender.log` and
+`verdict`. `PHXP_PROBE_DIRECTORY` may select a short, not-yet-existing directory;
+an existing path is refused, never deleted or reused. The default is a unique
+directory under the temporary directory. Socket endpoints, listeners, clients,
+and the heartbeat are cleaned up before the verdict; there are no key files.
+The Python child has its own 20-second OS alarm and is killed by its exact PID
+and reaped on an incomplete run. Retain the two evidence files as needed, then
+remove only that run's announced directory.
 
 Both harnesses expect a debug binary at `runtime-target/debug/phx-port`
 relative to the working directory and create their own scratch state. They

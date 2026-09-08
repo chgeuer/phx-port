@@ -164,6 +164,7 @@ external OS-process watchdog:
 ```bash
 cd phx_port_handoff
 timeout --kill-after=10s 180s mix test test/phx_port_handoff_test.exs test/phx_port_handoff_transport_test.exs
+timeout --kill-after=10s 180s mix test test/scheduler_probe_test.exs
 ```
 
 The startup tests use private fixture sockets and two queued connections to
@@ -182,6 +183,17 @@ Accept-locality coverage starts two isolated loopback BEAM peers with a generate
 cookie, pauses one peer's global lock server, and verifies closed-broker accepts
 do not wait for it. Concurrent direct callers also exercise serialized handoff
 and distinct socket ownership through the external sender.
+
+Scheduler-evidence coverage runs the three external-sender probes in fresh
+two-scheduler VMs with an additional 20-second external watchdog per run. It
+requires real PHXP adoption, matching receiver connection counts and live peers
+through the complete heartbeat window, followed by successful sender exit.
+Missing, failed, or stalled senders, false adoption counts, premature closure,
+and unsuccessful completion must be inconclusive, not healthy. Artifacts use
+private per-run directories and unfinished child processes are reaped. The
+deliberately freezing in-VM-sender evidence script is never executed by this
+suite. See `docs/adversarial-audit.md` in the repository root for probe usage
+and the distinction between current automated evidence and historical results.
 
 An ExUnit timeout alone cannot stop a frozen VM. Do not move the PHXP sender
 back into the receiving BEAM: its socket operations can change the shared
