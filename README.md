@@ -77,7 +77,9 @@ export PHX_PORT_CONFIG="C:\Users\me\.phx-ports.toml"  # Windows
 
 An unset override retains the default per-user registry for allocation; an
 empty override is an error. Filesystem paths preserve their operating-system
-encoding, including non-UTF-8 Unix paths.
+encoding, including non-UTF-8 Unix paths. If the filesystem rejects a path's
+encoding, allocation reports that native error rather than using the HOME
+registry.
 
 Production workload automation can replace the current-directory key with an
 explicit logical Workload ID:

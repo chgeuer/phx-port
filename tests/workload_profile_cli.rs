@@ -438,7 +438,44 @@ fn config_override_preserves_non_utf8_paths() {
         Path::new(OsStr::from_bytes(b"registry-\xff")).join("ports.toml"),
         Path::new("registry").join(OsStr::from_bytes(b"ports-\xff.toml")),
     ] {
-        assert_config_override_allocation(&registry);
+        let probe_directory = tempdir().unwrap();
+        let probe = probe_directory.path().join(&registry);
+        let native_creation =
+            fs::create_dir(probe.parent().unwrap()).and_then(|()| fs::write(&probe, b""));
+        eprintln!("native filesystem probe for {registry:?}: {native_creation:?}");
+        match native_creation {
+            Ok(()) => assert_config_override_allocation(&registry),
+            Err(error) => {
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(nix::libc::EILSEQ),
+                    "unexpected native fixture error for {registry:?}: {error}"
+                );
+                let directory = tempdir().unwrap();
+                let home = tempdir().unwrap();
+                let output = allocation_command(
+                    directory.path(),
+                    &directory.path().join(&registry),
+                    Some("ignored-environment-id"),
+                    &["--workload-id", "config-path-web", "https"],
+                )
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .output()
+                .unwrap();
+                assert_eq!(output.status.code(), Some(1), "{output:?}");
+                assert!(output.stdout.is_empty(), "rejected path emitted a port");
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert!(
+                    stderr.starts_with("Error: ") && stderr.contains(&error.to_string()),
+                    "native encoding rejection was not surfaced: {stderr}"
+                );
+                assert!(
+                    home.path().read_dir().unwrap().next().is_none(),
+                    "rejected override created HOME state"
+                );
+            }
+        }
     }
 }
 
