@@ -299,7 +299,7 @@ fn format_ports(ports: &[(i64, String)], as_url: bool) -> String {
         .iter()
         .map(|(p, r)| {
             let port_str = if as_url {
-                format!("http://localhost:{}", p)
+                format!("{}://localhost:{}", scheme_for_role(r), p)
             } else {
                 format!("{}", p)
             };
@@ -677,7 +677,7 @@ fn cmd_open(config: &Path, role: &str) {
         }
     };
 
-    let url = format!("http://localhost:{}", port);
+    let url = format!("{}://localhost:{}", scheme_for_role(role), port);
     eprintln!("Opening {}", url);
 
     if let Err(e) = open_url(&url) {

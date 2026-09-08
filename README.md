@@ -784,6 +784,10 @@ phx-port launch
 phx-port launch debug
 ```
 
+Navigation URLs from `list`, `open`, and `launch` use `https://localhost:<port>`
+for the `https` role and `http://localhost:<port>` for `main` and other roles.
+The registered port is unchanged.
+
 ### Interactive mode
 
 Running `phx-port` with no arguments in a terminal shows the help text. This way it never accidentally auto-registers when you're just exploring.
