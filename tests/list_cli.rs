@@ -65,6 +65,67 @@ fn assert_tree(output: &str, root: &str, mut expected: Vec<(String, String)>) {
 }
 
 #[test]
+fn tree_lists_registered_root_and_child_assignments_once() {
+    let directory = tempdir().unwrap();
+    let home = directory.path().canonicalize().unwrap();
+
+    for parent in [home.clone(), home.join("projects")] {
+        let child = parent.join("api").display().to_string();
+        let parent = parent.display().to_string();
+        let assignments = [
+            (parent.clone(), "main", 4001),
+            (child.clone(), "main", 4002),
+        ];
+
+        assert_eq!(
+            list(&home, &assignments, &["list", "--flat"]),
+            format!(" 4001  {parent}\n 4002  {child}\n")
+        );
+        for (arguments, prefix) in TREE_MODES {
+            assert_tree(
+                &list(&home, &assignments, arguments),
+                &format!("{parent} .. {prefix}4001"),
+                vec![("api".to_string(), format!("{prefix}4002"))],
+            );
+        }
+    }
+}
+
+#[test]
+fn tree_lists_multirole_registered_root_with_and_without_children() {
+    let directory = tempdir().unwrap();
+    let home = directory.path().canonicalize().unwrap();
+    let parent = home.join("projects").display().to_string();
+    let child = home.join("projects/api").display().to_string();
+    let assignments = [
+        (parent.clone(), "main", 4001),
+        (parent.clone(), "debug", 4003),
+        (child.clone(), "main", 4002),
+    ];
+
+    assert_eq!(
+        list(&home, &assignments[..2], &["list", "--flat"]),
+        format!(" 4001  {parent}\n 4003  {parent} (debug)\n")
+    );
+    assert_eq!(
+        list(&home, &assignments, &["list", "--flat"]),
+        format!(" 4001  {parent}\n 4002  {child}\n 4003  {parent} (debug)\n")
+    );
+    for (arguments, prefix) in TREE_MODES {
+        let root = format!("{parent} .. {prefix}4001, {prefix}4003 (debug)");
+        assert_eq!(
+            list(&home, &assignments[..2], arguments),
+            format!("{root}\n")
+        );
+        assert_tree(
+            &list(&home, &assignments, arguments),
+            &root,
+            vec![("api".to_string(), format!("{prefix}4002"))],
+        );
+    }
+}
+
+#[test]
 fn tree_preserves_home_and_filesystem_root_project_assignments() {
     let directory = tempdir().unwrap();
     let home = directory.path().canonicalize().unwrap();

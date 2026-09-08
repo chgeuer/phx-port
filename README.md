@@ -817,6 +817,9 @@ HOME remain absolute and never merge with HOME-relative names. Logical
 Workload IDs remain separate from filesystem paths; listings without a shared
 root use a `Workloads` heading. Flat output retains the original registry keys.
 
+Ports registered on the displayed root appear on its heading even when it has
+registered descendants.
+
 ```
 $ phx-port list
 /home/user

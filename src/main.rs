@@ -409,14 +409,17 @@ fn cmd_list_tree(config: &Path, as_url: bool) {
         display_root.to_string_lossy().into_owned()
     };
 
+    if render_node.ports.is_empty() {
+        println!("{}", display_root);
+    } else {
+        println!(
+            "{} .. {}",
+            display_root,
+            format_ports(&render_node.ports, as_url)
+        );
+    }
+
     if render_node.children.is_empty() {
-        if !render_node.ports.is_empty() {
-            println!(
-                "{} .. {}",
-                display_root,
-                format_ports(&render_node.ports, as_url)
-            );
-        }
         return;
     }
 
@@ -431,7 +434,6 @@ fn cmd_list_tree(config: &Path, as_url: bool) {
         .unwrap_or(0);
     let target = max_end + 2;
 
-    println!("{}", display_root);
     for line in &lines {
         match &line.port_info {
             Some(ports) => {
