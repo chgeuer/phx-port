@@ -332,6 +332,13 @@ Recommended public default:
 This removes attacker-controlled discovery fan-out and the 32-candidate
 correctness ceiling from normal production routing.
 
+A cached relay connection failure invalidates a Verified Route only if its
+workload endpoint, declaration generation, certificate fingerprint, and TLS
+verification time still match the observation selected before handoff. The
+single retry uses a newer valid Verified Route without discovery admission
+when available; otherwise it follows normal bounded rediscovery. Routing
+locks are never held across network I/O.
+
 ### Configuration and state
 
 Production configuration should be separated from derived state:

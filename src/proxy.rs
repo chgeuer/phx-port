@@ -292,7 +292,7 @@ struct ProbeMatch {
     certificate: CertificateProof,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ActiveRoute {
     backend: Backend,
     certificate: CertificateProof,
@@ -1218,7 +1218,7 @@ struct HandoffJob {
     hostname: String,
     peeked_length: usize,
     backend: Backend,
-    cached: bool,
+    cached_route: Option<ActiveRoute>,
     relay_idle_timeout: Option<Duration>,
 }
 
@@ -1227,7 +1227,7 @@ struct RelayJob {
     admission: PreRoutingAdmission,
     hostname: String,
     backend: Backend,
-    cached: bool,
+    cached_route: Option<ActiveRoute>,
     idle_timeout: Option<Duration>,
 }
 
@@ -2030,7 +2030,7 @@ async fn prepare_tokio_handoff(
     .map_err(|error| error.to_string())?;
     state.record_source_diagnostic(source, &hostname);
 
-    let (backend, cached) = select_tokio_route(&hostname, ingress).await?;
+    let (backend, cached_route) = select_tokio_route(&hostname, ingress).await?;
     let relay_idle_timeout = state.relay_idle_timeout(&hostname);
     let client = client
         .into_std()
@@ -2042,7 +2042,7 @@ async fn prepare_tokio_handoff(
         hostname,
         peeked_length,
         backend,
-        cached,
+        cached_route,
         relay_idle_timeout,
     })
 }
@@ -2050,9 +2050,9 @@ async fn prepare_tokio_handoff(
 async fn select_tokio_route(
     hostname: &str,
     ingress: &TokioIngress,
-) -> Result<(Backend, bool), String> {
-    if let Some(backend) = current_active_backend(&ingress.state, hostname)? {
-        return Ok((backend, true));
+) -> Result<(Backend, Option<ActiveRoute>), String> {
+    if let Some(route) = current_active_route(&ingress.state, hostname)? {
+        return Ok((route.backend.clone(), Some(route)));
     }
 
     let deadline = Instant::now()
@@ -2091,7 +2091,7 @@ async fn select_tokio_route(
         return Err("route selection timed out".to_string());
     }
     match received {
-        Ok(Ok(result)) => result.map(|backend| (backend, false)),
+        Ok(Ok(result)) => result.map(|backend| (backend, None)),
         Ok(Err(_)) => Err("route-selection worker dropped its result".to_string()),
         Err(_) => {
             ingress
@@ -2102,7 +2102,7 @@ async fn select_tokio_route(
     }
 }
 
-fn current_active_backend(state: &ProxyState, hostname: &str) -> Result<Option<Backend>, String> {
+fn current_active_route(state: &ProxyState, hostname: &str) -> Result<Option<ActiveRoute>, String> {
     loop {
         let active = state
             .routes
@@ -2115,7 +2115,7 @@ fn current_active_backend(state: &ProxyState, hostname: &str) -> Result<Option<B
         };
         let now_unix_seconds = current_unix_seconds();
         if active.certificate_is_valid_at(now_unix_seconds) {
-            return Ok(Some(active.backend));
+            return Ok(Some(active));
         }
         if deactivate_expired_route(state, hostname, now_unix_seconds) {
             return Ok(None);
@@ -3861,9 +3861,9 @@ fn handle_connection(
         .set_read_timeout(None)
         .map_err(|error| format!("cannot clear ClientHello timeout before handoff: {error}"))?;
 
-    let cached_backend = current_active_backend(&state, &hostname)?;
-    let backend = if let Some(backend) = cached_backend.as_ref() {
-        backend.clone()
+    let cached_route = current_active_route(&state, &hostname)?;
+    let backend = if let Some(route) = cached_route.as_ref() {
+        route.backend.clone()
     } else {
         resolve_backend(&hostname, &state)?
     };
@@ -3875,7 +3875,7 @@ fn handle_connection(
         hostname,
         peeked_length,
         backend,
-        cached: cached_backend.is_some(),
+        cached_route,
         relay_idle_timeout,
     };
 
@@ -3944,7 +3944,7 @@ fn perform_handoff(handoff: HandoffJob, state: &ProxyState) -> Result<Option<Rel
         hostname,
         peeked_length,
         backend,
-        cached,
+        cached_route,
         relay_idle_timeout,
     } = handoff;
     let process_start = *PROCESS_START.get_or_init(Instant::now);
@@ -4003,7 +4003,7 @@ fn perform_handoff(handoff: HandoffJob, state: &ProxyState) -> Result<Option<Rel
         admission,
         hostname,
         backend,
-        cached,
+        cached_route,
         idle_timeout: relay_idle_timeout,
     }))
 }
@@ -4015,7 +4015,7 @@ impl HandoffJob {
             admission: self.admission,
             hostname: self.hostname,
             backend: self.backend,
-            cached: self.cached,
+            cached_route: self.cached_route,
             idle_timeout: self.relay_idle_timeout,
         }
     }
@@ -4097,7 +4097,7 @@ where
         admission,
         hostname,
         mut backend,
-        cached,
+        cached_route,
         idle_timeout,
     } = job;
     let state = &ingress.state;
@@ -4114,15 +4114,19 @@ where
         .map_err(|error| format!("cannot adopt accepted socket into Tokio: {error}"))?;
     let upstream = match connect_backend(backend.clone()).await {
         Ok(stream) => stream,
-        Err(_) if cached => {
+        Err(_) if cached_route.is_some() => {
             state
                 .relay_backend_connect_failures
                 .fetch_add(1, Ordering::Relaxed);
-            state
-                .routes
-                .write()
-                .map_err(|_| "route table lock poisoned".to_string())?
-                .remove(&hostname);
+            {
+                let mut routes = state
+                    .routes
+                    .write()
+                    .map_err(|_| "route table lock poisoned".to_string())?;
+                if route_observation_matches(routes.get(&hostname), cached_route.as_ref()) {
+                    routes.remove(&hostname);
+                }
+            }
             backend = select_tokio_route(&hostname, ingress).await?.0;
             connect_backend(backend).await.map_err(|error| {
                 state
@@ -5609,7 +5613,7 @@ mod tests {
         ProbeMatch, ProxyState, QueuedRouteSelection, RelayJob, RouteSelectionJob,
         SOURCE_DIAGNOSTIC_EVENT_INTERVAL, TLS_REVALIDATION_INTERVAL, TokioIngress, WaitingClient,
         cache_negative, clear_conflict, collect_probe_matches, commit_relay_start,
-        current_active_backend, current_unix_seconds, handle_connection, handle_route_selection,
+        current_active_route, current_unix_seconds, handle_connection, handle_route_selection,
         install_active_route, observe_workloads, prefer_https_per_project,
         reap_ready_connection_tasks, reconcile_routes, reconcile_workloads, record_conflict,
         record_connection_completion, relay_tokio_connection,
@@ -6707,7 +6711,7 @@ mod tests {
             .unwrap()
             .certificate
             .not_after_unix_seconds = current_unix_seconds();
-        assert!(current_active_backend(&state, HOSTNAME).unwrap().is_none());
+        assert!(current_active_route(&state, HOSTNAME).unwrap().is_none());
         let expired_status = serde_json::from_str::<serde_json::Value>(&render_control_response(
             &state,
             &running_shutdown(),
@@ -6862,8 +6866,8 @@ mod tests {
             admission: state.admission.try_admit(source.ip()).unwrap(),
             hostname: "www.example.test".into(),
             peeked_length: 0,
+            cached_route: Some(active_route(backend.clone())),
             backend,
-            cached: true,
             relay_idle_timeout: None,
         };
         drop(peer);
@@ -6977,7 +6981,7 @@ mod tests {
                 role: "https".to_string(),
                 port: 1,
             },
-            cached: false,
+            cached_route: None,
             relay_idle_timeout: None,
         };
 
@@ -6996,7 +7000,7 @@ mod tests {
                 role: "https".to_string(),
                 port: 1,
             },
-            cached: false,
+            cached_route: None,
             relay_idle_timeout: None,
         };
 
@@ -7147,7 +7151,7 @@ mod tests {
                 role: "https".to_string(),
                 port: 1,
             },
-            cached: false,
+            cached_route: None,
             relay_idle_timeout: None,
         };
         let shutdown = IngressShutdown::new(Duration::from_secs(1));
@@ -8036,6 +8040,259 @@ mod tests {
     }
 
     #[test]
+    fn cached_relay_failure_preserves_refreshed_route_with_full_discovery_queue() {
+        const HOSTNAME: &str = "refreshed.example.test";
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        for changed in ["backend", "generation", "certificate", "tls_check"] {
+            for refresh_before_connect in [false, true] {
+                let directory = tempdir().unwrap();
+                let state = Arc::new(ProxyState::new_with_profile(
+                    directory.path().join("ports.toml"),
+                    public_profile(HOSTNAME, "web"),
+                ));
+                let workload = TcpListener::bind("127.0.0.1:0").unwrap();
+                let replacement = TcpListener::bind("127.0.0.1:0").unwrap();
+                let mut observed = active_route(Backend {
+                    project: "web".into(),
+                    role: "https".into(),
+                    port: workload.local_addr().unwrap().port(),
+                });
+                observed.declaration_generation = Some(1);
+                observed.last_tls_check = Instant::now() - Duration::from_secs(1);
+                let mut refreshed = observed.clone();
+                match changed {
+                    "backend" => refreshed.backend.port = replacement.local_addr().unwrap().port(),
+                    "generation" => refreshed.declaration_generation = Some(2),
+                    "certificate" => refreshed.certificate.fingerprint = "BB:CC".into(),
+                    "tls_check" => refreshed.last_tls_check += Duration::from_millis(1),
+                    _ => unreachable!(),
+                }
+                state
+                    .routes
+                    .write()
+                    .unwrap()
+                    .insert(HOSTNAME.into(), observed.clone());
+                let (route_sender, _route_receiver) = mpsc::sync_channel(0);
+                let ingress = TokioIngress {
+                    state: Arc::clone(&state),
+                    shutdown: running_shutdown(),
+                    route_sender,
+                };
+                let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+                let _public_peer = TcpStream::connect(frontend.local_addr().unwrap()).unwrap();
+                let (client, source) = frontend.accept().unwrap();
+                let connect_calls = AtomicUsize::new(0);
+
+                runtime.block_on(async {
+                    let (backend, cached_route) =
+                        select_tokio_route(HOSTNAME, &ingress).await.unwrap();
+                    let job = super::HandoffJob {
+                        client,
+                        accepted_at: Instant::now(),
+                        admission: state.admission.try_admit(source.ip()).unwrap(),
+                        hostname: HOSTNAME.into(),
+                        peeked_length: 0,
+                        backend,
+                        cached_route,
+                        relay_idle_timeout: None,
+                    }
+                    .into_relay();
+                    let publish = || {
+                        if changed == "generation" {
+                            let mut profile = state.hosting_profile.write().unwrap();
+                            let HostingProfile::Public(snapshot) = &mut *profile else {
+                                unreachable!()
+                            };
+                            Arc::make_mut(snapshot).generation = 2;
+                        }
+                        state
+                            .routes
+                            .write()
+                            .unwrap()
+                            .insert(HOSTNAME.into(), refreshed.clone());
+                    };
+                    if refresh_before_connect {
+                        publish();
+                    }
+                    let (started, started_rx) = oneshot::channel();
+                    let (release, release_rx) = oneshot::channel();
+                    let mut pause = Some((started, release_rx));
+                    let calls = &connect_calls;
+                    let relay = super::establish_relay(job, &ingress, |backend| {
+                        let pause = pause.take();
+                        async move {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            if let Some((started, release_rx)) = pause {
+                                started.send(backend).unwrap();
+                                release_rx.await.unwrap();
+                                Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+                            } else {
+                                super::connect_tokio_backend(&backend).await
+                            }
+                        }
+                    });
+                    let refresh = async {
+                        assert_eq!(started_rx.await.unwrap(), observed.backend);
+                        if !refresh_before_connect {
+                            publish();
+                        }
+                        assert_eq!(
+                            select_tokio_route(HOSTNAME, &ingress).await.unwrap().0,
+                            refreshed.backend
+                        );
+                        release.send(()).unwrap();
+                    };
+                    let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                        tokio::join!(relay, refresh)
+                    })
+                    .await
+                    .expect("cached relay retry exceeded its deadline");
+                    assert!(
+                        super::route_observation_matches(
+                            state.routes.read().unwrap().get(HOSTNAME),
+                            Some(&refreshed),
+                        ),
+                        "stale {changed} failure evicted the refresh \
+                         (before_connect={refresh_before_connect}): {:?}",
+                        result.as_ref().err(),
+                    );
+                    let established = result.unwrap().unwrap();
+                    assert_eq!(
+                        established.upstream.peer_addr().unwrap().port(),
+                        refreshed.backend.port
+                    );
+                    let status = serde_json::from_str::<serde_json::Value>(
+                        &render_control_response(&state, &ingress.shutdown, "STATUS JSON"),
+                    )
+                    .unwrap();
+                    assert_eq!(status["ready"], true);
+                });
+
+                assert_eq!(connect_calls.load(Ordering::Relaxed), 2);
+                assert_eq!(
+                    state.relay_backend_connect_failures.load(Ordering::Relaxed),
+                    1
+                );
+                assert_eq!(state.rejected_routing_queue.load(Ordering::Relaxed), 0);
+                assert_eq!(state.queued_route_selections.load(Ordering::Relaxed), 0);
+                let admission = state.admission.snapshot();
+                assert_eq!(admission.global.in_use, 0);
+                assert_eq!(admission.pre_routing.in_use, 0);
+                assert_eq!(admission.relay.in_use, 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_relay_failure_invalidates_current_observation_and_reverifies() {
+        const HOSTNAME: &str = "rediscovered.example.test";
+
+        let directory = tempdir().unwrap();
+        let certificate = TestCertificate::for_hostname(HOSTNAME);
+        let workload = TestTlsBackend::start(&certificate, b"rediscovered");
+        let registry = write_logical_registry(directory.path(), &[("web", workload.port())]);
+        let state = Arc::new(ProxyState::new_with_profile_and_connector(
+            registry,
+            public_profile(HOSTNAME, "web"),
+            certificate.connector(),
+        ));
+        let verified = resolve_backend(HOSTNAME, &state).unwrap();
+        let observed = state.routes.read().unwrap()[HOSTNAME].clone();
+        assert_eq!(workload.accepted(), 1);
+
+        let (route_sender, route_receiver) = mpsc::sync_channel(1);
+        let ingress = TokioIngress {
+            state: Arc::clone(&state),
+            shutdown: running_shutdown(),
+            route_sender,
+        };
+        let worker_state = Arc::clone(&state);
+        let worker = thread::spawn(move || {
+            let job = route_receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(
+                !worker_state.routes.read().unwrap().contains_key(HOSTNAME),
+                "the failed current observation must be invalidated before rediscovery"
+            );
+            handle_route_selection(job, &worker_state);
+        });
+        let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _public_peer = TcpStream::connect(frontend.local_addr().unwrap()).unwrap();
+        let (client, source) = frontend.accept().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        let connect_calls = AtomicUsize::new(0);
+        let expected = &verified;
+        let result = runtime.block_on(async {
+            let (backend, cached_route) = select_tokio_route(HOSTNAME, &ingress).await.unwrap();
+            let job = super::HandoffJob {
+                client,
+                accepted_at: Instant::now(),
+                admission: state.admission.try_admit(source.ip()).unwrap(),
+                hostname: HOSTNAME.into(),
+                peeked_length: 0,
+                backend,
+                cached_route,
+                relay_idle_timeout: None,
+            }
+            .into_relay();
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                super::establish_relay(job, &ingress, |backend| {
+                    let first = connect_calls.fetch_add(1, Ordering::Relaxed) == 0;
+                    async move {
+                        assert_eq!(&backend, expected);
+                        if first {
+                            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+                        } else {
+                            super::connect_tokio_backend(&backend).await
+                        }
+                    }
+                }),
+            )
+            .await
+        });
+        worker.join().unwrap();
+        let established = result
+            .expect("cached relay rediscovery exceeded its deadline")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            established.upstream.peer_addr().unwrap().port(),
+            workload.port()
+        );
+        drop(established);
+        assert_eq!(connect_calls.load(Ordering::Relaxed), 2);
+        assert!(
+            workload.accepted() >= 2,
+            "rediscovery skipped certificate verification"
+        );
+        let routes = state.routes.read().unwrap();
+        assert!(
+            !super::route_observation_matches(routes.get(HOSTNAME), Some(&observed)),
+            "rediscovery reused the failed observation"
+        );
+        assert_eq!(routes[HOSTNAME].certificate, observed.certificate);
+        assert_eq!(
+            state.relay_backend_connect_failures.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(state.queued_route_selections.load(Ordering::Relaxed), 0);
+        let admission = state.admission.snapshot();
+        assert_eq!(admission.global.in_use, 0);
+        assert_eq!(admission.pre_routing.in_use, 0);
+        assert_eq!(admission.relay.in_use, 0);
+    }
+
+    #[test]
     fn async_backend_connect_failure_releases_relay_capacity() {
         let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
         let public_peer = TcpStream::connect(frontend.local_addr().unwrap()).unwrap();
@@ -8056,7 +8313,7 @@ mod tests {
                 role: "https".to_string(),
                 port: unavailable_port,
             },
-            cached: false,
+            cached_route: None,
             idle_timeout: None,
         };
         let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(1);
@@ -8105,7 +8362,7 @@ mod tests {
                 role: "https".to_string(),
                 port: 443,
             },
-            cached: false,
+            cached_route: None,
             idle_timeout: None,
         };
         let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(1);
@@ -8239,7 +8496,7 @@ mod tests {
                 role: "https".to_string(),
                 port: workload.local_addr().unwrap().port(),
             },
-            cached: false,
+            cached_route: None,
             idle_timeout: None,
         };
         let (route_sender, _route_receiver) = std::sync::mpsc::sync_channel(1);
