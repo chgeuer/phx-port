@@ -4,14 +4,20 @@ use fs2::FileExt;
 #[cfg(target_os = "linux")]
 use native_tls::{Identity, TlsAcceptor};
 #[cfg(target_os = "linux")]
+use nix::poll::{PollFd, PollFlags, poll};
+#[cfg(target_os = "linux")]
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, PKCS_RSA_SHA256,
 };
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::net::TcpStream;
 use std::net::{SocketAddr, TcpListener};
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
@@ -182,6 +188,134 @@ impl Drop for TlsBackend {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct ProbeCosts {
+    durations: Vec<Duration>,
+    per_workload: Vec<usize>,
+    peak_open: usize,
+}
+
+#[cfg(target_os = "linux")]
+struct StalledWorkloads {
+    ports: Vec<u16>,
+    shutdown: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<ProbeCosts>>,
+}
+
+#[cfg(target_os = "linux")]
+impl StalledWorkloads {
+    fn start(workloads: usize) -> Self {
+        assert!((1..=100).contains(&workloads));
+        let listeners = (0..workloads)
+            .map(|_| {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                listener
+            })
+            .collect::<Vec<_>>();
+        let ports = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().port())
+            .collect();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = thread::spawn(move || {
+            let mut costs = ProbeCosts {
+                durations: Vec::new(),
+                per_workload: vec![0; workloads],
+                peak_open: 0,
+            };
+            let mut probes: Vec<(usize, TcpStream, Instant, usize)> = Vec::new();
+            let mut shutdown_deadline = None;
+            loop {
+                if worker_shutdown.load(Ordering::Acquire) {
+                    let deadline = shutdown_deadline
+                        .get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
+                    assert!(
+                        Instant::now() < *deadline,
+                        "stalled fixture sockets did not close after child exit"
+                    );
+                }
+                let ready = {
+                    let mut descriptors = listeners
+                        .iter()
+                        .map(|listener| PollFd::new(listener.as_fd(), PollFlags::POLLIN))
+                        .chain(probes.iter().map(|(_, stream, _, _)| {
+                            PollFd::new(stream.as_fd(), PollFlags::POLLIN)
+                        }))
+                        .collect::<Vec<_>>();
+                    poll(&mut descriptors, 10_u16).unwrap();
+                    descriptors
+                        .iter()
+                        .map(|descriptor| descriptor.revents().unwrap())
+                        .collect::<Vec<_>>()
+                };
+                for index in (0..probes.len()).rev() {
+                    if ready[workloads + index].is_empty() {
+                        continue;
+                    }
+                    let (_, stream, _, received) = &mut probes[index];
+                    let mut buffer = [0; 1024];
+                    let closed = loop {
+                        match stream.read(&mut buffer) {
+                            Ok(0) => {
+                                assert!(*received > 0, "probe sent no TLS ClientHello");
+                                break true;
+                            }
+                            Ok(size) => {
+                                *received += size;
+                                assert!(*received <= 64 * 1024, "unbounded fixture input");
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                break false;
+                            }
+                            Err(error) => panic!("stalled fixture read failed: {error}"),
+                        }
+                    };
+                    if closed {
+                        let (workload, _, started, _) = probes.swap_remove(index);
+                        costs.durations.push(started.elapsed());
+                        costs.per_workload[workload] += 1;
+                        assert!(costs.durations.len() <= 1_000);
+                    }
+                }
+                for (workload, listener) in listeners.iter().enumerate() {
+                    if ready[workload].contains(PollFlags::POLLIN) {
+                        let (stream, _) = listener.accept().unwrap();
+                        stream.set_nonblocking(true).unwrap();
+                        probes.push((workload, stream, Instant::now(), 0));
+                        assert!(probes.len() <= 100, "fixture probe capacity exceeded");
+                        costs.peak_open = costs.peak_open.max(probes.len());
+                    }
+                }
+                if worker_shutdown.load(Ordering::Acquire) && probes.is_empty() {
+                    return costs;
+                }
+            }
+        });
+        Self {
+            ports,
+            shutdown,
+            worker: Some(worker),
+        }
+    }
+
+    fn finish(mut self) -> ProbeCosts {
+        self.shutdown.store(true, Ordering::Release);
+        self.worker.take().unwrap().join().unwrap()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for StalledWorkloads {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
 struct HostFixture {
     root: TempDir,
     ingress_config: PathBuf,
@@ -286,6 +420,10 @@ impl HostFixture {
     }
 
     fn command(&self, extra: &[&str]) -> Output {
+        self.command_with_timeout(extra, Duration::from_secs(5))
+    }
+
+    fn command_with_timeout(&self, extra: &[&str], timeout: Duration) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_phx-port"));
         command.args(self.arguments(extra));
         self.configure(&mut command);
@@ -295,7 +433,7 @@ impl HostFixture {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + timeout;
         while child.try_wait().unwrap().is_none() {
             if Instant::now() >= deadline {
                 child.kill().unwrap();
@@ -304,6 +442,127 @@ impl HostFixture {
             thread::sleep(Duration::from_millis(10));
         }
         child.wait_with_output().unwrap()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn measure_stalled_preflight(workloads: usize, hostnames_per_workload: usize) {
+    let routes = workloads * hostnames_per_workload;
+    assert!((1..=1_000).contains(&routes));
+    let backends = StalledWorkloads::start(workloads);
+    let host = HostFixture::new(None, None);
+    let mut registry = "[ports]\n".to_string();
+    let mut ingress = format!(
+        "[ingress]\nmode = \"public\"\nunknown_sni = \"reject\"\nlisten = [\"{}\"]\n",
+        host.ingress_address
+    );
+    for (workload, port) in backends.ports.iter().enumerate() {
+        registry.push_str(&format!("\n[ports.scale-{workload:03}]\nhttps = {port}\n"));
+        for hostname in 0..hostnames_per_workload {
+            let index = workload * hostnames_per_workload + hostname;
+            ingress.push_str(&format!(
+                "\n[ingress.hosts.\"scale-{index:04}.example.test\"]\n\
+                 workload = \"scale-{workload:03}\"\nrole = \"https\"\nrequired = {}\n",
+                index.is_multiple_of(2)
+            ));
+        }
+    }
+    fs::write(&host.registry, &registry).unwrap();
+    fs::write(&host.ingress_config, ingress).unwrap();
+
+    // Two probe budgets per declaration plus setup slack: a watchdog, not an SLO.
+    let watchdog = Duration::from_millis(400 * routes as u64) + Duration::from_secs(5);
+    let started = Instant::now();
+    let output = host.command_with_timeout(&["--task-budget", "128"], watchdog);
+    let elapsed = started.elapsed();
+    let mut costs = backends.finish();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected a complete FAIL report, not a watchdog kill: {output:?}"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for check in [
+        "PASS execution identity",
+        "PASS ingress configuration",
+        "PASS production paths",
+        "PASS sandbox access",
+        "PASS control authorization",
+        "PASS capacity",
+        "PASS listener acquisition",
+        "PASS system trust roots",
+        "PASS registrations",
+        "Preflight failed: 1 blocking check(s)",
+    ] {
+        assert!(stdout.contains(check), "missing {check:?} in:\n{stdout}");
+    }
+    for (status, kind, count) in [
+        ("FAIL", "required", routes.div_ceil(2)),
+        ("WARN", "optional", routes / 2),
+    ] {
+        if count == 0 {
+            continue;
+        }
+        let line = stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("{status} route certificates:")))
+            .unwrap();
+        assert!(
+            line.contains(&format!("{count} {kind} route(s) failed")),
+            "{line}"
+        );
+        assert_eq!(
+            line.matches("(route selection timed out)").count(),
+            count.min(16),
+            "{line}"
+        );
+        if count > 16 {
+            assert!(
+                line.contains(&format!("{} additional failure(s) omitted", count - 16)),
+                "{line}"
+            );
+        }
+    }
+    assert_eq!(costs.durations.len(), routes);
+    assert_eq!(costs.per_workload, vec![hostnames_per_workload; workloads]);
+    assert!(
+        elapsed < watchdog,
+        "preflight exceeded its fixture watchdog"
+    );
+    assert_eq!(fs::read_to_string(&host.registry).unwrap(), registry);
+    assert!(!host.runtime.join("control/control.sock").exists());
+    drop(TcpListener::bind(host.ingress_address).unwrap());
+
+    costs.durations.sort_unstable();
+    let probe_total = costs.durations.iter().sum::<Duration>().as_secs_f64() * 1_000.0;
+    println!(
+        "preflight_scale workloads={workloads} routes={routes} probes={} \
+         probe_min_ms={:.3} probe_mean_ms={:.3} probe_p50_ms={:.3} probe_max_ms={:.3} \
+         probe_total_ms={probe_total:.3} command_ms={:.3} peak_observed_open_probes={}",
+        costs.durations.len(),
+        costs.durations[0].as_secs_f64() * 1_000.0,
+        probe_total / routes as f64,
+        costs.durations[routes / 2].as_secs_f64() * 1_000.0,
+        costs.durations[routes - 1].as_secs_f64() * 1_000.0,
+        elapsed.as_secs_f64() * 1_000.0,
+        costs.peak_open,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn preflight_stalled_routes_complete_all_diagnostics() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    measure_stalled_preflight(2, 2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "route-scale characterization takes approximately 221 seconds"]
+fn preflight_stalled_routes_at_supported_scale() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    for (workloads, hostnames_per_workload) in [(1, 1), (10, 10), (100, 10)] {
+        measure_stalled_preflight(workloads, hostnames_per_workload);
     }
 }
 

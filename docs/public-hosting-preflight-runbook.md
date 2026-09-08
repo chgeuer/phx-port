@@ -39,6 +39,79 @@ registry-related `FAIL` instead of indefinitely delaying the report;
 independent categories still run. Normal Workload allocation retains its
 blocking, exclusive locking.
 
+### Route-scale duration
+
+Registered Route Declarations are checked **serially**, each with a fresh
+200 ms TCP/TLS probe deadline. Hostnames sharing a Workload/role still require
+independent exact-hostname certificate verification. A reachable Workload
+that accepts TCP but never responds to TLS can therefore consume roughly
+200 ms per declaration: about 20 seconds for 100 declarations or 200 seconds
+for the supported 1,000-declaration maximum, before configuration, filesystem,
+trust initialization, scheduling, and report overhead.
+
+This is finite accumulated probe cost, not CP-02's former indefinite registry
+lock wait. The one-second registry-access deadlines are not whole-command
+deadlines. The report is emitted after all checks finish; limiting displayed
+failure details does not stop the remaining probes. No whole-command latency
+target has been accepted. Do not infer one from the phrase "bounded checks",
+skip certificate verification, or assume the daemon's concurrent probe pool
+also runs preflight.
+
+The Linux CLI fixture measures this without starting an Ingress Node or using
+production Workloads:
+
+```bash
+timeout --kill-after=10s 600s \
+  cargo test --locked --test preflight_cli \
+    preflight_stalled_routes_at_supported_scale -- --exact --ignored --nocapture
+```
+
+It exercises 1, 100, and 1,000 exact declarations across 1, 10, and 100
+loopback-only Workloads, respectively, in fresh private temporary directories.
+One fixture thread polls at most 100 ephemeral listeners and 100 accepted
+sockets, receives only bounded ClientHello data, and sends no TLS response.
+It needs neither certificates nor private keys. Each CLI child has a parent
+process watchdog of `5 seconds + 400 ms * declaration count` (twice the
+per-probe budget plus setup slack), with the separate 600-second shell
+watchdog covering the complete run. These are fixture safety limits, not a
+production latency promise. The children are killed and reaped on expiry;
+fixture sockets, worker, and temporary directories are cleaned up.
+
+The fixture reports per-probe minimum, mean, median, maximum, summed
+accept-to-peer-close observations, peak observed open probes, and whole CLI
+elapsed time. Server-side observations can differ from the client's deadline
+because acceptance, close notification, and process observation are scheduled
+separately. Assertions require every declaration to be probed, complete
+required/optional failure counts and bounded omission details, independent
+diagnostics, an ordinary failing exit rather than a watchdog kill, unchanged
+Port Registry contents, and release of the non-serving listener. The existing
+ready-host TLS and held-lock tests separately cover trusted exact-hostname
+success and bounded registry failure.
+
+The scale fixture is ignored by default because it takes approximately 221
+seconds. `preflight_stalled_routes_complete_all_diagnostics` covers the same
+integration path with four declarations in the ordinary suite. Include the
+scale fixture when collecting duration evidence; the small test alone is not
+supported-scale qualification.
+
+Executed CP-Q1 characterization on 2026-09-08 used Linux 7.1.9-arch1-2 x86_64,
+rustc 1.95.0-nightly (`f134bbc78`), the locked debug build, and unchanged
+production source from `0dd1f926bd516d887baaf17999ad247d7c84f3e5`:
+
+| Workloads | Declarations / completed probes | Mean per probe (ms) | Sum of probe observations (s) | Whole command (s) |
+|---|---|---|---|---|
+| 1 | 1 / 1 | 200.161 | 0.200161 | 0.222134 |
+| 10 | 100 / 100 | 200.176 | 20.017556 | 20.050804 |
+| 100 | 1,000 / 1,000 | 200.173 | 200.173373 | 200.285312 |
+
+All three runs observed a peak of one open probe. At 1,000 declarations,
+all 500 required and 500 optional failures were counted, each category
+displayed 16 details and reported 484 omissions, and every independent
+category passed. A preceding full-scale run completed in 200.276104 seconds.
+This supports retaining the existing runtime behavior: the accepted bounded
+checks complete, and no required whole-command latency contract was violated.
+It is not data-plane load qualification, canary evidence, or Darwin evidence.
+
 ## Inputs
 
 Run as the same dedicated service identity and with the same environment and
