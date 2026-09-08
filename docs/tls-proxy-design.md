@@ -560,6 +560,14 @@ runs. At most 64 client connections may wait for discovery, and at most 32
 backend TLS probes may run concurrently. Simultaneous discoveries for the same
 normalized hostname share one single-flight operation.
 
+Port Registry/cache access, loopback candidate scanning, probe admission, and
+TLS verification consume that same absolute discovery deadline. A slow
+registered Workload can consume part of the budget during scanning; healthy
+candidates still get a verification attempt with the time remaining, even
+when less than 200 milliseconds remain. Probe launch does not require the scan
+to finish within an initial 50-millisecond window, and no probe receives a
+fresh discovery budget.
+
 Applied to the motivating example:
 
 1. A default probe may discover `www.contoso.com`; an SNI-only backend simply

@@ -5642,10 +5642,9 @@ fn probe_candidates_until(
     deadline: Instant,
 ) -> Vec<ProbeMatch> {
     let (sender, receiver) = mpsc::channel();
-    let launch_deadline = deadline.checked_sub(PROBE_TIMEOUT).unwrap_or(deadline);
 
     for backend in candidates {
-        if state.check_running_until(launch_deadline).is_err() {
+        if state.check_running_until(deadline).is_err() {
             break;
         }
         let sender = sender.clone();
@@ -9573,6 +9572,199 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].backend, backend());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn development_discovery_verifies_cached_candidate_after_slow_scan() {
+        const HOSTNAME: &str = "discovery-budget.example.test";
+        let directory = tempdir().unwrap();
+        let certificate = TestCertificate::for_hostname(HOSTNAME);
+        let healthy = TestTlsBackend::start(&certificate, b"");
+        let expected = Backend {
+            project: "/healthy".to_string(),
+            role: "https".to_string(),
+            port: healthy.port(),
+        };
+        let slow = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        slow.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        slow.listen(0).unwrap();
+        let slow: TcpListener = slow.into();
+        let slow_address = slow.local_addr().unwrap();
+        // Linux admits one connection at backlog zero; keep it queued to delay later connects.
+        let queued = TcpStream::connect_timeout(&slow_address, Duration::from_millis(100)).unwrap();
+        assert_eq!(
+            TcpStream::connect_timeout(&slow_address, Duration::from_millis(20))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        let registry = directory.path().join("ports.toml");
+        update_config(&registry, |document| {
+            for (project, port) in [("/slow", slow_address.port()), ("/healthy", healthy.port())] {
+                document["ports"][project] = toml_edit::table();
+                document["ports"][project]["https"] = value(i64::from(port));
+            }
+        });
+        route_cache::store(
+            &registry,
+            route_cache::Storage::CombinedRegistry,
+            HOSTNAME,
+            &expected.project,
+            &expected.role,
+            "STALE",
+        )
+        .unwrap();
+        let state = ProxyState::new_with_profile_and_connector(
+            registry.clone(),
+            HostingProfile::Development,
+            certificate.connector(),
+        );
+        let connector = state.probe_connector_override.clone().unwrap();
+
+        let started = Instant::now();
+        let deadline = started + super::DISCOVERY_TIMEOUT;
+        let cached = route_cache::load_until(
+            &registry,
+            HOSTNAME,
+            route_cache::Storage::CombinedRegistry,
+            Some(state.access_deadline(deadline)),
+        )
+        .unwrap();
+        let candidates =
+            super::candidate_backends_until(&state, cached.as_ref(), deadline).unwrap();
+        let scan_finished = Instant::now();
+        assert_eq!(candidates, vec![expected.clone()]);
+        assert!(scan_finished > deadline - super::PROBE_TIMEOUT);
+        let remaining = deadline.duration_since(scan_finished);
+        let candidate = candidates.into_iter().next().unwrap();
+        let submitted = Instant::now();
+        let receiver = state
+            .submit_probe(deadline, move || {
+                let launched = Instant::now();
+                let proof =
+                    super::probe_backend_until(HOSTNAME, &candidate, Some(&connector), deadline)?;
+                Ok((launched - submitted, launched.elapsed(), proof))
+            })
+            .unwrap();
+        let (launch, tls, proof) = super::receive_probe_until(receiver, &state, deadline).unwrap();
+        eprintln!(
+            "discovery_budget scan_lock={:?} remaining_after_scan={remaining:?} launch={launch:?} tls_proof={tls:?} control_total={:?}",
+            scan_finished - started,
+            started.elapsed()
+        );
+        assert!(Instant::now() < deadline);
+        assert!(launch + tls < remaining);
+        assert_ne!(proof.fingerprint, "STALE");
+
+        let started = Instant::now();
+        let result =
+            super::resolve_backend_until(HOSTNAME, &state, started + super::DISCOVERY_TIMEOUT);
+        let elapsed = started.elapsed();
+        eprintln!("discovery_budget integration_total={elapsed:?} result={result:?}");
+        let workers = state.probe_workers.lock().unwrap().take().unwrap();
+        assert_eq!(
+            workers
+                .join_until(Instant::now() + Duration::from_secs(1))
+                .unwrap(),
+            0
+        );
+        assert_eq!(*state.probes.in_use.lock().unwrap(), 0);
+        assert_eq!(state.waiting_clients.load(Ordering::Acquire), 0);
+        assert!(state.flights.lock().unwrap().is_empty());
+        drop((queued, slow));
+        assert_eq!(result.unwrap(), expected);
+        assert!(elapsed < super::DISCOVERY_TIMEOUT);
+        assert_eq!(state.successful_discoveries.load(Ordering::Acquire), 1);
+        assert!(state.negative.lock().unwrap().is_empty());
+        assert_eq!(
+            state.routes.read().unwrap()[HOSTNAME]
+                .certificate
+                .fingerprint,
+            proof.fingerprint
+        );
+        assert_eq!(
+            route_cache::load(&registry, HOSTNAME, route_cache::Storage::CombinedRegistry)
+                .unwrap()
+                .unwrap()
+                .certificate_fingerprint,
+            proof.fingerprint
+        );
+    }
+
+    #[test]
+    fn development_discovery_rejects_conflicts_with_less_than_full_probe_budget() {
+        const HOSTNAME: &str = "discovery-conflict.example.test";
+        let directory = tempdir().unwrap();
+        let certificate = TestCertificate::for_hostname(HOSTNAME);
+        let wrong_name = TestCertificate::for_hostname("other.example.test");
+        let first = TestTlsBackend::start(&certificate, b"");
+        let second = TestTlsBackend::start(&certificate, b"");
+        let wrong = TestTlsBackend::start(&wrong_name, b"");
+        let state = ProxyState::new_with_profile_and_connector(
+            directory.path().join("ports.toml"),
+            HostingProfile::Development,
+            TestCertificate::connector_for(&[&certificate, &wrong_name]),
+        );
+        let candidates: Vec<_> = [("/first", &first), ("/second", &second), ("/wrong", &wrong)]
+            .into_iter()
+            .map(|(project, workload)| Backend {
+                project: project.to_string(),
+                role: "https".to_string(),
+                port: workload.port(),
+            })
+            .collect();
+        let started = Instant::now();
+        let budget = Duration::from_millis(150);
+        let result =
+            super::discover_backend_until(HOSTNAME, &state, candidates.clone(), started + budget);
+        let elapsed = started.elapsed();
+        if let Some(workers) = state.probe_workers.lock().unwrap().take() {
+            assert_eq!(
+                workers
+                    .join_until(Instant::now() + Duration::from_secs(1))
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            result.unwrap_err(),
+            format!("2 active backends present trusted certificates for {HOSTNAME}")
+        );
+        assert!(elapsed < budget);
+        assert_eq!(state.conflicts.read().unwrap()[HOSTNAME], candidates[..2]);
+        assert!(state.routes.read().unwrap().is_empty());
+        assert_eq!(state.successful_discoveries.load(Ordering::Acquire), 0);
+        assert_eq!(*state.probes.in_use.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn development_discovery_does_not_launch_after_deadline_or_shutdown() {
+        let directory = tempdir().unwrap();
+        let state = ProxyState::new(directory.path().join("ports.toml"));
+        for (deadline, cancelled) in [
+            (Instant::now(), false),
+            (Instant::now() + super::DISCOVERY_TIMEOUT, true),
+        ] {
+            state.shutdown_requested.store(cancelled, Ordering::Release);
+            assert!(
+                super::probe_candidates_until(
+                    "expired.example.test",
+                    vec![backend()],
+                    &state,
+                    deadline,
+                )
+                .is_empty()
+            );
+            assert!(state.probe_workers.lock().unwrap().is_none());
+            assert_eq!(*state.probes.in_use.lock().unwrap(), 0);
+        }
     }
 
     #[test]
