@@ -135,7 +135,7 @@ defmodule PhxPortHandoff do
     lock = {{__MODULE__, broker}, self()}
 
     with {:ok, receipt, fd, address_family, sni, peeked_length} <-
-           :global.trans(lock, fn -> Native.accept(broker) end),
+           :global.trans(lock, fn -> Native.accept(broker) end, [node()]),
          {:ok, socket} <- fdopen(receipt, fd, address_family) do
       retain_client_until_socket_closes(socket, receipt)
       {:ok, socket, receipt, %{sni: sni, peeked_length: peeked_length}}

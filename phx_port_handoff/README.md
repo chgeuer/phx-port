@@ -93,6 +93,8 @@ Use the same canonical project path and role that the workload registered with
 phx-port. The helper uses public port `443` in Bandit's connection metadata and
 does not bind TCP port 443 itself. It configures one Thousand Island acceptor
 because the current native receive path is deliberately serialized.
+Serialization is local to the broker's BEAM node, without involving connected
+nodes.
 
 In the explicit production Hosting Profile, set the same logical
 `PHX_PORT_WORKLOAD_ID` used by the Port Registry. The configured child reads
@@ -175,6 +177,11 @@ and require an `ADOPTED` reply and successful process exit. The complete-TLS
 client also reports readiness and must exit successfully. Fixture callbacks
 reap unfinished child processes on failure; the sender has its own 15-second
 OS alarm. Listeners use ephemeral loopback ports and generated test certificates.
+
+Accept-locality coverage starts two isolated loopback BEAM peers with a generated
+cookie, pauses one peer's global lock server, and verifies closed-broker accepts
+do not wait for it. Concurrent direct callers also exercise serialized handoff
+and distinct socket ownership through the external sender.
 
 An ExUnit timeout alone cannot stop a frozen VM. Do not move the PHXP sender
 back into the receiving BEAM: its socket operations can change the shared

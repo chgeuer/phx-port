@@ -1,6 +1,7 @@
 defmodule PhxPortHandoff.TransportTest do
   use ExUnit.Case, async: false
 
+  alias PhxPortHandoff.Native
   alias PhxPortHandoff.Transport
 
   # A TLS record header announcing a 512 byte ClientHello, followed by two bytes
@@ -55,6 +56,120 @@ defmodule PhxPortHandoff.TransportTest do
 
     assert_receive {^reference, sender}
     assert Port.info(sender) == nil
+  end
+
+  @tag :local_accept
+  @tag timeout: 30_000
+  test "accept does not wait for a connected node's global lock server" do
+    path = Path.join(temporary_directory(), "handoff.sock")
+    cookie = Base.encode16(:crypto.strong_rand_bytes(16))
+
+    with_peer(cookie, fn receiver, receiver_node ->
+      with_peer(cookie, fn remote, remote_node ->
+        assert :ok = :peer.call(receiver, :code, :add_paths, [:code.get_path()])
+
+        assert {:ok, _apps} =
+                 :peer.call(receiver, :application, :ensure_all_started, [:phx_port_handoff])
+
+        assert true = :peer.call(receiver, :net_kernel, :connect_node, [remote_node])
+        assert :ok = :peer.call(receiver, :global, :sync, [])
+        assert [remote_node] == :peer.call(receiver, :erlang, :nodes, [])
+        assert [receiver_node] == :peer.call(remote, :erlang, :nodes, [])
+        assert :ok = :peer.call(remote, :sys, :suspend, [:global_name_server, 1_000])
+
+        try do
+          probe =
+            quote do
+              {:ok, broker} = PhxPortHandoff.Native.listen(unquote(path))
+              :ok = PhxPortHandoff.Native.close_listener(broker)
+              {:error, :closed} = PhxPortHandoff.Native.accept(broker)
+              accept = Task.async(fn -> PhxPortHandoff.accept(broker) end)
+
+              try do
+                Task.yield(accept, 1_000)
+              after
+                Task.shutdown(accept, :brutal_kill)
+              end
+            end
+
+          assert {{:ok, {:error, :closed}}, _binding} =
+                   :peer.call(receiver, Code, :eval_quoted, [probe], 5_000)
+        after
+          assert :ok = :peer.call(remote, :sys, :resume, [:global_name_server, 1_000])
+        end
+      end)
+    end)
+  end
+
+  @tag :local_accept
+  @tag timeout: 30_000
+  test "concurrent direct callers serialize accepts and own distinct descriptors" do
+    path = Path.join(temporary_directory(), "handoff.sock")
+    assert {:ok, broker} = Native.listen(path)
+    parent = self()
+
+    accepts =
+      for _ <- 1..2 do
+        Task.async(fn ->
+          receive do
+            :accept -> :ok
+          end
+
+          {:ok, socket, receipt, metadata} = PhxPortHandoff.accept(broker)
+          :ok = :gen_tcp.controlling_process(socket, parent)
+          :ok = Native.adopted(receipt)
+          {socket, receipt, metadata}
+        end)
+      end
+
+    assert 1 = :erlang.trace_pattern({Native, :accept, 1}, true, [:local])
+
+    try do
+      for accept <- accepts do
+        assert 1 = :erlang.trace(accept.pid, true, [:call])
+        send(accept.pid, :accept)
+      end
+
+      assert_receive {:trace, first_pid, :call, {Native, :accept, [^broker]}}, 1_000
+      [second] = Enum.reject(accepts, &(&1.pid == first_pid))
+      second_pid = second.pid
+      refute_receive {:trace, ^second_pid, :call, {Native, :accept, [^broker]}}, 100
+      :erlang.trace(first_pid, false, [:call])
+
+      sockets =
+        for {accept, payload} <- [
+              {Enum.find(accepts, &(&1.pid == first_pid)), "first"},
+              {second, "second"}
+            ] do
+          with_sender(path, fn sender, port ->
+            assert {:ok, client} =
+                     :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false], 5_000)
+
+            try do
+              assert :ok = :gen_tcp.send(client, payload)
+              assert finish_child(sender) == "ADOPTED\n"
+              {socket, receipt, metadata} = Task.await(accept, 5_000)
+              assert metadata.sni == "localhost"
+              assert {:ok, ^payload} = :gen_tcp.recv(socket, 0, 1_000)
+              assert :ok = :gen_tcp.close(socket)
+              {socket, receipt}
+            after
+              :gen_tcp.close(client)
+            end
+          end)
+        end
+
+      assert_receive {:trace, ^second_pid, :call, {Native, :accept, [^broker]}}, 1_000
+      assert [{first_socket, first_receipt}, {second_socket, second_receipt}] = sockets
+      refute first_socket == second_socket
+      refute first_receipt == second_receipt
+      assert :ok = Native.close_listener(broker)
+      assert {:error, :closed} = PhxPortHandoff.accept(broker)
+    after
+      :erlang.trace_pattern({Native, :accept, 1}, false, [:local])
+      Native.close_listener(broker)
+      Enum.each(accepts, &Task.shutdown(&1, :brutal_kill))
+    end
   end
 
   @tag timeout: 45_000
@@ -306,6 +421,33 @@ defmodule PhxPortHandoff.TransportTest do
       assert Port.command(sender, path <> "\n")
       callback.(sender, port)
     end)
+  end
+
+  defp with_peer(cookie, callback) do
+    assert {:ok, peer, peer_node} =
+             :peer.start_link(%{
+               name: :peer.random_name(~c"phxp-local-accept"),
+               host: ~c"127.0.0.1",
+               longnames: true,
+               connection: :standard_io,
+               args: [
+                 ~c"+S",
+                 ~c"2:2",
+                 ~c"-setcookie",
+                 String.to_charlist(cookie),
+                 ~c"-kernel",
+                 ~c"inet_dist_use_interface",
+                 ~c"{127,0,0,1}"
+               ],
+               wait_boot: 5_000
+             })
+
+    try do
+      refute :peer.call(peer, :os, :getpid, []) == String.to_charlist(System.pid())
+      callback.(peer, peer_node)
+    after
+      assert :ok = :peer.stop(peer)
+    end
   end
 
   defp with_child(executable, arguments, callback) do
