@@ -177,6 +177,92 @@ defmodule PhxPortHandoffTest do
     assert {:error, :econnaborted} = Task.await(accept)
   end
 
+  @tag :endpoint_liveness
+  @tag skip: :os.type() != {:unix, :linux}
+  test "native startup preserves a full endpoint within its probe deadline" do
+    path = endpoint_path()
+    listener = bound_socket(path, :seqpacket)
+    :ok = :socket.listen(listener, 1)
+    original = File.lstat!(path)
+
+    queued =
+      for _ <- 1..2 do
+        {:ok, client} = :socket.open(:local, :seqpacket, :default)
+        on_exit(fn -> :socket.close(client) end)
+        :ok = :socket.connect(client, %{family: :local, path: path}, 1_000)
+        client
+      end
+
+    probe =
+      Task.async(fn ->
+        started = System.monotonic_time(:millisecond)
+        result = Native.listen(path)
+        {result, System.monotonic_time(:millisecond) - started}
+      end)
+
+    {outcome, preserved} =
+      try do
+        outcome = Task.yield(probe, 2_500)
+        {outcome, File.lstat!(path)}
+      after
+        :socket.close(listener)
+        Enum.each(queued, &:socket.close/1)
+        Task.shutdown(probe, 5_000)
+      end
+
+    assert {:ok, {{:error, _message}, elapsed}} = outcome
+    assert elapsed < 2_500
+    assert preserved.inode == original.inode
+    assert preserved.major_device == original.major_device
+  end
+
+  @tag :endpoint_liveness
+  test "native startup preserves an endpoint when its probe has a protocol error" do
+    path = endpoint_path()
+    _datagram = bound_socket(path, :dgram)
+    original = File.lstat!(path)
+
+    assert {:error, message} = Native.listen(path)
+    assert message =~ "cannot probe handoff endpoint"
+    preserved = File.lstat!(path)
+    assert preserved.inode == original.inode
+    assert preserved.major_device == original.major_device
+  end
+
+  @tag :endpoint_liveness
+  @tag skip: :os.type() != {:unix, :linux}
+  test "native startup preserves an endpoint when its probe is denied permission" do
+    refute Native.effective_uid() == 0, "run this fixture unprivileged"
+    path = endpoint_path()
+    assert {:ok, broker} = Native.listen(path)
+
+    try do
+      File.chmod!(path, 0o000)
+      original = File.lstat!(path)
+      assert {:error, message} = Native.listen(path)
+      assert message =~ "cannot probe handoff endpoint"
+      preserved = File.lstat!(path)
+      assert preserved.inode == original.inode
+      assert preserved.major_device == original.major_device
+      assert Bitwise.band(preserved.mode, 0o777) == 0o000
+    after
+      Native.close_listener(broker)
+    end
+  end
+
+  @tag :endpoint_liveness
+  test "native startup replaces a confirmed stale endpoint" do
+    type = if :os.type() == {:unix, :linux}, do: :seqpacket, else: :stream
+    path = endpoint_path()
+    stale = bound_socket(path, type)
+    :ok = :socket.close(stale)
+
+    assert {:ok, broker} = Native.listen(path)
+    assert {:error, :eagain} = Native.try_accept(broker)
+    assert :ok = Native.close_listener(broker)
+    refute File.exists?(path)
+  end
+
   test "native broker refuses to replace a regular file" do
     path = endpoint_path()
 
@@ -226,6 +312,15 @@ defmodule PhxPortHandoffTest do
 
     on_exit(fn -> File.rm_rf!(directory) end)
     Path.join(directory, "handoff.sock")
+  end
+
+  defp bound_socket(path, type) do
+    File.mkdir_p!(Path.dirname(path))
+    File.chmod!(Path.dirname(path), 0o700)
+    {:ok, socket} = :socket.open(:local, type, :default)
+    on_exit(fn -> :socket.close(socket) end)
+    :ok = :socket.bind(socket, %{family: :local, path: path})
+    socket
   end
 
   defp wait_until_removed(path, attempts \\ 100)

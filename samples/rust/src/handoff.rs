@@ -1,14 +1,16 @@
 use crate::handoff_protocol::{self, MAX_PACKET_LENGTH, Message};
 #[cfg(target_os = "macos")]
 use crate::handoff_stream::{complete_frame, read_frame};
+#[path = "../../../phx_port_handoff/native/phx_port_handoff_native/src/endpoint_probe.rs"]
+mod endpoint_probe;
+
 #[cfg(target_os = "macos")]
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 #[cfg(target_os = "macos")]
 use nix::sys::socket::accept;
 use nix::sys::socket::{
     AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, SockaddrLike,
-    SockaddrStorage, UnixAddr, bind, connect, getpeername, getsockopt, listen, recvmsg, socket,
-    sockopt,
+    SockaddrStorage, UnixAddr, bind, getpeername, getsockopt, listen, recvmsg, socket, sockopt,
 };
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{accept4, recv, send};
@@ -29,7 +31,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Sender, error::TrySendError};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -321,7 +323,7 @@ fn remove_stale_endpoint(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    if endpoint_is_live(path) {
+    if endpoint_is_live(path)? {
         return Err(format!(
             "another handoff receiver is already listening at {}",
             path.display()
@@ -331,14 +333,10 @@ fn remove_stale_endpoint(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot remove stale endpoint {}: {error}", path.display()))
 }
 
-fn endpoint_is_live(path: &Path) -> bool {
-    let Ok(address) = UnixAddr::new(path) else {
-        return false;
-    };
-    let Ok(socket) = create_control_socket() else {
-        return false;
-    };
-    connect(socket.as_raw_fd(), &address).is_ok()
+fn endpoint_is_live(path: &Path) -> Result<bool, String> {
+    let deadline = Instant::now() + CONTROL_TIMEOUT;
+    endpoint_probe::is_live(create_control_socket()?, path, deadline)
+        .map_err(|error| format!("cannot probe handoff endpoint {}: {error}", path.display()))
 }
 
 fn receive_handoff(
@@ -691,13 +689,20 @@ fn hex_id(id: &[u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        HandoffIdentity, HandoffListener, create_private_directory, endpoint_hash,
-        endpoint_path_in, endpoint_path_with_runtime, ensure_endpoint_directory,
+        HandoffIdentity, HandoffListener, create_control_socket, create_private_directory,
+        endpoint_hash, endpoint_path_in, endpoint_path_with_runtime, ensure_endpoint_directory,
         ensure_private_directory, remove_stale_endpoint,
     };
+    #[cfg(target_os = "linux")]
+    use nix::sys::socket::{AddressFamily, Backlog, SockFlag, SockType, connect, listen, socket};
+    use nix::sys::socket::{UnixAddr, bind};
     use std::fs;
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::net::UnixDatagram;
     use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     #[test]
@@ -777,6 +782,120 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+        drop(listener);
+        assert!(!endpoint.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn listener_preserves_full_endpoint_within_probe_deadline() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = directory.path().join("full.sock");
+        let address = UnixAddr::new(&endpoint).unwrap();
+        let listener = create_control_socket().unwrap();
+        bind(listener.as_raw_fd(), &address).unwrap();
+        listen(&listener, Backlog::new(1).unwrap()).unwrap();
+        let original = fs::symlink_metadata(&endpoint).unwrap();
+        let queued = (0..2)
+            .map(|_| {
+                let client = socket(
+                    AddressFamily::Unix,
+                    SockType::SeqPacket,
+                    SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+                    None,
+                )
+                .unwrap();
+                connect(client.as_raw_fd(), &address).unwrap();
+                client
+            })
+            .collect::<Vec<_>>();
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let probe_path = endpoint.clone();
+        let worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = HandoffListener::bind(&probe_path, false);
+            let _ = sender.send((result, started.elapsed()));
+        });
+        let bound = super::CONTROL_TIMEOUT + Duration::from_millis(500);
+        let outcome = receiver.recv_timeout(bound);
+        let preserved = fs::symlink_metadata(&endpoint);
+        drop(listener);
+        drop(queued);
+        worker.join().unwrap();
+
+        let (result, elapsed) = outcome.expect("startup outlived the liveness probe deadline");
+        let error = result.err().expect("a full endpoint must not be replaced");
+        assert!(
+            error.contains("cannot probe handoff endpoint") || error.contains("already listening"),
+            "{error}"
+        );
+        assert!(elapsed < bound, "liveness probe took {elapsed:?}");
+        let preserved = preserved.unwrap();
+        assert_eq!(preserved.dev(), original.dev());
+        assert_eq!(preserved.ino(), original.ino());
+    }
+
+    #[test]
+    fn listener_preserves_endpoint_on_probe_error() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = directory.path().join("datagram.sock");
+        let _datagram = UnixDatagram::bind(&endpoint).unwrap();
+        let original = fs::symlink_metadata(&endpoint).unwrap();
+
+        let error = HandoffListener::bind(&endpoint, false)
+            .err()
+            .expect("a protocol mismatch is not evidence of a stale socket");
+
+        assert!(error.contains("cannot probe handoff endpoint"), "{error}");
+        let preserved = fs::symlink_metadata(&endpoint).unwrap();
+        assert_eq!(preserved.dev(), original.dev());
+        assert_eq!(preserved.ino(), original.ino());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn listener_preserves_endpoint_on_probe_permission_error() {
+        assert!(
+            !nix::unistd::geteuid().is_root(),
+            "run this fixture unprivileged"
+        );
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = directory.path().join("private.sock");
+        let _listener = HandoffListener::bind(&endpoint, false).unwrap();
+        fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o000)).unwrap();
+        let original = fs::symlink_metadata(&endpoint).unwrap();
+
+        let error = HandoffListener::bind(&endpoint, false)
+            .err()
+            .expect("permission failure must preserve the existing endpoint");
+
+        assert!(error.contains("cannot probe handoff endpoint"), "{error}");
+        let preserved = fs::symlink_metadata(&endpoint).unwrap();
+        assert_eq!(preserved.dev(), original.dev());
+        assert_eq!(preserved.ino(), original.ino());
+        assert_eq!(preserved.permissions().mode() & 0o777, 0o000);
+    }
+
+    #[test]
+    fn listener_replaces_confirmed_stale_endpoint() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = directory.path().join("stale.sock");
+        let stale = create_control_socket().unwrap();
+        bind(stale.as_raw_fd(), &UnixAddr::new(&endpoint).unwrap()).unwrap();
+        drop(stale);
+
+        let listener = HandoffListener::bind(&endpoint, false).unwrap();
+        assert!(
+            fs::symlink_metadata(&endpoint)
+                .unwrap()
+                .file_type()
+                .is_socket()
         );
         drop(listener);
         assert!(!endpoint.exists());

@@ -1,6 +1,8 @@
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("phx_port_handoff_native requires Linux or macOS");
 
+mod endpoint_probe;
+
 #[cfg(target_os = "macos")]
 use nix::fcntl::FdFlag;
 #[cfg(target_os = "macos")]
@@ -9,8 +11,8 @@ use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::socket::accept as socket_accept;
 use nix::sys::socket::{
     AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, SockaddrLike,
-    SockaddrStorage, UnixAddr, bind, connect, getpeername, getsockopt, listen as socket_listen,
-    recv, recvmsg, socket, sockopt,
+    SockaddrStorage, UnixAddr, bind, getpeername, getsockopt, listen as socket_listen, recv,
+    recvmsg, socket, sockopt,
 };
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{accept4, send};
@@ -29,7 +31,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAGIC: &[u8; 4] = b"PHXP";
 const VERSION: u8 = 1;
@@ -468,7 +470,7 @@ fn remove_stale_endpoint(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    if endpoint_is_live(path) {
+    if endpoint_is_live(path)? {
         return Err(format!(
             "another handoff receiver is already listening at {}",
             path.display()
@@ -488,14 +490,10 @@ fn remove_owned_endpoint(path: &Path, identity: EndpointIdentity) {
     }
 }
 
-fn endpoint_is_live(path: &Path) -> bool {
-    let Ok(address) = UnixAddr::new(path) else {
-        return false;
-    };
-    let Ok(socket) = create_client_socket() else {
-        return false;
-    };
-    connect(socket.as_raw_fd(), &address).is_ok()
+fn endpoint_is_live(path: &Path) -> Result<bool, String> {
+    let deadline = Instant::now() + CONTROL_TIMEOUT;
+    endpoint_probe::is_live(create_client_socket()?, path, deadline)
+        .map_err(|error| format!("cannot probe handoff endpoint {}: {error}", path.display()))
 }
 
 #[cfg(target_os = "linux")]

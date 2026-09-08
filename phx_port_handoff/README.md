@@ -102,10 +102,13 @@ The native broker creates a `0600` endpoint in a user-owned `0700` directory.
 Linux uses `SOCK_SEQPACKET` and `SO_PEERCRED`; macOS uses `SOCK_STREAM`,
 length-delimited reads, explicit `FD_CLOEXEC`, and `getpeereid`. Both require
 exactly one connected TCP descriptor and reject duplicate connection
-identifiers. The broker refuses to replace non-socket paths or a live receiver,
-but removes a confirmed stale socket. It monitors its owning Thousand Island
-listener process so supervisor shutdown stops its polling accept and releases
-only the endpoint it bound before an in-VM restart.
+identifiers. The broker refuses to replace non-socket paths or a live receiver.
+Its nonblocking liveness probe has a two-second absolute deadline; a full
+queue, pending connection, timeout, or operational error preserves the endpoint
+and fails startup. Only a refused connection confirms a stale socket for removal.
+It monitors its owning Thousand Island listener process so supervisor shutdown
+stops its polling accept and releases only the endpoint it bound before an in-VM
+restart.
 
 `phx-port` inspects ClientHello with `MSG_PEEK`; the backend's TLS stack still
 reads the original bytes and performs authoritative SNI certificate selection.
@@ -135,17 +138,22 @@ descriptors across restarts.
   and the retry delay is taken on an ordinary scheduler, so idle acceptors do
   not occupy a dirty-I/O scheduler and starve unrelated file or port work.
 
-## Transport regression tests
+## Regression tests
 
-On Linux, run the transport tests with an external OS-process watchdog:
+On Linux, run the startup and transport tests as an unprivileged user with an
+external OS-process watchdog:
 
 ```bash
 cd phx_port_handoff
-timeout --kill-after=10s 180s mix test test/phx_port_handoff_transport_test.exs
+timeout --kill-after=10s 180s mix test test/phx_port_handoff_test.exs test/phx_port_handoff_transport_test.exs
 ```
 
-These tests require Python 3 (standard library only) in addition to the package
-toolchain. Both the stalled-peer and complete-TLS scenarios use an external
+The startup tests use private fixture sockets and two queued connections to
+exercise a full accept queue, with a 2.5-second elapsed bound. Permission-error
+coverage requires an unprivileged effective UID.
+
+The transport tests require Python 3 (standard library only) in addition to the
+package toolchain. Both the stalled-peer and complete-TLS scenarios use an external
 Python PHXP sender, assert its reported OS PID against the spawned process,
 and require an `ADOPTED` reply and successful process exit. The complete-TLS
 client also reports readiness and must exit successfully. Fixture callbacks

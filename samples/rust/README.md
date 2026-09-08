@@ -15,7 +15,8 @@ addresses. The handoff SNI is printed only as diagnostic metadata; rustls
 processes the original ClientHello and does not trust that field for TLS.
 
 The example directly includes the repository's `src/handoff_protocol.rs`, so
-its packet codec stays identical to the daemon implementation.
+its packet codec stays identical to the daemon implementation. It also shares
+the native handoff package's nonblocking endpoint liveness probe.
 
 ## Build and test
 
@@ -24,6 +25,14 @@ From the repository root:
 ```bash
 cargo build --manifest-path samples/rust/Cargo.toml
 cargo test --manifest-path samples/rust/Cargo.toml
+```
+
+On Linux, run the endpoint liveness regressions as an unprivileged user under
+an external watchdog. The full-queue fixture has only two queued connections
+and asserts a 2.5-second startup bound; the permission fixture must not run as root.
+
+```bash
+timeout --kill-after=10s 180s cargo test --locked --manifest-path samples/rust/Cargo.toml handoff::
 ```
 
 ## Run
@@ -108,6 +117,11 @@ This production endpoint defaults to
 `/run/phx-port` for a nonstandard deployment, macOS host, or test. The
 production runtime root may be group-traversable, but its `handoff` child
 remains owned by the service identity with mode `0700`.
+
+Startup probes an existing endpoint without blocking and with a two-second
+absolute deadline. Full queues, pending connections, timeouts, and operational
+errors fail startup without unlinking the endpoint. Only a refused connection
+confirms a stale socket for removal.
 
 ## Scope and limitations
 
