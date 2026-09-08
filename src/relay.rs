@@ -110,9 +110,16 @@ where
         if read == 0 {
             return writer.shutdown().await;
         }
-        writer.write_all(&buffer[..read]).await?;
-        saturating_add(bytes, u64::try_from(read).unwrap_or(u64::MAX));
-        let _ = progress.try_send(());
+        let mut remaining = &buffer[..read];
+        while !remaining.is_empty() {
+            let written = writer.write(remaining).await?;
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            saturating_add(bytes, u64::try_from(written).unwrap_or(u64::MAX));
+            let _ = progress.try_send(());
+            remaining = &remaining[written..];
+        }
     }
 }
 
@@ -124,8 +131,11 @@ fn saturating_add(counter: &AtomicU64, value: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::copy_bidirectional;
+    use super::{RELAY_BUFFER_SIZE, copy_bidirectional};
+    use crate::ingress_config::DEFAULT_RELAY_IDLE_TIMEOUT;
     use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::net::{TcpListener, TcpStream};
@@ -198,6 +208,157 @@ mod tests {
         assert!(report.error.is_none());
         assert_eq!(report.client_to_workload_bytes, 1);
         assert_eq!(report.workload_to_client_bytes, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_writes_reset_idle_deadline_in_either_direction() {
+        const CHUNK_SIZE: usize = 1024;
+        let idle_timeout = DEFAULT_RELAY_IDLE_TIMEOUT;
+        let progress_interval = idle_timeout / 3;
+
+        for reverse in [false, true] {
+            let (mut sending_peer, mut source) = duplex(RELAY_BUFFER_SIZE);
+            let (mut destination, mut receiving_peer) = duplex(CHUNK_SIZE);
+            sending_peer
+                .write_all(&[0x5a; RELAY_BUFFER_SIZE])
+                .await
+                .unwrap();
+            let relay = tokio::spawn(async move {
+                if reverse {
+                    copy_bidirectional(&mut destination, &mut source, Some(idle_timeout)).await
+                } else {
+                    copy_bidirectional(&mut source, &mut destination, Some(idle_timeout)).await
+                }
+            });
+            tokio::task::yield_now().await;
+
+            for step in 1..=4 {
+                tokio::time::advance(progress_interval).await;
+                let mut chunk = [0_u8; CHUNK_SIZE];
+                receiving_peer.read_exact(&mut chunk).await.unwrap();
+                assert_eq!(chunk, [0x5a; CHUNK_SIZE]);
+                tokio::task::yield_now().await;
+                assert!(
+                    !relay.is_finished(),
+                    "relay closed despite partial-write progress at step {step}, reverse={reverse}"
+                );
+            }
+
+            tokio::time::advance(idle_timeout - Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert!(!relay.is_finished());
+            tokio::time::advance(Duration::from_secs(1)).await;
+
+            let report = relay.await.unwrap();
+            assert_eq!(
+                report.error.as_ref().map(io::Error::kind),
+                Some(io::ErrorKind::TimedOut)
+            );
+            let expected_bytes = u64::try_from(5 * CHUNK_SIZE).unwrap();
+            assert_eq!(
+                (
+                    report.client_to_workload_bytes,
+                    report.workload_to_client_bytes
+                ),
+                if reverse {
+                    (0, expected_bytes)
+                } else {
+                    (expected_bytes, 0)
+                }
+            );
+            let mut remaining = Vec::new();
+            receiving_peer.read_to_end(&mut remaining).await.unwrap();
+            assert_eq!(remaining, [0x5a; CHUNK_SIZE]);
+            assert_eq!(report.elapsed, progress_interval * 4 + idle_timeout);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_writes_are_counted_before_a_write_error() {
+        let (mut public_peer, mut accepted) = duplex(RELAY_BUFFER_SIZE);
+        let (mut upstream, mut workload_peer) = duplex(1);
+        public_peer
+            .write_all(&[0x5a; RELAY_BUFFER_SIZE])
+            .await
+            .unwrap();
+        let relay =
+            tokio::spawn(
+                async move { copy_bidirectional(&mut accepted, &mut upstream, None).await },
+            );
+        let mut byte = [0_u8; 1];
+        workload_peer.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, [0x5a]);
+        drop(workload_peer);
+
+        let report = relay.await.unwrap();
+        assert_eq!(
+            report.error.as_ref().map(io::Error::kind),
+            Some(io::ErrorKind::BrokenPipe)
+        );
+        assert_eq!(report.client_to_workload_bytes, 1);
+        assert_eq!(report.workload_to_client_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn partial_write_followed_by_zero_preserves_count_and_errors() {
+        let mut destination = [0_u8; 1];
+        let writer = io::Cursor::new(destination.as_mut_slice());
+        let bytes = AtomicU64::new(0);
+        let (progress, _receiver) = tokio::sync::mpsc::channel(1);
+
+        let error = super::copy_direction(&b"ab"[..], writer, progress, &bytes)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(destination, [b'a']);
+        assert_eq!(bytes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_backpressure_preserves_all_forwarded_bytes() {
+        const PAYLOAD_SIZE: usize = 256 * 1024;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (mut public_peer, accepted) = tcp_pair().await;
+            let (upstream, mut workload_peer) = tcp_pair().await;
+            socket2::SockRef::from(&upstream)
+                .set_send_buffer_size(RELAY_BUFFER_SIZE)
+                .unwrap();
+            socket2::SockRef::from(&workload_peer)
+                .set_recv_buffer_size(RELAY_BUFFER_SIZE)
+                .unwrap();
+            let bytes = Arc::new(AtomicU64::new(0));
+            let copied_bytes = Arc::clone(&bytes);
+            let (progress, mut receiver) = tokio::sync::mpsc::channel(1);
+            let copy = tokio::spawn(async move {
+                super::copy_direction(accepted, upstream, progress, &copied_bytes).await
+            });
+
+            let payload: Vec<_> = (0_u8..=250).cycle().take(PAYLOAD_SIZE).collect();
+            let expected_bytes = u64::try_from(PAYLOAD_SIZE).unwrap();
+            public_peer.write_all(&payload).await.unwrap();
+            public_peer.shutdown().await.unwrap();
+            receiver.recv().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !copy.is_finished(),
+                "fixture did not impose TCP backpressure"
+            );
+            let before_drain = bytes.load(Ordering::Relaxed);
+            assert!(before_drain > 0 && before_drain < expected_bytes);
+
+            let mut received = Vec::new();
+            workload_peer.read_to_end(&mut received).await.unwrap();
+            copy.await.unwrap().unwrap();
+            assert_eq!(received, payload);
+            assert_eq!(bytes.load(Ordering::Relaxed), expected_bytes);
+            eprintln!(
+                "loopback backpressure: {before_drain}/{PAYLOAD_SIZE} bytes written before drain; \
+                 all {PAYLOAD_SIZE} bytes delivered and counted after drain"
+            );
+        })
+        .await
+        .expect("bounded loopback backpressure fixture");
     }
 
     #[tokio::test(start_paused = true)]

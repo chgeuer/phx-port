@@ -164,7 +164,12 @@ normalized exact hostnames, a valid logical `workload`, a bounded lowercase
 optional integer `relay_idle_timeout_seconds` that is either zero or at least
 1,800. Public relays default to 1,800 seconds of bidirectional inactivity,
 reset on progress in either direction; larger values extend the window and
-zero disables the policy for that exact declaration.
+zero disables the policy for that exact declaration. Each successful relay
+write, including a partial write under backpressure, resets the window and
+contributes to directional byte totals even if the remaining buffer later
+fails or times out. Merely reading bytes into a relay buffer is not forwarding
+progress; successful TCP writes mean local socket acceptance, not remote
+application consumption.
 Development relays retain unlimited idle lifetime. `unknown_sni`, when
 present, must be `"reject"`.
 An optional `[ingress] listen` array declares at most one IPv4 and one IPv6

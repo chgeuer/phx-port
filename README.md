@@ -226,8 +226,11 @@ contain no source address.
 Public relay inactivity defaults to 1,800 seconds per Route Declaration.
 `relay_idle_timeout_seconds` may extend that bidirectional inactivity window;
 zero explicitly disables it for the declaration. Progress in either direction
-resets the deadline. Development relays retain their existing unlimited idle
-lifetime.
+resets the deadline, including each successful partial write under
+backpressure. Bytes only read into the relay buffer do not reset it; a
+blocked write with no further progress still expires. Directional byte totals
+include successful partial writes even if a later write fails or times out.
+Development relays retain their existing unlimited idle lifetime.
 
 The public Hosting Profile keeps operator intent, stable assignments, derived
 state, and runtime endpoints in separate ownership domains:
