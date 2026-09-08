@@ -299,15 +299,18 @@ permit an unprivileged process to bind port 443, startup fails with a clear
 privilege diagnostic rather than attempting privilege escalation.
 
 On Linux, `phx-port proxy install-service` writes the user unit under
-`$XDG_CONFIG_HOME/systemd/user` (falling back to
-`~/.config/systemd/user`), with absolute paths for both the current executable
-and registry. It then runs `systemctl --user daemon-reload` and
+`$XDG_CONFIG_HOME/systemd/user` when `XDG_CONFIG_HOME` is absolute. Unset,
+empty, or relative values fall back to `$HOME/.config/systemd/user`, following
+the XDG absolute-path contract. A missing or nonabsolute `HOME` when that
+fallback is needed fails before any filesystem or service-manager operation.
+The unit records absolute paths for both the current executable and registry.
+Installation then runs `systemctl --user daemon-reload` and
 `systemctl --user enable --now phx-port.service`. The unit uses
 `Restart=on-failure` and allows 35 seconds for the daemon's bounded shutdown
-drain. `phx-port proxy uninstall-service` disables and stops the service,
-removes the unit, and reloads the user manager. This command remains the
-development-profile user service and does not silently install or activate the
-public system service.
+drain. `phx-port proxy uninstall-service` uses the same path resolver, disables
+and stops the service, removes the unit, and reloads the user manager. This
+command remains the development-profile user service and does not silently
+install or activate the public system service.
 
 `sudo phx-port daemon --run-as USER --listen ...` supports deliberate manual
 privileged binding without a root data plane. It requires every listener on

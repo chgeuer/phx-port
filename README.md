@@ -496,14 +496,19 @@ begins. Control and metrics endpoints close only after final state and the
 bounded shutdown event are emitted.
 
 On Linux, `install-service` writes
-`$XDG_CONFIG_HOME/systemd/user/phx-port.service` (or
-`~/.config/systemd/user/phx-port.service`), records absolute executable and
-registry paths, reloads the user manager, and enables and starts the service.
+`$XDG_CONFIG_HOME/systemd/user/phx-port.service` when `XDG_CONFIG_HOME` is
+absolute. Unset, empty, or relative values use
+`$HOME/.config/systemd/user/phx-port.service` instead, following the XDG
+absolute-path contract. If that fallback is needed, a missing or nonabsolute
+`HOME` is an error before any files or services are changed. Installation
+records absolute executable and registry paths, reloads the user manager,
+and enables and starts the service.
 This remains a development-profile user service that binds listeners directly;
 it does not activate production or replace a machine service. The unit runs the
 daemon in the foreground with `Restart=on-failure`, `LimitNOFILE=65536`,
 `TasksMax=1024`, and the existing 35-second service-manager stop deadline.
-`uninstall-service` disables and stops the service before removing the unit.
+`uninstall-service` uses the same path resolution, disables and stops the
+service, and then removes the unit.
 
 For deliberate foreground use from a root shell, `--run-as USER` is the only
 supported privileged daemon path:

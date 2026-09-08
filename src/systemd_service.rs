@@ -65,12 +65,21 @@ fn ensure_linux() -> Result<(), String> {
 }
 
 fn unit_path() -> Result<PathBuf, String> {
-    let config_home = if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(path)
+    let config_home = if let Some(path) = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        path
     } else {
         let home = env::var_os("HOME")
             .ok_or_else(|| "HOME is not set and XDG_CONFIG_HOME is unavailable".to_string())?;
-        PathBuf::from(home).join(".config")
+        let home = PathBuf::from(home);
+        if !home.is_absolute() {
+            return Err(
+                "HOME must be an absolute path when XDG_CONFIG_HOME is unavailable".to_string(),
+            );
+        }
+        home.join(".config")
     };
     Ok(config_home.join("systemd/user").join(SERVICE_NAME))
 }
