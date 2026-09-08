@@ -796,6 +796,14 @@ fn write_atomic(
     security: RegistrySecurity,
 ) -> Result<(), String> {
     let content = document.to_string();
+    if security.is_private() && content.len() as u64 > MAX_PRIVATE_FILE_BYTES {
+        return Err(format!(
+            "{} {} exceeds the {} byte limit",
+            security.description(),
+            path.display(),
+            MAX_PRIVATE_FILE_BYTES
+        ));
+    }
     AtomicFile::new(path, AllowOverwrite)
         .write(|file| {
             #[cfg(unix)]
@@ -839,8 +847,174 @@ fn unlock<R>(lock: File, path: &Path, result: Result<R, String>) -> Result<R, St
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_private_path;
+    use super::{
+        MAX_PRIVATE_FILE_BYTES, RegistrySecurity, allocate, read, replace, resolve_private_path,
+        update_until, write_new,
+    };
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use tempfile::{TempDir, tempdir_in};
+    use toml_edit::{DocumentMut, value};
+
+    fn tempdir() -> std::io::Result<TempDir> {
+        #[cfg(unix)]
+        let root = Path::new("/tmp").canonicalize()?;
+        #[cfg(not(unix))]
+        let root = std::env::temp_dir().canonicalize()?;
+        let directory = tempdir_in(root)?;
+        #[cfg(unix)]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        Ok(directory)
+    }
+
+    fn padded_document(source: &str, length: usize) -> DocumentMut {
+        let content = format!("{source}#{}\n", "x".repeat(length - source.len() - 2));
+        let document = content.parse::<DocumentMut>().unwrap();
+        assert!(document.to_string() == content, "fixture must round-trip");
+        document
+    }
+
+    fn assert_published(path: &Path, security: RegistrySecurity, expected: &str) {
+        assert!(
+            fs::read_to_string(path).unwrap() == expected,
+            "published bytes must match, including comments"
+        );
+        assert!(
+            read(path, security).unwrap().to_string() == expected,
+            "published state must remain readable"
+        );
+    }
+
+    #[test]
+    fn private_allocation_respects_serialized_byte_limit() {
+        let source = "[ports.existing]\nmain = 4001\n";
+        let mut allocated = source.parse::<DocumentMut>().unwrap();
+        allocated["ports"]["added-web"] = toml_edit::table();
+        allocated["ports"]["added-web"]["main"] = value(4002);
+        let growth = allocated.to_string().len() - source.len();
+        let security = RegistrySecurity::LogicalWorkload;
+
+        for excess in [0, 1] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("ports.toml");
+            let target_length = MAX_PRIVATE_FILE_BYTES as usize + excess;
+            let original = padded_document(source, target_length - growth);
+            let mut expected = original.clone();
+            expected["ports"]["added-web"] = allocated["ports"]["added-web"].clone();
+            assert_eq!(expected.to_string().len(), target_length);
+            write_new(&path, security, &original).unwrap();
+            assert_published(&path, security, &original.to_string());
+
+            let result = allocate(&path, "added-web", "main", true);
+            if excess == 0 {
+                assert_eq!(result.unwrap(), (4002, true));
+                assert_published(&path, security, &expected.to_string());
+                assert_eq!(
+                    allocate(&path, "added-web", "main", true).unwrap(),
+                    (4002, false)
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "allocation accepted {} serialized bytes above the private limit",
+                    fs::metadata(&path).unwrap().len()
+                );
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains(&format!("exceeds the {MAX_PRIVATE_FILE_BYTES} byte limit"))
+                );
+                assert_published(&path, security, &original.to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn private_publication_paths_respect_serialized_byte_limit() {
+        let source = "[ports.existing]\nmain = 4001\n";
+        let exact = padded_document(source, MAX_PRIVATE_FILE_BYTES as usize);
+        let oversized = padded_document(source, MAX_PRIVATE_FILE_BYTES as usize + 1);
+        let expected_error = format!("exceeds the {MAX_PRIVATE_FILE_BYTES} byte limit");
+
+        for security in [
+            RegistrySecurity::LogicalWorkload,
+            RegistrySecurity::DerivedState,
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("state.toml");
+            assert!(
+                write_new(&path, security, &oversized)
+                    .unwrap_err()
+                    .contains(&expected_error)
+            );
+            assert!(!path.exists(), "oversized creation must not publish state");
+
+            write_new(&path, security, &exact).unwrap();
+            assert_published(&path, security, &exact.to_string());
+            assert!(
+                replace(&path, security, &oversized)
+                    .unwrap_err()
+                    .contains(&expected_error)
+            );
+            assert_published(&path, security, &exact.to_string());
+            replace(&path, security, &exact).unwrap();
+            assert_published(&path, security, &exact.to_string());
+
+            update_until(&path, security, None, |_| Ok(())).unwrap();
+            let error = update_until(&path, security, None, |document| {
+                document["ports"]["existing"]["main"] = value(40010);
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(error.contains(&expected_error));
+            assert_published(&path, security, &exact.to_string());
+        }
+    }
+
+    #[test]
+    fn private_byte_limit_accounts_for_legacy_serialization_without_limiting_development() {
+        let original = padded_document(
+            "[ports]\nexisting = 4001\n",
+            MAX_PRIVATE_FILE_BYTES as usize,
+        )
+        .to_string();
+
+        for security in [
+            RegistrySecurity::LogicalWorkload,
+            RegistrySecurity::Development,
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("ports.toml");
+            fs::write(&path, &original).unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let migrated = read(&path, security).unwrap();
+            assert!(migrated.to_string().len() > MAX_PRIVATE_FILE_BYTES as usize);
+            assert_eq!(
+                migrated["ports"]["existing"]["main"].as_integer(),
+                Some(4001)
+            );
+
+            let result = allocate(&path, "existing", "main", security.is_private());
+            if security.is_private() {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains(&format!("exceeds the {MAX_PRIVATE_FILE_BYTES} byte limit"))
+                );
+                assert!(fs::read_to_string(&path).unwrap() == original);
+                assert!(
+                    read(&path, security).unwrap().to_string() == migrated.to_string(),
+                    "rejected migration must preserve readable assignments"
+                );
+            } else {
+                assert_eq!(result.unwrap(), (4001, false));
+                assert_published(&path, security, &migrated.to_string());
+            }
+        }
+    }
 
     #[test]
     fn private_paths_are_lexically_normalized_before_validation() {

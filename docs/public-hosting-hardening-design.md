@@ -384,6 +384,8 @@ Allocator requirements:
 - require service-UID ownership and private modes;
 - take the existing exclusive advisory lock before reading or assigning;
 - allocate and atomically persist one `(workload ID, role)` mapping;
+- reject serialized private state above the existing 4 MiB reader limit before
+  publication, preserving the previous bytes and assignments;
 - preserve unrelated assignments and derived files;
 - return the existing assignment idempotently;
 - prevent two concurrent first starts from receiving one port;
