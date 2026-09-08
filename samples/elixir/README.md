@@ -50,6 +50,19 @@ PORT=4100 HTTPS_PORT=4101 mix run --no-halt -- \
   --cert /path/to/cert.pem --key /path/to/key.pem
 ```
 
+The supported sample flags are `--cert`, `--key`, `--project`, and `--role`.
+Each accepts either `--flag value` or `--flag=value`. CLI values override
+environment values, which override application config. For repeated flags,
+the first value wins, but every occurrence must be valid. Missing values,
+unknown flags, positional arguments, and empty strings are configuration
+errors rather than requests to fall back to another source. Selected
+environment and application string values must also be non-empty.
+
+Listener ports come from `PORT` and `HTTPS_PORT` (or application config keys
+`:port` and `:https_port`), not CLI flags. Each must be an integer from 1
+through 65535; malformed environment values do not fall back to application
+config.
+
 `PHXP_PROJECT` and `PHXP_ROLE` (or `--project` and `--role`) override the
 handoff endpoint identity. The project defaults to the current directory and
 the role defaults to `https`. Linux derives the endpoint below
