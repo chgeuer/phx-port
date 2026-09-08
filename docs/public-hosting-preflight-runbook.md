@@ -114,23 +114,39 @@ It is not data-plane load qualification, canary evidence, or Darwin evidence.
 
 ### Mandatory client authentication
 
-A Workload may demand a client certificate. `phx-port` holds no Workload
-private key, so its probe never offers a client identity, and the route
-certificate check records the outcome the TLS version dictates.
+A Workload may demand a client certificate in its initial handshake.
+`phx-port` holds no Workload private key, so its probe never offers a client
+identity. The table below records what one measured configuration does with
+that probe. It is **not** a general TLS-version rule: it covers an OpenSSL
+3.6.3 probe (through `native-tls`) against an OTP 29 `:ssl` listener on Linux.
+Darwin's Security.framework backend and every other client or server TLS
+implementation are unqualified here.
 
-| Workload TLS version | Route certificates | Verified Route | Workload-side handshake |
+| Probe TLS version | Route certificates | Verified Route | Workload-side handshake |
 |---|---|---|---|
 | TLS 1.2 | `FAIL` (`TLS validation failed`, alert 40) | never activates | rejected, `handshake_failure` |
 | TLS 1.3 | `PASS` | activates normally | rejected, `certificate_required` |
 
-TLS 1.3 sends the server certificate and its signature before the client
-certificate, so the probe completes a chain- and exact-hostname-verified
-handshake and holds a complete proof; the Workload then aborts that probe
-connection. TLS 1.2 interleaves client authentication into the same
-handshake, so the Workload aborts before the probe can inspect anything.
+Over TLS 1.3 the server's `CertificateRequest` arrives in the same flight as
+its `Certificate`, `CertificateVerify`, and `Finished`. The probe verifies
+that complete server flight against the system trust roots and the exact
+declared hostname, sends an empty client certificate, and its connect returns
+without waiting for the server's verdict. So the ingress obtains a genuine
+server proof and activates the route, while the Workload rejects that
+anonymous probe connection immediately afterwards. **This is not successful
+mutual authentication**, and it is not evidence that end-to-end mTLS requests
+work; only the probe's own certificate verification succeeded. Over TLS 1.2
+the Workload's `handshake_failure` arrives before the client handshake
+completes, so no certificate proof is produced at all.
+
 The TLS 1.2 outcome is fail-closed and correct: an unverified backend never
 becomes a Verified Route. Do not "fix" it by relaxing verification or by
 moving a Workload private key into ingress.
+
+These are properties of the **probe** connection. `phx-port` is an SNI
+passthrough proxy, so relayed client traffic is untouched and negotiates its
+own TLS session, version, and client authentication directly with the
+Workload. Nothing here requires client traffic to use the probe's TLS version.
 
 An activated TLS 1.3 mandatory-client-auth route is TCP-liveness checked each
 reconciliation pass and fully re-probed every 30 seconds, so expect one
@@ -138,8 +154,12 @@ rejected `certificate_required` handshake per revalidation in Workload logs.
 That is normal ingress verification, not an attack.
 
 The Linux CLI fixture records the matrix against a real OTP `:ssl` listener
-with `verify: :verify_peer` and `fail_if_no_peer_cert: true`, the same
-transport options Bandit and Cowboy pass through for a Phoenix endpoint:
+with `verify: :verify_peer` and `fail_if_no_peer_cert: true`. That is the
+underlying transport seam only: Bandit's ThousandIsland SSL transport calls
+`:ssl.listen/2`, `:ssl.transport_accept/1`, and `:ssl.handshake/1` with the
+endpoint's HTTPS options, so the listener presents the same initial
+client-certificate demand. No web framework was started, and no HTTP request
+was exchanged.
 
 ```bash
 timeout --kill-after=10s 600s \
@@ -148,13 +168,15 @@ timeout --kill-after=10s 600s \
     -- --exact --ignored --nocapture
 ```
 
-It generates its own fixture CA, leaf, and key in a fresh private temporary
-directory, keeps chain and exact-hostname verification enabled against that
-CA through `SSL_CERT_FILE`, and runs 20 real `proxy preflight` invocations per
-TLS version. It asserts that every probe reached the Workload, that the
-Workload never accepted a handshake, and that each version's ingress verdict
-and Workload alert are unanimous across the 20 attempts. The fixture is
-ignored by default because it needs an Elixir/OTP toolchain on `PATH`; it
+In a fresh private temporary directory the fixture generates a CA key pair and
+a leaf certificate signed by it, reusing the repository's existing
+`tests/fixtures/proxy-test-rsa-key.pem` as the leaf key rather than minting a
+new private key. It keeps chain and exact-hostname verification enabled
+against that CA through `SSL_CERT_FILE` and runs 20 real `proxy preflight`
+invocations per TLS version. It asserts that every probe reached the Workload,
+that the Workload never accepted a handshake, and that each version's ingress
+verdict and Workload alert are unanimous across the 20 attempts. The fixture
+is ignored by default because it needs an Elixir/OTP toolchain on `PATH`; it
 fails loudly rather than skipping when one is absent. Its Workload child is
 killed and reaped on drop.
 
@@ -170,9 +192,12 @@ only `result=rejected alert=certificate_required`. A separate out-of-band run
 of the real `daemon`, using the same committed Workload fixture script with
 separately generated fixture credentials, confirmed the runtime path: TLS 1.3
 logged `event=route result=activated`, and TLS 1.2 logged no activation at
-all. That daemon run is corroboration, not a committed regression. This is a
-Linux/OpenSSL characterization; the Darwin Security.framework backend was not
-measured and remains unqualified.
+all. That daemon run is corroboration, not a committed regression.
+
+This characterization is bounded to the client and server implementations
+named above. It does not qualify Darwin, other TLS libraries, other OTP or
+OpenSSL versions, TLS 1.3 post-handshake client authentication, or any
+end-to-end mutually authenticated request path.
 
 ## Inputs
 
@@ -405,7 +430,7 @@ worker demand.
 | Listener acquisition | For direct mode, find the exact owner of the address/port. For activation, verify descriptor names, count, TCP/listening state, address family, and configured address. |
 | System trust roots | Repair the platform CA installation and service sandbox access to it. Do not disable hostname or certificate verification. |
 | Registrations | Start the declared Workload with the shared `PHX_PORT_CONFIG`, exact `PHX_PORT_WORKLOAD_ID`, and declared role. Do not edit derived routes as authority. |
-| Route certificates | Connect only to the reported loopback port and inspect the Workload-owned chain, SAN, validity window, and SNI selection. Do not move private keys into ingress. A Workload that demands a client certificate fails this check on TLS 1.2 and passes on TLS 1.3; see "Mandatory client authentication". |
+| Route certificates | Connect only to the reported loopback port and inspect the Workload-owned chain, SAN, validity window, and SNI selection. Do not move private keys into ingress. A Workload that demands a client certificate in its initial handshake may fail this check depending on the probe's negotiated TLS version and the client/server TLS implementations; see "Mandatory client authentication" for the one measured configuration. |
 
 After all checks pass, remove any staging service override, start the real
 daemon, and require both commands to succeed before exposing traffic:

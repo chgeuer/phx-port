@@ -192,8 +192,10 @@ impl Drop for TlsBackend {
     }
 }
 
-/// A workload that demands a client certificate, run out of process on OTP's
-/// `:ssl` so the matrix observes a real handshake rather than a Rust stand-in.
+/// A workload that demands a client certificate in its initial handshake, run
+/// out of process on OTP's `:ssl` so the matrix observes a real handshake
+/// rather than a Rust stand-in. This is the transport seam a Bandit endpoint
+/// forwards its HTTPS options to, not a running web framework.
 #[cfg(target_os = "linux")]
 struct MandatoryClientAuthWorkload {
     port: u16,
@@ -940,12 +942,18 @@ fn preflight_never_auto_detects_production() {
 const MANDATORY_CLIENT_AUTH_ATTEMPTS: usize = 20;
 
 /// ING-Q1: characterize whether a workload that demands a client certificate
-/// can produce the completed certificate proof a Verified Route requires.
+/// in its initial handshake can produce the completed certificate proof a
+/// Verified Route requires.
 ///
 /// `phx-port` never holds a workload private key, so its probe offers no client
 /// identity. Preflight and runtime route activation share one probe, so this
 /// matrix drives the shipped `proxy preflight` gate and records both the
 /// ingress verdict and the workload's own handshake result per TLS version.
+///
+/// The outcome is specific to this client and server pair: `native-tls` over
+/// the system OpenSSL against an OTP `:ssl` listener on Linux. It is not a
+/// general TLS-version rule, and it says nothing about Darwin, other TLS
+/// implementations, or end-to-end mutually authenticated requests.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires an Elixir/OTP toolchain to run a mandatory-client-auth workload"]
@@ -1042,6 +1050,7 @@ fn preflight_route_certificates_across_mandatory_client_auth_tls_versions() {
     assert_eq!(
         tls13_results.iter().map(String::as_str).collect::<Vec<_>>(),
         vec!["result=rejected alert=certificate_required"],
-        "TLS 1.3 must reject the anonymous client only after proving the server certificate"
+        "TLS 1.3 must reject the anonymous client after the probe verified the \
+         complete server flight, which is not mutual authentication"
     );
 }

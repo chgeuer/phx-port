@@ -1,10 +1,14 @@
 #!/usr/bin/env elixir
 # A mandatory-client-authentication workload listener for the ING-Q1 matrix.
 #
-# Bandit and Cowboy hand their HTTPS transport options straight to OTP's :ssl,
-# so an :ssl listener with `verify: :verify_peer` and `fail_if_no_peer_cert:
-# true` reproduces the activation contract of a Phoenix endpoint that demands a
-# client certificate, without needing the whole framework in a Rust fixture.
+# This reproduces the underlying OTP transport seam only, not a full framework
+# run. Bandit's ThousandIsland SSL transport calls :ssl.listen/2,
+# :ssl.transport_accept/1 and :ssl.handshake/1 with the endpoint's HTTPS
+# options, so an :ssl listener with `verify: :verify_peer` and
+# `fail_if_no_peer_cert: true` presents the ingress probe with the same
+# initial client-certificate demand a Phoenix endpoint would. No web framework
+# is started here and no HTTP request is exchanged, so nothing about
+# end-to-end mutually authenticated request handling is measured.
 #
 # Usage: elixir mandatory_client_auth_workload.exs <certfile> <keyfile> \
 #          <cacertfile> <tlsv1.2|tlsv1.3>

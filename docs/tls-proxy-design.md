@@ -899,16 +899,25 @@ protocols, and certificate hostname removal.
 - Encrypted ClientHello can hide the inner hostname. Unless a usable outer name
   maps to a route, such connections cannot be dynamically routed by this
   design.
-- A backend requiring a client certificate is verifiable only over TLS 1.3.
-  The probe holds no Workload private key and never offers a client identity.
-  Under TLS 1.3 the backend proves its own certificate before it demands the
-  client's, so the probe completes a fully verified handshake and the route
-  activates; the backend then aborts that probe connection with
-  `certificate_required`, once per activation and once per 30-second TLS
-  revalidation. Under TLS 1.2 the backend aborts with `handshake_failure`
-  before the probe can inspect the certificate, so the route never activates
-  and preflight fails its route-certificate check. Such TLS 1.2 workloads
-  may require a future explicit hostname announcement mechanism. The public
+- A backend that demands a client certificate in its initial handshake may not
+  be discoverable, because the probe holds no Workload private key and never
+  offers a client identity. This was measured only for an OpenSSL 3.6.3 probe
+  against an OTP 29 `:ssl` listener on Linux; Darwin and other TLS
+  implementations remain unqualified. In that configuration the probe's TLS 1.3
+  connect returns successfully: the server's `CertificateRequest` arrives in
+  the same flight as its `Certificate`/`CertificateVerify`/`Finished`, the
+  probe verifies that complete server flight, sends an empty client
+  certificate, and returns without waiting for the server's verdict. The route
+  therefore activates on a genuine server proof. That is not mutual
+  authentication: the Workload rejects the anonymous probe connection with
+  `certificate_required` immediately afterwards, once per activation and once
+  per 30-second TLS revalidation. Over TLS 1.2 the same probe fails, because
+  the Workload's `handshake_failure` arrives before the client handshake
+  completes, so no certificate proof is produced, no route activates, and
+  preflight fails its route-certificate check. This concerns the probe
+  connection only; relayed client traffic is untouched and negotiates its own
+  TLS session with the Workload. Workloads whose probe cannot complete may
+  require a future explicit hostname announcement mechanism. The public
   hosting preflight runbook records the measured matrix.
 - The first request for a non-default hostname waits for discovery and may time
   out under a large or unhealthy workload set.
