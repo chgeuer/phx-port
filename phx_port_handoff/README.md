@@ -128,6 +128,23 @@ It monitors its owning Thousand Island listener process so supervisor shutdown
 stops its polling accept and releases only the endpoint it bound before an in-VM
 restart.
 
+Owner-death and resource-drop callbacks only mark the broker closed; they do
+not inspect or unlink filesystem paths. The package's Application supervisor
+runs one cleanup process, polling a native registry every 10 ms and performing
+cleanup in a dirty-I/O NIF. The registry reserves capacity before binding and
+allows at most 1,024 starting, live, or cleanup-pending endpoints per BEAM node.
+Capacity exhaustion explicitly rejects new listeners rather than dropping
+cleanup work or spawning more workers.
+
+Explicit close waits for cleanup, and same-path startup finishes any pending
+predecessor cleanup before binding. Both serialize with deferred cleanup and
+retain socket-type, device, inode, and UID checks, so a retired broker cannot
+unlink a replacement endpoint. Cleanup failures retain their capacity slot.
+The worker retries at most once per second and reports a bounded aggregate
+warning once per failed endpoint, without logging its path. Explicit close and
+startup retry immediately and report their own cleanup errors. No real
+stalled-filesystem behavior is claimed by the deterministic callback regressions.
+
 `phx-port` inspects ClientHello with `MSG_PEEK`; the backend's TLS stack still
 reads the original bytes and performs authoritative SNI certificate selection.
 After successful descriptor delivery, failures close the client connection
@@ -170,6 +187,9 @@ timeout --kill-after=10s 180s mix test test/scheduler_probe_test.exs
 The startup tests use private fixture sockets and two queued connections to
 exercise a full accept queue, with a 2.5-second elapsed bound. Permission-error
 coverage requires an unprivileged effective UID.
+Cleanup coverage also exercises resource collection while the owner remains
+alive, cleanup-worker restart, immediate same-path listener restart, replacement
+socket preservation, fixed-capacity admission, and explicit cleanup errors.
 
 The transport tests require Python 3 (standard library only) in addition to the
 package toolchain. Both the stalled-peer and complete-TLS scenarios use an external

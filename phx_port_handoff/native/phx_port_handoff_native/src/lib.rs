@@ -1,6 +1,7 @@
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("phx_port_handoff_native requires Linux or macOS");
 
+mod endpoint_cleanup;
 mod endpoint_probe;
 
 #[cfg(target_os = "macos")]
@@ -29,7 +30,6 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt}
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -78,9 +78,7 @@ enum TcpAddressFamily {
 
 struct Broker {
     listener: OwnedFd,
-    path: PathBuf,
-    endpoint_identity: EndpointIdentity,
-    closed: AtomicBool,
+    endpoint: endpoint_cleanup::EndpointCleanup,
     connection_ids: Arc<Mutex<HashSet<[u8; 16]>>>,
 }
 
@@ -101,9 +99,7 @@ impl Drop for Broker {
 
 impl Broker {
     fn close(&self) {
-        if !self.closed.swap(true, Ordering::AcqRel) {
-            remove_owned_endpoint(&self.path, self.endpoint_identity);
-        }
+        self.endpoint.request();
     }
 }
 
@@ -147,13 +143,32 @@ fn listen_with_policy(
 ) -> NifResult<(Atom, ResourceArc<Broker>)> {
     let path = PathBuf::from(path);
     ensure_endpoint_directory(&path, validate_runtime_root).map_err(failure)?;
+    let address = UnixAddr::new(&path)
+        .map_err(|error| failure(format!("invalid handoff socket path: {error}")))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| failure("handoff socket has no parent directory"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| failure("handoff socket has no file name"))?;
+    let cleanup_path = fs::canonicalize(parent)
+        .map_err(|error| failure(format!("cannot resolve handoff directory: {error}")))?
+        .join(name);
+    let endpoint = endpoint_cleanup::register(cleanup_path).map_err(failure)?;
+    let lifecycle = endpoint.lock_path().map_err(failure)?;
     remove_stale_endpoint(&path).map_err(failure)?;
 
     let listener = create_listener_socket().map_err(failure)?;
-    let address = UnixAddr::new(&path)
-        .map_err(|error| failure(format!("invalid handoff socket path: {error}")))?;
     bind(listener.as_raw_fd(), &address)
         .map_err(|error| failure(format!("cannot bind handoff socket: {error}")))?;
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| failure(format!("cannot inspect handoff socket: {error}")))?;
+    endpoint
+        .set_identity(EndpointIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+        .map_err(failure)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
         .map_err(|error| failure(format!("cannot secure handoff socket: {error}")))?;
     socket_listen(
@@ -162,17 +177,10 @@ fn listen_with_policy(
     )
     .map_err(|error| failure(format!("cannot listen on handoff socket: {error}")))?;
 
-    let metadata = fs::symlink_metadata(&path)
-        .map_err(|error| failure(format!("cannot inspect handoff socket: {error}")))?;
-    let endpoint_identity = EndpointIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    };
+    drop(lifecycle);
     let broker = ResourceArc::new(Broker {
         listener,
-        path,
-        endpoint_identity,
-        closed: AtomicBool::new(false),
+        endpoint,
         connection_ids: Arc::new(Mutex::new(HashSet::new())),
     });
     env.monitor(&broker, &env.pid())
@@ -182,21 +190,27 @@ fn listen_with_policy(
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn close_listener(broker: ResourceArc<Broker>) -> NifResult<Atom> {
-    broker.close();
+    broker.endpoint.finish().map_err(failure)?;
     Ok(atoms::ok())
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn cleanup_pending() -> NifResult<(Atom, usize)> {
+    let failures = endpoint_cleanup::drain_pending().map_err(failure)?;
+    Ok((atoms::ok(), failures))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn try_accept(
     broker: ResourceArc<Broker>,
 ) -> NifResult<(Atom, ResourceArc<Receipt>, i32, Atom, String, u32)> {
-    if broker.closed.load(Ordering::Acquire) {
+    if broker.endpoint.is_closed() {
         return Err(Error::Term(Box::new(atoms::closed())));
     }
     let mut control = match accept_control(&broker.listener) {
         Ok(Some(control)) => control,
         Ok(None) => return Err(Error::Term(Box::new(atoms::eagain()))),
-        Err(_error) if broker.closed.load(Ordering::Acquire) => {
+        Err(_error) if broker.endpoint.is_closed() => {
             return Err(Error::Term(Box::new(atoms::closed())));
         }
         Err(error) => {
@@ -205,7 +219,7 @@ fn try_accept(
             )));
         }
     };
-    if broker.closed.load(Ordering::Acquire) {
+    if broker.endpoint.is_closed() {
         return Err(Error::Term(Box::new(atoms::closed())));
     }
 
@@ -480,14 +494,27 @@ fn remove_stale_endpoint(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot remove stale endpoint {}: {error}", path.display()))
 }
 
-fn remove_owned_endpoint(path: &Path, identity: EndpointIdentity) {
-    if let Ok(metadata) = fs::symlink_metadata(path)
-        && metadata.file_type().is_socket()
+fn remove_owned_endpoint(path: &Path, identity: EndpointIdentity) -> std::io::Result<()> {
+    #[cfg(test)]
+    tests::CALLBACK_FILESYSTEM_CALLS.with(|calls| calls.set(calls.get() + 1));
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_socket()
         && metadata.dev() == identity.device
         && metadata.ino() == identity.inode
+        && metadata.uid() == nix::unistd::geteuid().as_raw()
     {
-        let _ = fs::remove_file(path);
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
+    Ok(())
 }
 
 fn endpoint_is_live(path: &Path) -> Result<bool, String> {
@@ -911,18 +938,122 @@ mod tests {
     use super::{
         Broker, EndpointIdentity, HEADER_LENGTH, MAX_PACKET_LENGTH, Receipt, TYPE_HELLO,
         TcpAddressFamily, connected_tcp_address_family, create_listener_socket,
-        create_private_directory, empty_message, ensure_endpoint_directory,
+        create_private_directory, empty_message, endpoint_cleanup, ensure_endpoint_directory,
         ensure_private_directory, frame_length_from_header, remove_stale_endpoint,
     };
     use nix::sys::socket::{UnixAddr, bind};
+    use std::cell::Cell;
     use std::collections::HashSet;
     use std::fs;
     use std::net::{TcpListener, TcpStream};
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-    use std::sync::atomic::AtomicBool;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    thread_local! {
+        pub(super) static CALLBACK_FILESYSTEM_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn broker_at(path: &Path) -> Broker {
+        let endpoint = endpoint_cleanup::register(path.to_path_buf()).unwrap();
+        let lifecycle = endpoint.lock_path().unwrap();
+        let listener = create_listener_socket().unwrap();
+        bind(listener.as_raw_fd(), &UnixAddr::new(path).unwrap()).unwrap();
+        let metadata = fs::symlink_metadata(path).unwrap();
+        endpoint
+            .set_identity(EndpointIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+            .unwrap();
+        drop(lifecycle);
+        Broker {
+            listener,
+            endpoint,
+            connection_ids: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    fn wait_until_removed(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while path.try_exists().unwrap() {
+            assert!(Instant::now() < deadline, "endpoint cleanup did not finish");
+            assert_eq!(endpoint_cleanup::drain_pending().unwrap(), 0);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn owner_down_callback_does_not_run_filesystem_cleanup_inline() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("handoff.sock");
+        let broker = broker_at(&path);
+        let before = CALLBACK_FILESYSTEM_CALLS.get();
+
+        // This is the exact operation invoked by the Rustler down callback.
+        broker.close();
+
+        assert_eq!(CALLBACK_FILESYSTEM_CALLS.get(), before);
+        wait_until_removed(&path);
+    }
+
+    #[test]
+    fn resource_drop_callback_does_not_run_filesystem_cleanup_inline() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("handoff.sock");
+        let broker = broker_at(&path);
+        let before = CALLBACK_FILESYSTEM_CALLS.get();
+
+        drop(broker);
+
+        assert_eq!(CALLBACK_FILESYSTEM_CALLS.get(), before);
+        wait_until_removed(&path);
+    }
+
+    #[test]
+    fn deferred_cleanup_preserves_a_replacement_socket() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("handoff.sock");
+        let broker = broker_at(&path);
+        let replacement_path = directory.path().join("replacement.sock");
+        let replacement = create_listener_socket().unwrap();
+        bind(
+            replacement.as_raw_fd(),
+            &UnixAddr::new(&replacement_path).unwrap(),
+        )
+        .unwrap();
+        let identity = fs::symlink_metadata(&replacement_path).unwrap();
+        fs::rename(replacement_path, &path).unwrap();
+
+        broker.close();
+        assert_eq!(endpoint_cleanup::drain_pending().unwrap(), 0);
+        broker.endpoint.finish().unwrap();
+
+        let preserved = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(preserved.dev(), identity.dev());
+        assert_eq!(preserved.ino(), identity.ino());
+    }
+
+    #[test]
+    fn same_path_startup_finishes_pending_cleanup_before_binding() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("handoff.sock");
+        let retired = broker_at(&path);
+        retired.close();
+
+        let replacement = broker_at(&path);
+        let identity = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(endpoint_cleanup::drain_pending().unwrap(), 0);
+        retired.endpoint.finish().unwrap();
+
+        assert!(!replacement.endpoint.is_closed());
+        assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), identity.ino());
+        replacement.endpoint.finish().unwrap();
+        assert!(!path.try_exists().unwrap());
+    }
 
     #[test]
     fn rejects_oversized_stream_header_before_payload() {
@@ -985,21 +1116,10 @@ mod tests {
     fn active_receipt_does_not_retain_retired_listener() {
         let directory = tempdir().unwrap();
         let endpoint = directory.path().join("handoff.sock");
-        let listener = create_listener_socket().unwrap();
-        bind(listener.as_raw_fd(), &UnixAddr::new(&endpoint).unwrap()).unwrap();
-        let metadata = fs::symlink_metadata(&endpoint).unwrap();
         let endpoint_after_drop = endpoint.clone();
         let connection_ids = Arc::new(Mutex::new(HashSet::from([[0x5A; 16]])));
-        let broker = Broker {
-            listener,
-            path: endpoint,
-            endpoint_identity: EndpointIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            },
-            closed: AtomicBool::new(false),
-            connection_ids: Arc::clone(&connection_ids),
-        };
+        let mut broker = broker_at(&endpoint);
+        broker.connection_ids = Arc::clone(&connection_ids);
         let receipt = Receipt {
             client: Mutex::new(None),
             control: Mutex::new(None),
@@ -1009,7 +1129,7 @@ mod tests {
 
         drop(broker);
 
-        assert!(!endpoint_after_drop.exists());
+        wait_until_removed(&endpoint_after_drop);
         assert_eq!(Arc::strong_count(&receipt.connection_ids), 1);
         drop(receipt);
     }

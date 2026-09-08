@@ -334,6 +334,108 @@ defmodule PhxPortHandoffTest do
     assert wait_until_removed(path)
   end
 
+  @tag :endpoint_cleanup
+  test "resource collection cleans up the endpoint while its owner remains alive" do
+    path = endpoint_path()
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        listen_and_forget(path)
+        true = :erlang.garbage_collect()
+        send(parent, :collected)
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    monitor = Process.monitor(owner)
+    on_exit(fn -> Process.exit(owner, :kill) end)
+    assert_receive :collected, 1_000
+    assert wait_until_removed(path)
+    assert Process.alive?(owner)
+    send(owner, :stop)
+    assert_receive {:DOWN, ^monitor, :process, ^owner, :normal}, 1_000
+  end
+
+  @tag :endpoint_cleanup
+  test "cleanup worker restart retains pending endpoint cleanup" do
+    path = endpoint_path()
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, broker} = Native.listen(path)
+        send(parent, {:broker, broker})
+        Process.sleep(:infinity)
+      end)
+
+    on_exit(fn -> Process.exit(owner, :kill) end)
+    assert_receive {:broker, broker}, 1_000
+    cleanup = Process.whereis(PhxPortHandoff.Cleanup)
+    assert :ok = :sys.suspend(cleanup, 1_000)
+
+    try do
+      accept = Task.async(fn -> Native.accept(broker) end)
+      Process.exit(owner, :kill)
+      assert {:error, :closed} = Task.await(accept, 1_000)
+      assert File.exists?(path)
+      monitor = Process.monitor(cleanup)
+      Process.exit(cleanup, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^cleanup, :killed}, 1_000
+      assert wait_until_removed(path)
+      assert is_pid(Process.whereis(PhxPortHandoff.Cleanup))
+      refute Process.whereis(PhxPortHandoff.Cleanup) == cleanup
+
+      assert {:ok, replacement} = Native.listen(path)
+      assert :ok = Native.close_listener(broker)
+      assert File.exists?(path)
+      assert :ok = Native.close_listener(replacement)
+    after
+      if Process.alive?(cleanup), do: :sys.resume(cleanup, 1_000)
+      Native.close_listener(broker)
+    end
+  end
+
+  @tag :endpoint_cleanup
+  test "same-path restart drains owner-down cleanup even while the worker is suspended" do
+    path = endpoint_path()
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, broker} = Native.listen(path)
+        send(parent, {:broker, broker})
+        Process.sleep(:infinity)
+      end)
+
+    on_exit(fn -> Process.exit(owner, :kill) end)
+    assert_receive {:broker, broker}, 1_000
+    cleanup = Process.whereis(PhxPortHandoff.Cleanup)
+    assert :ok = :sys.suspend(cleanup, 1_000)
+
+    try do
+      accept = Task.async(fn -> Native.accept(broker) end)
+      Process.exit(owner, :kill)
+      assert {:error, :closed} = Task.await(accept, 1_000)
+      assert File.exists?(path)
+
+      assert {:ok, replacement} = Native.listen(Path.join(Path.dirname(path), "./handoff.sock"))
+      assert :ok = Native.close_listener(broker)
+      assert File.exists?(path)
+      assert :ok = Native.close_listener(replacement)
+    after
+      :sys.resume(cleanup, 1_000)
+      Native.close_listener(broker)
+    end
+  end
+
+  defp listen_and_forget(path) do
+    assert {:ok, _broker} = Native.listen(path)
+    :ok
+  end
+
   defp endpoint_path do
     directory =
       Path.join(

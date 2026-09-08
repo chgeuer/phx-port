@@ -694,6 +694,18 @@ ordinary scheduler. Closing the broker must make the next Darwin accept report
 closure and allow the supervised listener to restart. Validate this
 explicitly; do not assume Linux `shutdown` behavior is identical.
 
+Broker resource callbacks only publish closure through an atomic flag. One
+supervised Elixir cleanup process polls the bounded native registry and runs
+filesystem cleanup through a dirty-I/O NIF; it does not retain broker resources
+or listener descriptors. The 1,024-slot registry includes starting, live, and
+cleanup-pending endpoints and rejects admission when full. Explicit close and
+same-path startup serialize with pending cleanup before a replacement can bind.
+Cleanup retains the endpoint's socket type, device, inode, and UID checks.
+Failed filesystem operations keep their slot for one-second retries and produce
+one bounded aggregate warning per failed endpoint; explicit callers receive the
+error. These callback/lifecycle regressions have Linux coverage, not a new
+Darwin slow-filesystem qualification.
+
 ### Descriptor import
 
 Keep `:gen_tcp.fdopen/2` as the first implementation:

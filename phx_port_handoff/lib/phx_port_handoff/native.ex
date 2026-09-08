@@ -11,6 +11,7 @@ defmodule PhxPortHandoff.Native do
   def listen(_path), do: :erlang.nif_error(:nif_not_loaded)
   def listen_derived(_path), do: :erlang.nif_error(:nif_not_loaded)
   def close_listener(_broker), do: :erlang.nif_error(:nif_not_loaded)
+  def cleanup_pending(), do: :erlang.nif_error(:nif_not_loaded)
   def effective_uid(), do: :erlang.nif_error(:nif_not_loaded)
 
   def accept(broker) do
