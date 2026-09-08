@@ -119,6 +119,13 @@ windows. If the exact executable is unavailable, confirm with
 `command -v probex`, record that limitation, and fall back to file reading.
 Do not guess another path or edit `deps/`.
 
+The user explicitly authorizes direct repository-file reading when the CLI
+denies access only to the external `probex` executable. Record that utility
+limitation and use the file-reading fallback; do not retry the denied
+executable, invoke an alternate copy, or request broader paths. This does not
+authorize reading an excluded or denied source file through another tool.
+A source-file denial or any different permission requirement remains a stop.
+
 Invoke the `beam-introspection` skill for live BEAM observations and the
 `diagnose` skill for bug diagnosis when relevant. Use isolated nodes, fresh
 private fixture directories, explicit process identities, and external
