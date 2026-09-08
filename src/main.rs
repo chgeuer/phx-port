@@ -29,6 +29,8 @@ mod relay;
 mod route_cache;
 mod systemd_service;
 mod tls_client_hello;
+#[cfg(unix)]
+mod unix_socket;
 mod worker_pool;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

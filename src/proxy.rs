@@ -2228,14 +2228,15 @@ pub fn query_health(check: HealthCheck) -> Result<(String, bool), String> {
 pub fn query_control(command: &str) -> Result<String, String> {
     #[cfg(unix)]
     {
-        let mut stream = UnixStream::connect(client_control_socket_path()?)
-            .map_err(|error| format!("TLS proxy daemon is not reachable: {error}"))?;
-        stream
-            .set_read_timeout(Some(CONTROL_IO_TIMEOUT))
-            .map_err(|error| format!("cannot configure control connection: {error}"))?;
-        stream
-            .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
-            .map_err(|error| format!("cannot configure control connection: {error}"))?;
+        let deadline = control_deadline()?;
+        let mut stream = ControlConnection {
+            stream: crate::unix_socket::connect_stream_until(
+                &client_control_socket_path()?,
+                deadline,
+            )
+            .map_err(|error| format!("TLS proxy daemon is not reachable: {error}"))?,
+            deadline,
+        };
         stream
             .write_all(format!("{command}\n").as_bytes())
             .map_err(|error| format!("cannot send daemon command: {error}"))?;
@@ -2265,6 +2266,64 @@ pub fn query_control(command: &str) -> Result<String, String> {
 
     #[cfg(not(unix))]
     Err("live daemon status is not supported on this platform".to_string())
+}
+
+#[cfg(unix)]
+fn control_deadline() -> Result<Instant, String> {
+    Instant::now()
+        .checked_add(CONTROL_IO_TIMEOUT)
+        .ok_or_else(|| "cannot represent control connection deadline".to_string())
+}
+
+#[cfg(unix)]
+struct ControlConnection {
+    stream: UnixStream,
+    deadline: Instant,
+}
+
+#[cfg(unix)]
+impl ControlConnection {
+    fn remaining(&self) -> io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "control request exceeded its absolute deadline",
+                )
+            })
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.remaining()?;
+        self.stream.shutdown(how)
+    }
+}
+
+#[cfg(unix)]
+impl Read for ControlConnection {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        let read = self.stream.read(buffer)?;
+        self.remaining()?;
+        Ok(read)
+    }
+}
+
+#[cfg(unix)]
+impl Write for ControlConnection {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        let written = self.stream.write(buffer)?;
+        self.remaining()?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.remaining()?;
+        self.stream.flush()
+    }
 }
 
 #[cfg(unix)]
@@ -2676,6 +2735,25 @@ fn start_control_server(
         Ok(_) => {
             validate_control_socket(&path, "existing control socket", policy)
                 .map_err(|error| format!("{error}: {}", path.display()))?;
+            match crate::unix_socket::connect_stream_until(&path, control_deadline()?) {
+                Ok(_) => {
+                    return Err(format!(
+                        "another TLS proxy daemon is already using {}",
+                        path.display()
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(&path)
+                        .map_err(|error| format!("cannot remove stale control socket: {error}"))?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot check existing control socket {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -2685,17 +2763,6 @@ fn start_control_server(
             ));
         }
     }
-    if std::fs::symlink_metadata(&path).is_ok() {
-        if UnixStream::connect(&path).is_ok() {
-            return Err(format!(
-                "another TLS proxy daemon is already using {}",
-                path.display()
-            ));
-        }
-        std::fs::remove_file(&path)
-            .map_err(|error| format!("cannot remove stale control socket: {error}"))?;
-    }
-
     let listener = bind_private_control_socket(&path, policy)?;
     validate_control_socket(&path, "bound control socket", policy)?;
     listener

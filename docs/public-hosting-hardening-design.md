@@ -728,13 +728,19 @@ workload permission to stop or reconfigure ingress. Harden control handling by:
 - checking peer credentials on every accepted connection;
 - comparing against the configured operator UID or group policy;
 - bounding request and response sizes;
-- retaining read/write timeouts;
+- bounding connection establishment and the complete client exchange with one
+  two-second absolute deadline;
 - making mutating commands explicit;
 - adding a configuration reload command only after atomic reload exists; and
 - returning a versioned machine-readable response for automation.
 
 `STOP` and future mutation operations require stronger authorization than
 read-only status if group-readable administration is introduced.
+
+Duplicate-daemon startup also bounds its control-endpoint liveness connection.
+Only connection refusal identifies a stale socket that may be removed.
+Timeouts and other operational errors leave the existing endpoint intact and
+refuse startup; a disappeared endpoint may be recreated.
 
 ### Certificate operations
 
