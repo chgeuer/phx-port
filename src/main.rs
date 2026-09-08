@@ -494,7 +494,7 @@ fn cmd_register(config: &Path, role: &str, explicit_workload_id: Option<&str>) {
     println!("{}", port);
 }
 
-fn resolve_dir(doc: &DocumentMut, arg: &str) -> Option<String> {
+fn resolve_project(doc: &DocumentMut, arg: &str) -> Option<String> {
     let table = doc["ports"].as_table()?;
 
     if arg == "." {
@@ -506,21 +506,37 @@ fn resolve_dir(doc: &DocumentMut, arg: &str) -> Option<String> {
         return None;
     }
 
-    // Try as directory name suffix
+    let port_num = arg.parse::<i64>().ok();
+    let suffix = format!("/{}", arg);
     let matches: Vec<&str> = table
         .iter()
+        .filter(|(key, value)| match port_num {
+            Some(port) => value.as_table().is_some_and(|roles| {
+                roles
+                    .iter()
+                    .any(|(_, value)| value.as_integer() == Some(port))
+            }),
+            None => key.ends_with(&suffix),
+        })
         .map(|(k, _)| k)
-        .filter(|k| k.ends_with(&format!("/{}", arg)))
         .collect();
 
     match matches.len() {
         0 => {
-            eprintln!("No mapping found matching '{}'", arg);
+            if let Some(port) = port_num {
+                eprintln!("No mapping found for port {}", port);
+            } else {
+                eprintln!("No mapping found matching '{}'", arg);
+            }
             None
         }
         1 => Some(matches[0].to_string()),
         _ => {
-            eprintln!("Ambiguous match for '{}'. Matching directories:", arg);
+            let selector = match port_num {
+                Some(port) => format!("port {}", port),
+                None => format!("'{}'", arg),
+            };
+            eprintln!("Ambiguous match for {}. Matching directories:", selector);
             for m in &matches {
                 eprintln!("  {}", m);
             }
@@ -530,47 +546,10 @@ fn resolve_dir(doc: &DocumentMut, arg: &str) -> Option<String> {
 }
 
 fn cmd_delete(config: &Path, arg: &str, role: Option<&str>) {
-    if let Ok(port_num) = arg.parse::<i64>() {
-        let (dir, found_role) = update_config(config, |doc| {
-            ensure_ports_table(doc);
-            let mut found = None;
-            if let Some(table) = doc["ports"].as_table() {
-                for (dir, dir_value) in table.iter() {
-                    if let Some(dir_table) = dir_value.as_table() {
-                        for (r, port_value) in dir_table.iter() {
-                            if port_value.as_integer() == Some(port_num) {
-                                found = Some((dir.to_string(), r.to_string()));
-                            }
-                        }
-                    }
-                }
-            }
-            let Some((dir, found_role)) = found else {
-                eprintln!("No mapping found for port {}", port_num);
-                process::exit(1);
-            };
-            doc["ports"][&dir]
-                .as_table_mut()
-                .unwrap()
-                .remove(&found_role);
-            if doc["ports"][&dir].as_table().is_none_or(|t| t.is_empty()) {
-                doc["ports"].as_table_mut().unwrap().remove(&dir);
-            }
-            route_cache::remove_for_registration(doc, &dir, Some(&found_role));
-            (dir, found_role)
-        });
-        if found_role == DEFAULT_ROLE {
-            eprintln!("Removed {} (was port {})", dir, port_num);
-        } else {
-            eprintln!("Removed {} ({}) (was port {})", dir, found_role, port_num);
-        }
-        return;
-    }
-
     if let Some(role) = role {
         let (key, port) = update_config(config, |doc| {
             ensure_ports_table(doc);
-            let key = resolve_dir(doc, arg).unwrap_or_else(|| process::exit(1));
+            let key = resolve_project(doc, arg).unwrap_or_else(|| process::exit(1));
             let Some(port) = doc["ports"]
                 .as_table()
                 .and_then(|t| t.get(&key))
@@ -596,7 +575,7 @@ fn cmd_delete(config: &Path, arg: &str, role: Option<&str>) {
     } else {
         let (key, ports) = update_config(config, |doc| {
             ensure_ports_table(doc);
-            let key = resolve_dir(doc, arg).unwrap_or_else(|| process::exit(1));
+            let key = resolve_project(doc, arg).unwrap_or_else(|| process::exit(1));
             let ports: Vec<(String, i64)> = doc["ports"]
                 .as_table()
                 .and_then(|t| t.get(&key))

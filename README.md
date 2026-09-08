@@ -770,6 +770,7 @@ phx-port delete admin_dashboard
 phx-port delete .
 
 # Remove a specific port role
+phx-port delete 4003 debug
 phx-port delete . debug
 phx-port delete admin_dashboard metrics
 
@@ -783,6 +784,12 @@ phx-port open debug
 phx-port launch
 phx-port launch debug
 ```
+
+A numeric selector identifies the project containing that port, not the role
+to delete. The optional role is honored independently, and deleting
+registrations also removes their discovered-route entries from the registry.
+Missing or ambiguous selectors and missing roles fail without removing
+registrations.
 
 Navigation URLs from `list`, `open`, and `launch` use `https://localhost:<port>`
 for the `https` role and `http://localhost:<port>` for `main` and other roles.
