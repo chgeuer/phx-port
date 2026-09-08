@@ -32,6 +32,13 @@ Failure details are bounded to 16 Route Declarations and 256 characters per
 underlying probe error. The command still checks independent categories after
 one category fails so one maintenance pass can expose multiple blockers.
 
+Production-path validation shares a one-second access deadline across its
+Port Registry and derived-state reads. The later registration read gets a
+fresh one-second deadline. A held registry lock therefore produces a
+registry-related `FAIL` instead of indefinitely delaying the report;
+independent categories still run. Normal Workload allocation retains its
+blocking, exclusive locking.
+
 ## Inputs
 
 Run as the same dedicated service identity and with the same environment and

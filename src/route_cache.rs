@@ -31,7 +31,15 @@ pub struct CachedRoute {
 }
 
 pub fn validate(path: &Path, storage: Storage) -> Result<(), String> {
-    let document = port_registry::read(path, storage.security())?;
+    validate_until(path, storage, None)
+}
+
+pub(crate) fn validate_until(
+    path: &Path,
+    storage: Storage,
+    deadline: Option<port_registry::AccessDeadline<'_>>,
+) -> Result<(), String> {
+    let document = port_registry::read_until(path, storage.security(), deadline)?;
     validate_document(&document, storage)
 }
 

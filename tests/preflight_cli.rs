@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use fs2::FileExt;
 #[cfg(target_os = "linux")]
 use native_tls::{Identity, TlsAcceptor};
 #[cfg(target_os = "linux")]
@@ -11,20 +12,20 @@ use std::fs;
 use std::net::{SocketAddr, TcpListener};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-#[cfg(target_os = "linux")]
 use std::thread;
 #[cfg(target_os = "linux")]
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
+use std::time::{Duration, Instant};
 use tempfile::{TempDir, tempdir_in};
 
 const HOSTNAME: &str = "preflight.example.test";
@@ -42,6 +43,42 @@ fn reserve_address() -> SocketAddr {
         .unwrap()
         .local_addr()
         .unwrap()
+}
+
+fn hold_registry_lock(path: &Path) -> fs::File {
+    let lock_path = path.with_file_name(format!(
+        "{}.lock",
+        path.file_name().unwrap().to_str().unwrap()
+    ));
+    let lock = fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(lock_path)
+        .unwrap();
+    FileExt::lock_exclusive(&lock).unwrap();
+    lock
+}
+
+fn assert_registry_timeout_report(output: &Output) -> String {
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "preflight must report failure before its external five-second watchdog kills it:\n{output:?}"
+    );
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    for check in [
+        "registry operation timed out",
+        "PASS ingress configuration",
+        "PASS capacity",
+        "PASS listener acquisition",
+        "PASS system trust roots",
+        "Preflight failed",
+    ] {
+        assert!(stdout.contains(check), "missing {check:?} in:\n{stdout}");
+    }
+    stdout
 }
 
 #[cfg(target_os = "linux")]
@@ -252,8 +289,82 @@ impl HostFixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_phx-port"));
         command.args(self.arguments(extra));
         self.configure(&mut command);
-        command.output().unwrap()
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        child.wait_with_output().unwrap()
     }
+}
+
+#[test]
+fn preflight_registry_deadline_covers_path_validation_and_assignments() {
+    let guard = TEST_LOCK.lock().unwrap();
+    let host = HostFixture::at(None, None, reserve_address(), false);
+    let _lock = hold_registry_lock(&host.registry);
+
+    let output = host.command(&["--task-budget", "128"]);
+    drop(guard);
+    let stdout = assert_registry_timeout_report(&output);
+    assert!(
+        stdout.contains("FAIL production paths: registry operation timed out"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("FAIL registrations: registry operation timed out"),
+        "{stdout}"
+    );
+    assert_eq!(fs::read_to_string(&host.registry).unwrap(), "[ports]\n");
+}
+
+#[test]
+fn preflight_registry_deadline_covers_assignments_after_path_rejection() {
+    let guard = TEST_LOCK.lock().unwrap();
+    let mut host = HostFixture::at(None, None, reserve_address(), false);
+    host.runtime = host.registry.parent().unwrap().to_path_buf();
+    let _lock = hold_registry_lock(&host.registry);
+
+    let output = host.command(&["--task-budget", "128"]);
+    drop(guard);
+    let stdout = assert_registry_timeout_report(&output);
+    assert!(
+        stdout.contains(
+            "FAIL production paths: production state directory and runtime root must be distinct"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("FAIL registrations: registry operation timed out"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn preflight_registry_deadline_covers_derived_state_without_skipping_assignments() {
+    let guard = TEST_LOCK.lock().unwrap();
+    let host = HostFixture::at(None, None, reserve_address(), false);
+    let _lock = hold_registry_lock(&host.registry.with_file_name("routes.toml"));
+
+    let output = host.command(&["--task-budget", "128"]);
+    drop(guard);
+    let stdout = assert_registry_timeout_report(&output);
+    assert!(
+        stdout.contains("FAIL production paths: registry operation timed out"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("WARN registrations"), "{stdout}");
+    assert!(!stdout.contains("FAIL registrations"), "{stdout}");
+    assert!(stdout.contains("WARN route certificates"), "{stdout}");
 }
 
 #[cfg(target_os = "linux")]

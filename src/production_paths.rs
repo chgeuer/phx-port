@@ -76,11 +76,18 @@ impl ProductionPaths {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        self.validate_paths(false)
+        self.validate_until(None)
+    }
+
+    pub(crate) fn validate_until(
+        &self,
+        deadline: Option<port_registry::AccessDeadline<'_>>,
+    ) -> Result<(), String> {
+        self.validate_paths(false, deadline)
     }
 
     pub fn prepare_for_startup(&self) -> Result<(), String> {
-        self.validate_paths(true)
+        self.validate_paths(true, None)
     }
 
     pub fn validate_sandbox_access(&self) -> Result<(), String> {
@@ -94,7 +101,11 @@ impl ProductionPaths {
         probe_directory_write(&self.runtime_root, "production runtime root")
     }
 
-    fn validate_paths(&self, repair_derived_state: bool) -> Result<(), String> {
+    fn validate_paths(
+        &self,
+        repair_derived_state: bool,
+        deadline: Option<port_registry::AccessDeadline<'_>>,
+    ) -> Result<(), String> {
         let state_directory = self
             .port_registry
             .parent()
@@ -102,11 +113,15 @@ impl ProductionPaths {
         if state_directory == self.runtime_root {
             return Err("production state directory and runtime root must be distinct".to_string());
         }
-        port_registry::read_logical_assignments(&self.port_registry)?;
+        port_registry::read_logical_assignments_until(&self.port_registry, deadline)?;
         if repair_derived_state {
             route_cache::prepare(&self.route_cache)?;
         } else {
-            route_cache::validate(&self.route_cache, route_cache::Storage::SeparateState)?;
+            route_cache::validate_until(
+                &self.route_cache,
+                route_cache::Storage::SeparateState,
+                deadline,
+            )?;
         }
         validate_runtime_root(&self.runtime_root)?;
         validate_optional_handoff_directory(&self.runtime_root.join("handoff"))

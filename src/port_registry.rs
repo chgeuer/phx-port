@@ -147,8 +147,11 @@ pub(crate) fn read_until(
     unlock(lock, &path, result)
 }
 
-pub fn read_logical_assignments(path: &Path) -> Result<LogicalAssignments, String> {
-    let document = read(path, RegistrySecurity::LogicalWorkload)?;
+pub(crate) fn read_logical_assignments_until(
+    path: &Path,
+    deadline: Option<AccessDeadline<'_>>,
+) -> Result<LogicalAssignments, String> {
+    let document = read_until(path, RegistrySecurity::LogicalWorkload, deadline)?;
     logical_assignments(&document)
 }
 

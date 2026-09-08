@@ -11,8 +11,11 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 
 const INGRESS_CONFIG_ENV: &str = "PHX_PORT_INGRESS_CONFIG";
+const REGISTRY_ACCESS_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_REPORTED_ROUTE_FAILURES: usize = 16;
 const MAX_FAILURE_DETAIL_LENGTH: usize = 256;
 
@@ -220,6 +223,11 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
         }
     };
 
+    let cancelled = AtomicBool::new(false);
+    let registry_deadline = || port_registry::AccessDeadline {
+        deadline: Instant::now() + REGISTRY_ACCESS_TIMEOUT,
+        cancelled: &cancelled,
+    };
     let mut production_paths_valid = false;
     let paths = match ProductionPaths::from_environment() {
         Ok(paths) => {
@@ -227,7 +235,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
                 if let Some(snapshot) = &snapshot {
                     paths.validate_intent_separation(&snapshot.ingress_config)?;
                 }
-                paths.validate()
+                paths.validate_until(Some(registry_deadline()))
             })();
             match result {
                 Ok(()) => {
@@ -344,7 +352,10 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     };
 
     let assignments = match &paths {
-        Some(paths) => match port_registry::read_logical_assignments(&paths.port_registry) {
+        Some(paths) => match port_registry::read_logical_assignments_until(
+            &paths.port_registry,
+            Some(registry_deadline()),
+        ) {
             Ok(assignments) => Some(assignments),
             Err(error) => {
                 report.fail("registrations", error);
