@@ -261,13 +261,13 @@ impl TreeNode {
         }
     }
 
-    fn insert(&mut self, segments: &[&str], ports: Vec<(i64, String)>) {
+    fn insert(&mut self, segments: &[String], ports: Vec<(i64, String)>) {
         if segments.is_empty() {
             self.ports = ports;
             return;
         }
         self.children
-            .entry(segments[0].to_string())
+            .entry(segments[0].clone())
             .or_insert_with(TreeNode::new)
             .insert(&segments[1..], ports);
     }
@@ -285,7 +285,8 @@ impl TreeNode {
             if should_merge {
                 let child = self.children.remove(&key).unwrap();
                 let (gk, gv) = child.children.into_iter().next().unwrap();
-                self.children.insert(format!("{}/{}", key, gk), gv);
+                let merged = Path::new(&key).join(gk).to_string_lossy().into_owned();
+                self.children.insert(merged, gv);
             }
         }
     }
@@ -382,26 +383,31 @@ fn cmd_list_tree(config: &Path, as_url: bool) {
         return;
     }
 
-    let home = home_dir().to_string_lossy().to_string();
     let mut root = TreeNode::new();
 
     for (dir, ports) in &dir_ports {
-        let relative = dir.strip_prefix(&home).unwrap_or(dir.as_str());
-        let relative = relative.strip_prefix('/').unwrap_or(relative);
-        let segments: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
+        let segments: Vec<String> = Path::new(dir)
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect();
         root.insert(&segments, ports.clone());
     }
 
     root.collapse();
 
     // Collapse single-child root chain into the display path
-    let mut display_root = home;
+    let mut display_root = PathBuf::new();
     let mut render_node = &root;
     while render_node.children.len() == 1 && render_node.ports.is_empty() {
         let (name, child) = render_node.children.iter().next().unwrap();
-        display_root = format!("{}/{}", display_root, name);
+        display_root.push(name);
         render_node = child;
     }
+    let display_root = if display_root.as_os_str().is_empty() {
+        "Workloads".to_string()
+    } else {
+        display_root.to_string_lossy().into_owned()
+    };
 
     if render_node.children.is_empty() {
         if !render_node.ports.is_empty() {

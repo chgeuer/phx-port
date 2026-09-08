@@ -812,6 +812,11 @@ Registered /home/user/projects/shop (debug) → port 4004    # ← new role
 
 With many projects, the tree view (the default) gives a cleaner overview grouped by directory structure. Single-child directories are collapsed automatically, and ports are shown as clickable URLs:
 
+The tree uses the projects' actual common filesystem root, so paths outside
+HOME remain absolute and never merge with HOME-relative names. Logical
+Workload IDs remain separate from filesystem paths; listings without a shared
+root use a `Workloads` heading. Flat output retains the original registry keys.
+
 ```
 $ phx-port list
 /home/user
