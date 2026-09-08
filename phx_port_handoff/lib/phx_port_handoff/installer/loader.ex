@@ -4,6 +4,7 @@ defmodule PhxPortHandoff.Installer.Loader do
   @required_modules [
     "Igniter.Code.Common",
     "Igniter.Code.Function",
+    "Igniter.Code.Keyword",
     "Igniter.Code.List",
     "Igniter.Code.Tuple",
     "Igniter.Libs.Phoenix",

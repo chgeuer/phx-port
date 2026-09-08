@@ -32,8 +32,10 @@ substitute a Hex or Git dependency. The installer discovers the OTP
 application and Phoenix endpoint and adds the conditional handoff child
 immediately before the ordinary endpoint.
 
-If the dependency is already present, rerun the same Igniter command; the
-installer is idempotent:
+If the dependency is already present, rerun the same Igniter command. Select
+the intended endpoint when the project contains more than one. Installation
+is idempotent for that endpoint's `"https"` role, including an omitted default
+role; existing children for other endpoints or roles are left unchanged:
 
 ```bash
 mix igniter.install \
@@ -41,7 +43,7 @@ mix igniter.install \
   --yes
 ```
 
-Review the generated diff. It should contain:
+On a new installation, review the generated diff. It should contain:
 
 ```elixir
 {PhxPortHandoff,
@@ -50,6 +52,11 @@ Review the generated diff. It should contain:
  role: "https"},
 MyAppWeb.Endpoint
 ```
+
+Only an inserted child produces a configuration notice. An already-present
+child needs no edit; a manual-edit warning does not mean setup is complete.
+An existing child's dynamically computed endpoint or role may require a
+manual check so that installation does not create a duplicate.
 
 The child reads the endpoint's HTTPS options unchanged, derives the path or
 Workload identity, and returns `:ignore` when HTTPS is unset or explicitly

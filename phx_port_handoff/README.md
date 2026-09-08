@@ -23,8 +23,14 @@ mix igniter.install \
 ```
 
 The installer adds the path dependency and inserts the handoff child
-immediately before the Phoenix endpoint. Rerunning the command is safe; the
-installer is idempotent.
+immediately before the selected Phoenix endpoint. It matches existing children
+by endpoint and role (`"https"`, including an omitted default role), so a
+different endpoint or role does not prevent installation. Rerunning for the
+same target leaves its child and options unchanged and does not announce a new
+configuration. A configuration notice appears only when a child was inserted;
+custom supervision trees requiring a manual edit produce a warning instead.
+If an existing child's endpoint or role cannot be determined statically, the
+installer requests a manual check rather than risking a duplicate.
 
 ## Phoenix integration
 
