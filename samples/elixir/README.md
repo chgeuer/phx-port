@@ -11,11 +11,18 @@ same tiny Plug on three Bandit listeners:
 The root `justfile` owns stable port assignment. The application only reads
 `PORT` and `HTTPS_PORT`; it never invokes `phx-port`.
 
+The `phx_port_handoff` path dependency uses the adjacent
+`../../phx_port_handoff` package, so integration exercises this repository
+checkout rather than a separately fetched Git revision. Keep the repository
+layout intact; external dependency versions remain pinned in `mix.lock`.
+
 ## Run
 
-From the repository root, use the sample recipes:
+From the repository root, fetch the sample dependencies, then use the sample
+recipes:
 
 ```bash
+(cd samples/elixir && mix deps.get)
 just start-elixir
 just show-elixir
 ```
@@ -69,6 +76,8 @@ The listener value is `http`, `https`, or `phxp-handoff-https`. `peer` and
 original client and local socket addresses.
 
 ## Verify
+
+From `samples/elixir`:
 
 ```bash
 mix format --check-formatted
