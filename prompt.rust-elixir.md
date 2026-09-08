@@ -229,6 +229,15 @@ bound the SSH command from Linux and explicitly track/clean remote fixture
 PIDs rather than assuming disconnect kills them. Do not install tools until
 an actual required command fails for a missing dependency.
 
+The user subsequently authorized `--add-dir /bin` for required Darwin worker
+sessions only. The CLI path checker can mistake a quoted remote
+`/bin/zsh -lc ...` command for an out-of-repository local path. The supervisor
+may resume ING-R4 or CP-10 with that specific additional-directory flag after
+restoring its agent-ready state. This is not authorization for
+`--allow-all-paths`, other directories, or broader permissions on ordinary
+workers. Preserve the original model and all host guardrails; surface any
+different authorization denial rather than evading it.
+
 Use unprivileged ephemeral listeners and generated certificates. Do not
 bootstrap launchd, invoke production control sockets, use real private keys,
 or alter installed services. Record the exact Git commit, architecture,
