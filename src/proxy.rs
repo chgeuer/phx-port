@@ -4561,6 +4561,10 @@ fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
                     "Eager TLS discovery unavailable at 127.0.0.1:{} ({} {}): {error}",
                     backend.port, backend.project, backend.role
                 );
+                if state.check_running_until(deadline).is_err() {
+                    defer_eager_workloads(state, &added[index..]);
+                    return;
+                }
                 continue;
             }
         };
@@ -4586,6 +4590,10 @@ fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
                     .is_ok()
                 {
                     record_conflict(state, &hostname, vec![incumbent.backend, backend.clone()]);
+                }
+                if state.check_running_until(deadline).is_err() {
+                    defer_eager_workloads(state, &added[index..]);
+                    return;
                 }
                 continue;
             }
@@ -6378,6 +6386,153 @@ mod tests {
                 .contains("shutting down")
         );
         assert!(!directory.path().join("ports.toml.lock").exists());
+    }
+
+    #[test]
+    fn development_eager_discovery_retries_after_name_probe_capacity_timeout() {
+        const HOSTNAME: &str = "deferred-name-probe.example.test";
+        let directory = tempdir().unwrap();
+        let registry = directory.path().join("ports.toml");
+        let certificate = TestCertificate::for_hostname(HOSTNAME);
+        let backend = TestTlsBackend::start(&certificate, b"deferred");
+        update_config(&registry, |document| {
+            document["ports"]["/project"] = toml_edit::table();
+            document["ports"]["/project"]["https"] = value(i64::from(backend.port()));
+        });
+        let mut state = ProxyState::new_with_profile_and_connector(
+            registry,
+            HostingProfile::Development,
+            certificate.connector(),
+        );
+        state.probes = Arc::new(ProbeLimiter::with_limit(1));
+        let permit = state
+            .probes
+            .acquire(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+
+        super::reconcile_workloads_until(&state, Instant::now() + Duration::from_millis(150));
+        assert!(state.routes.read().unwrap().is_empty());
+        drop(permit);
+        assert_eq!(*state.probes.in_use.lock().unwrap(), 0);
+        assert!(state.negative.lock().unwrap().is_empty());
+
+        reconcile_workloads(&state);
+        assert!(
+            state.routes.read().unwrap().contains_key(HOSTNAME),
+            "name-probe capacity timeout permanently suppressed eager discovery"
+        );
+    }
+
+    #[test]
+    fn development_eager_discovery_retries_after_incumbent_probe_capacity_timeout() {
+        const HOSTNAME: &str = "deferred-incumbent-probe.example.test";
+        let directory = tempdir().unwrap();
+        let registry = directory.path().join("ports.toml");
+        let certificate = TestCertificate::for_hostname(HOSTNAME);
+        let incumbent = TestTlsBackend::start(&certificate, b"incumbent");
+        let contender = TestTlsBackend::start(&certificate, b"contender");
+        update_config(&registry, |document| {
+            document["ports"]["/incumbent"] = toml_edit::table();
+            document["ports"]["/incumbent"]["https"] = value(i64::from(incumbent.port()));
+        });
+        let mut state = ProxyState::new_with_profile_and_connector(
+            registry,
+            HostingProfile::Development,
+            certificate.connector(),
+        );
+        state.probes = Arc::new(ProbeLimiter::with_limit(1));
+        reconcile_workloads(&state);
+        assert_eq!(
+            state.routes.read().unwrap()[HOSTNAME].backend.port,
+            incumbent.port()
+        );
+        update_config(&state.config, |document| {
+            document["ports"]["/contender"] = toml_edit::table();
+            document["ports"]["/contender"]["https"] = value(i64::from(contender.port()));
+        });
+
+        let state = Arc::new(state);
+        let routes = state.routes.write().unwrap();
+        let worker_state = Arc::clone(&state);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let worker = thread::spawn(move || {
+            super::reconcile_workloads_until(&worker_state, deadline);
+        });
+        // Let the names probe finish, then reserve capacity before incumbent confirmation.
+        while contender.accepted() < 2 || *state.probes.in_use.lock().unwrap() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "contender names probe did not finish"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let permit = state
+            .probes
+            .acquire(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        drop(routes);
+        worker.join().unwrap();
+        assert!(state.conflicts.read().unwrap().is_empty());
+        assert_eq!(
+            state.routes.read().unwrap()[HOSTNAME].backend.port,
+            incumbent.port()
+        );
+        drop(permit);
+        assert_eq!(*state.probes.in_use.lock().unwrap(), 0);
+        assert!(state.negative.lock().unwrap().is_empty());
+
+        reconcile_workloads(&state);
+        let conflicts = state.conflicts.read().unwrap();
+        let contenders = conflicts
+            .get(HOSTNAME)
+            .expect("incumbent-probe capacity timeout permanently suppressed conflict detection");
+        assert_eq!(contenders.len(), 2);
+        assert!(
+            contenders
+                .iter()
+                .any(|backend| backend.port == incumbent.port())
+        );
+        assert!(
+            contenders
+                .iter()
+                .any(|backend| backend.port == contender.port())
+        );
+    }
+
+    #[test]
+    fn development_eager_discovery_keeps_non_deadline_probe_failure_observed() {
+        const HOSTNAME: &str = "failed-name-probe.example.test";
+        let signing_key =
+            KeyPair::from_pkcs8_pem_and_sign_algo(TEST_RSA_PRIVATE_KEY, &PKCS_RSA_SHA256).unwrap();
+        let mut parameters = TestCertificate::parameters_for_hostname(HOSTNAME);
+        parameters.subject_alt_names.clear();
+        let certificate = TestCertificate {
+            certificate_pem: parameters.self_signed(&signing_key).unwrap().pem(),
+            private_key_pem: TEST_RSA_PRIVATE_KEY.to_string(),
+        };
+        let backend = TestTlsBackend::start(&certificate, b"no-names");
+        let directory = tempdir().unwrap();
+        let registry = directory.path().join("ports.toml");
+        update_config(&registry, |document| {
+            document["ports"]["/project"] = toml_edit::table();
+            document["ports"]["/project"]["https"] = value(i64::from(backend.port()));
+        });
+        let state = ProxyState::new(registry);
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        super::reconcile_workloads_until(&state, deadline);
+
+        assert!(state.check_running_until(deadline).is_ok());
+        assert!(state.routes.read().unwrap().is_empty());
+        assert_eq!(
+            *state.workloads.lock().unwrap(),
+            vec![Backend {
+                project: "/project".to_string(),
+                role: "https".to_string(),
+                port: backend.port(),
+            }],
+            "a completed names probe failure must not become a deadline retry"
+        );
     }
 
     #[test]

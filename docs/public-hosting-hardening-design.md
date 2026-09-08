@@ -213,7 +213,10 @@ deadlines. A malformed, unreadable, or lock-contended snapshot is unavailable,
 not an authoritative empty registry: existing Workload and Verified Route
 state is retained while the failure is reported through bounded diagnostics.
 Reconciliation resumes after a valid snapshot returns; CLI-only registry
-readers retain their command-exit error policy.
+readers retain their command-exit error policy. If a reconciliation pass
+expires during eager certificate-name discovery or incumbent confirmation,
+unfinished Workloads remain eligible for the next pass. Probe failures before
+pass expiry retain their existing handling.
 
 ## Threat model
 
