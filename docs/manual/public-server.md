@@ -68,8 +68,15 @@ sudo install -o root -g root -m 0755 target/release/phx-port \
 sudo install -d -o root -g phx-port -m 0755 /etc/phx-port
 sudo install -d -o phx-port -g phx-port -m 0700 /var/lib/phx-port
 sudo install -d -o phx-port -g phx-port-admin -m 0750 /run/phx-port
-sudo install -d -o phx-port -g phx-port -m 0700 /run/phx-port/handoff
+sudo -n -u phx-port -g phx-port -- install -d -o phx-port -g phx-port -m 0700 \
+  /run/phx-port/handoff
 ```
+
+Initialize the `handoff` child as the service user, including on repeated
+provisioning runs. Its parent is service-writable, so a pre-existing child
+could be a symlink. Root's `install -o phx-port` does not drop privileges and
+could change the symlink target's ownership or permissions. If the
+unprivileged step fails, inspect the path rather than retrying it as root.
 
 ### 3. Write ingress configuration
 
@@ -239,7 +246,7 @@ sudo install -d -o phx-port -g phx-port -m 0700 \
   "/Library/Application Support/phx-port/state"
 sudo install -d -o phx-port -g phx-port-admin -m 0750 \
   /private/var/run/phx-port
-sudo install -d -o phx-port -g phx-port -m 0700 \
+sudo -n -u phx-port -g phx-port -- install -d -o phx-port -g phx-port -m 0700 \
   /private/var/run/phx-port/handoff
 sudo install -o root -g phx-port -m 0640 ingress.toml \
   "/Library/Application Support/phx-port/ingress.toml"
@@ -252,9 +259,10 @@ sudo install -o root -g wheel -m 0644 \
 ```
 
 `/private/var/run` is cleared at boot. The root one-shot
-`dev.phx-port.runtime` job recreates the exact runtime and handoff directories
-on every boot. Bootstrap and verify it before running preflight or installing
-ingress:
+`dev.phx-port.runtime` job recreates the exact runtime directory on every boot,
+then drops to `phx-port` before initializing the service-writable handoff
+child. Do not run that child step as root, even during recovery. Bootstrap and
+verify the job before running preflight or installing ingress:
 
 ```bash
 sudo launchctl bootstrap system \

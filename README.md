@@ -599,7 +599,7 @@ sudo install -d -o phx-port -g phx-port -m 0700 \
   "/Library/Application Support/phx-port/state"
 sudo install -d -o phx-port -g phx-port-admin -m 0750 \
   /private/var/run/phx-port
-sudo install -d -o phx-port -g phx-port -m 0700 \
+sudo -n -u phx-port -g phx-port -- install -d -o phx-port -g phx-port -m 0700 \
   /private/var/run/phx-port/handoff
 sudo install -o root -g phx-port -m 0640 ingress.toml \
   "/Library/Application Support/phx-port/ingress.toml"
@@ -615,8 +615,12 @@ sudo launchctl bootstrap system \
 ```
 
 The root one-shot runtime job recreates `/private/var/run/phx-port` with exact
-owners and modes after every reboot; require its last exit code to be zero
-before first ingress bootstrap. The ingress plist's `tls-ipv4` and `tls-ipv6`
+owners and modes after every reboot, then initializes its service-writable
+`handoff` child as `phx-port`, not root. Preserve that privilege boundary when
+repeating provisioning: `install -o` changes ownership, not execution identity,
+and does not prevent following a workload-controlled symlink. Require the
+job's last exit code to be zero before first ingress bootstrap.
+The ingress plist's `tls-ipv4` and `tls-ipv6`
 sockets own port 443. The non-root daemon
 retrieves them by name with `launch_activate_socket()`, requires exactly one
 listening TCP descriptor on each configured address, and sets both

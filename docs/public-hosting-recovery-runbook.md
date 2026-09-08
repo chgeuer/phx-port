@@ -89,8 +89,14 @@ sudo install -d -o phx-port -g phx-port -m 0700 /var/lib/phx-port
 sudo install -o phx-port -g phx-port -m 0600 \
   "$backup/ports.toml" /var/lib/phx-port/ports.toml
 sudo install -d -o phx-port -g phx-port-admin -m 0750 /run/phx-port
-sudo install -d -o phx-port -g phx-port -m 0700 /run/phx-port/handoff
+sudo -n -u phx-port -g phx-port -- install -d -o phx-port -g phx-port -m 0700 \
+  /run/phx-port/handoff
 ```
+
+Keep the handoff-directory step unprivileged when repeating provisioning.
+The runtime root is service-writable; `install -o phx-port` run as root could
+follow a workload-controlled symlink and change its target. If the service-user
+step fails, inspect the path rather than retrying it as root.
 
 If disposable state already exists on the recovery target, stop ingress and
 remove only these exact host-local files before cold start:
