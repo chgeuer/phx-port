@@ -399,12 +399,15 @@ Allocator requirements:
 
 - validate every path component without following unexpected symlinks;
 - require service-UID ownership and private modes;
-- take the existing exclusive advisory lock before reading or assigning;
+- use a shared advisory lock for validated, unchanged assignment lookups;
+- release the shared lock and recheck under the existing exclusive advisory
+  lock before assigning or persisting legacy migration;
 - allocate and atomically persist one `(workload ID, role)` mapping;
 - reject serialized private state above the existing 4 MiB reader limit before
   publication, preserving the previous bytes and assignments;
 - preserve unrelated assignments and derived files;
-- return the existing assignment idempotently;
+- return the existing assignment idempotently without republishing unchanged
+  registry state;
 - prevent two concurrent first starts from receiving one port;
 - permit the same workload ID on different hosts to receive different local
   ports;

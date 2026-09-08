@@ -298,12 +298,57 @@ fn concurrent_distinct_logical_workloads_receive_distinct_ports() {
     assert_eq!(ports.len(), 12);
 }
 
+#[test]
+fn concurrent_development_starts_preserve_stability_and_uniqueness() {
+    for distinct_projects in [false, true] {
+        let directory = tempdir().unwrap();
+        let registry = directory.path().join("registry/ports.toml");
+        let barrier = Arc::new(Barrier::new(12));
+        let mut workers = Vec::new();
+
+        for index in 0..12 {
+            let project = if distinct_projects { index } else { 0 };
+            let cwd = directory.path().join(format!("project-{project}"));
+            fs::create_dir_all(&cwd).unwrap();
+            let registry = registry.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                allocate(&cwd, &registry, None, &[])
+            }));
+        }
+
+        let ports = workers
+            .into_iter()
+            .map(|worker| output_port(&worker.join().unwrap()))
+            .collect::<BTreeSet<_>>();
+        let expected = if distinct_projects { 12 } else { 1 };
+        assert_eq!(ports.len(), expected);
+        let document = fs::read_to_string(&registry)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(document["ports"].as_table().unwrap().len(), expected);
+    }
+}
+
 fn allocate(
     cwd: &Path,
     registry: &Path,
     workload_id: Option<&str>,
     arguments: &[&str],
 ) -> std::process::Output {
+    allocation_command(cwd, registry, workload_id, arguments)
+        .output()
+        .unwrap()
+}
+
+fn allocation_command(
+    cwd: &Path,
+    registry: &Path,
+    workload_id: Option<&str>,
+    arguments: &[&str],
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_phx-port"));
     command
         .args(arguments)
@@ -318,7 +363,7 @@ fn allocate(
             command.env_remove("PHX_PORT_WORKLOAD_ID");
         }
     }
-    command.output().unwrap()
+    command
 }
 
 fn output_port(output: &std::process::Output) -> u16 {
@@ -332,6 +377,207 @@ fn output_port(output: &std::process::Output) -> u16 {
         .trim()
         .parse()
         .unwrap()
+}
+
+fn assert_existing_lookup_preserves_registry(workload_id: Option<&str>) {
+    use std::time::{Duration, SystemTime};
+
+    let directory = tempdir().unwrap();
+    let registry = directory.path().join("registry/ports.toml");
+    let expected = output_port(&allocate(
+        directory.path(),
+        &registry,
+        workload_id,
+        &["https"],
+    ));
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&registry)
+        .unwrap();
+    file.set_times(
+        fs::FileTimes::new()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+    )
+    .unwrap();
+    let original = fs::read(&registry).unwrap();
+    let before = file.metadata().unwrap();
+    let mut modification_changes = 0;
+    #[cfg(unix)]
+    let mut inode_changes = 0;
+
+    for _ in 0..4 {
+        assert_eq!(
+            output_port(&allocate(
+                directory.path(),
+                &registry,
+                workload_id,
+                &["https"]
+            )),
+            expected
+        );
+        assert_eq!(fs::read(&registry).unwrap(), original);
+        let after = fs::metadata(&registry).unwrap();
+        modification_changes +=
+            usize::from(after.modified().unwrap() != before.modified().unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            inode_changes += usize::from(after.ino() != before.ino());
+        }
+    }
+    #[cfg(unix)]
+    assert_eq!(
+        inode_changes, 0,
+        "four unchanged lookups must not replace the registry"
+    );
+    assert_eq!(
+        modification_changes, 0,
+        "unchanged lookups must preserve modification time"
+    );
+}
+
+#[test]
+fn existing_logical_lookup_does_not_republish_registry() {
+    assert_existing_lookup_preserves_registry(Some("steady-web"));
+}
+
+#[test]
+fn existing_development_lookup_does_not_republish_registry() {
+    assert_existing_lookup_preserves_registry(None);
+}
+
+#[test]
+fn existing_lookup_persists_legacy_migration() {
+    for workload_id in [Some("steady-web"), None] {
+        let directory = tempdir().unwrap();
+        let registry = directory.path().join("registry/ports.toml");
+        let expected = output_port(&allocate(
+            directory.path(),
+            &registry,
+            workload_id,
+            &["https"],
+        ));
+        let mut legacy = fs::read_to_string(&registry)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        legacy["ports"]["legacy"] = toml_edit::value(4002);
+        fs::write(&registry, legacy.to_string()).unwrap();
+
+        assert_eq!(
+            output_port(&allocate(
+                directory.path(),
+                &registry,
+                workload_id,
+                &["https"]
+            )),
+            expected
+        );
+        let migrated = fs::read_to_string(&registry)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(migrated["ports"]["legacy"]["main"].as_integer(), Some(4002));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_lookup_uses_shared_registry_lock() {
+    use fs2::FileExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    for workload_id in [Some("steady-web"), None] {
+        let directory = tempdir().unwrap();
+        let registry = directory.path().join("registry/ports.toml");
+        let expected = output_port(&allocate(
+            directory.path(),
+            &registry,
+            workload_id,
+            &["https"],
+        ));
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(registry.with_file_name("ports.toml.lock"))
+            .unwrap();
+        FileExt::lock_shared(&lock).unwrap();
+        let mut child = allocation_command(directory.path(), &registry, workload_id, &["https"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let completed = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        FileExt::unlock(&lock).unwrap();
+        assert!(
+            completed,
+            "unchanged lookup waited for an exclusive registry lock"
+        );
+        assert_eq!(output_port(&output), expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_lookup_succeeds_when_registry_publication_would_fail() {
+    use nix::sys::resource::{Resource, setrlimit};
+    use std::os::unix::process::CommandExt;
+
+    for workload_id in [Some("steady-web"), None] {
+        let directory = tempdir().unwrap();
+        let registry = directory.path().join("registry/ports.toml");
+        let expected = output_port(&allocate(
+            directory.path(),
+            &registry,
+            workload_id,
+            &["https"],
+        ));
+        let original = fs::read(&registry).unwrap();
+
+        for role in ["https", "new-role"] {
+            let mut command = allocation_command(directory.path(), &registry, workload_id, &[role]);
+            // Only the child is forbidden to write files; reads and lock acquisition remain valid.
+            unsafe {
+                command.pre_exec(|| {
+                    if nix::libc::signal(nix::libc::SIGXFSZ, nix::libc::SIG_IGN)
+                        == nix::libc::SIG_ERR
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    setrlimit(Resource::RLIMIT_FSIZE, 0, 0).map_err(std::io::Error::other)
+                });
+            }
+            let output = command.output().unwrap();
+            if role == "https" {
+                assert_eq!(output_port(&output), expected);
+            } else {
+                assert!(
+                    !output.status.success(),
+                    "new allocation must still require publication"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("cannot atomically write"),
+                    "unexpected publication failure: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            assert_eq!(fs::read(&registry).unwrap(), original);
+        }
+    }
 }
 
 #[test]

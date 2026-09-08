@@ -257,28 +257,54 @@ pub fn allocate(
         RegistrySecurity::Development
     };
 
-    update(path, security, |document| {
-        ensure_ports_table(document);
-        if let Some(port) = document["ports"]
-            .as_table()
-            .and_then(|ports| ports.get(workload))
-            .and_then(|roles| roles.as_table())
-            .and_then(|roles| roles.get(role))
-            .and_then(|port| port.as_integer())
-        {
+    let path = prepare_path(path, security)?;
+    let lock = open_lock(&path, security)?;
+    lock_for_access(&lock, &path, false, None)?;
+    let result = (|| {
+        let (document, migrated) = load_with_policy(&path, security, false)?;
+        if !migrated && let Some(port) = assigned_port(&document, workload, role) {
             return Ok((port, false));
         }
+        drop(document);
 
-        let port = next_port(document)?;
-        if document["ports"]
-            .as_table()
-            .is_none_or(|ports| !ports.contains_key(workload))
-        {
-            document["ports"][workload] = toml_edit::table();
+        // Release the shared lock before taking exclusive ownership, then recheck from disk.
+        FileExt::unlock(&lock)
+            .map_err(|error| format!("cannot unlock {}: {error}", path.display()))?;
+        lock_for_access(&lock, &path, true, None)?;
+        let (mut document, migrated) = load_with_policy(&path, security, false)?;
+        let (port, created) = match assigned_port(&document, workload, role) {
+            Some(port) => (port, false),
+            None => {
+                let port = next_port(&document)?;
+                if document["ports"]
+                    .as_table()
+                    .is_none_or(|ports| !ports.contains_key(workload))
+                {
+                    document["ports"][workload] = toml_edit::table();
+                }
+                document["ports"][workload][role] = value(port);
+                (port, true)
+            }
+        };
+        if created || migrated {
+            if security == RegistrySecurity::LogicalWorkload {
+                validate_logical_assignments(&document)?;
+            }
+            write_atomic(&path, &document, security)?;
         }
-        document["ports"][workload][role] = value(port);
-        Ok((port, true))
-    })
+        Ok((port, created))
+    })();
+    unlock(lock, &path, result)
+}
+
+fn assigned_port(document: &DocumentMut, workload: &str, role: &str) -> Option<i64> {
+    document
+        .get("ports")
+        .and_then(|ports| ports.as_table())
+        .and_then(|ports| ports.get(workload))
+        .and_then(|roles| roles.as_table())
+        .and_then(|roles| roles.get(role))
+        .and_then(|port| port.as_integer())
 }
 
 fn prepare_path(path: &Path, security: RegistrySecurity) -> Result<PathBuf, String> {
@@ -532,18 +558,18 @@ fn open_lock(path: &Path, security: RegistrySecurity) -> Result<File, String> {
 }
 
 fn load(path: &Path, security: RegistrySecurity) -> Result<DocumentMut, String> {
-    load_with_policy(path, security, false)
+    load_with_policy(path, security, false).map(|(document, _)| document)
 }
 
 fn load_required(path: &Path, security: RegistrySecurity) -> Result<DocumentMut, String> {
-    load_with_policy(path, security, true)
+    load_with_policy(path, security, true).map(|(document, _)| document)
 }
 
 fn load_with_policy(
     path: &Path,
     security: RegistrySecurity,
     require_existing: bool,
-) -> Result<DocumentMut, String> {
+) -> Result<(DocumentMut, bool), String> {
     let mut document = match read_content(path, security)? {
         Some(content) => content
             .parse::<DocumentMut>()
@@ -561,7 +587,7 @@ fn load_with_policy(
             .expect("the empty registry document is valid TOML"),
     };
     if security == RegistrySecurity::DerivedState {
-        return Ok(document);
+        return Ok((document, false));
     }
     if security == RegistrySecurity::LogicalWorkload
         && document.get("ports").is_some()
@@ -570,11 +596,11 @@ fn load_with_policy(
         return Err("logical Workload registry [ports] value must be a table".to_string());
     }
     ensure_ports_table(&mut document);
-    migrate_legacy_assignments(&mut document);
+    let migrated = migrate_legacy_assignments(&mut document);
     if security == RegistrySecurity::LogicalWorkload {
         validate_logical_assignments(&document)?;
     }
-    Ok(document)
+    Ok((document, migrated))
 }
 
 fn read_content(path: &Path, security: RegistrySecurity) -> Result<Option<String>, String> {
@@ -717,7 +743,7 @@ fn ensure_ports_table(document: &mut DocumentMut) {
     }
 }
 
-fn migrate_legacy_assignments(document: &mut DocumentMut) {
+fn migrate_legacy_assignments(document: &mut DocumentMut) -> bool {
     let old_entries = document["ports"]
         .as_table()
         .map(|ports| {
@@ -727,10 +753,12 @@ fn migrate_legacy_assignments(document: &mut DocumentMut) {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let migrated = !old_entries.is_empty();
     for (workload, port) in old_entries {
         document["ports"][&workload] = toml_edit::table();
         document["ports"][&workload][DEFAULT_ROLE] = value(port);
     }
+    migrated
 }
 
 fn validate_logical_assignments(document: &DocumentMut) -> Result<(), String> {
