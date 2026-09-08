@@ -120,6 +120,83 @@ defmodule PhxPortHandoff.TransportTest do
     end
   end
 
+  for {name, options, timeout} <- [
+        {"configured", [handshake_timeout: 250], 250},
+        {"default", [], 5_000}
+      ] do
+    @tag :public_handshake_timeout
+    @tag timeout: 45_000
+    test "#{name} child handshake deadline preserves ordinary endpoint TLS", %{tls: tls} do
+      timeout = unquote(timeout)
+
+      https = [
+        ip: {127, 0, 0, 1},
+        port: 0,
+        thousand_island_options: [num_acceptors: 1, transport_options: tls]
+      ]
+
+      {child_options, path} = configure_endpoint(https)
+      start_supervised!({PhxPortHandoff, child_options ++ unquote(options)})
+
+      ordinary =
+        start_supervised!({Bandit, [plug: Endpoint, scheme: :https, startup_log: false] ++ https})
+
+      assert {:ok, {{127, 0, 0, 1}, port}} = ThousandIsland.listener_info(ordinary)
+      assert port in 1..65_535
+      assert Application.fetch_env!(:phx_port_handoff, Endpoint)[:https] == https
+
+      reference = make_ref()
+
+      :ok =
+        :telemetry.attach(
+          reference,
+          [:thousand_island, :connection, :stop],
+          &__MODULE__.report_connection_stop/4,
+          {self(), reference}
+        )
+
+      on_exit(fn -> :telemetry.detach(reference) end)
+
+      with_sender(path, fn sender, port ->
+        {:ok, client} =
+          :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, nodelay: true], 5_000)
+
+        try do
+          {:ok, {_, peer_port}} = :inet.sockname(client)
+          :ok = :gen_tcp.send(client, @truncated_client_hello)
+          assert finish_child(sender) == "ADOPTED\n"
+          assert {:error, :closed} = :gen_tcp.recv(client, 0, timeout + 1_000)
+
+          assert_receive {^reference, %{duration: duration},
+                          %{remote_port: ^peer_port, error: :timeout}},
+                         1_000
+
+          elapsed = System.convert_time_unit(duration, :native, :millisecond)
+          assert elapsed >= timeout
+          assert elapsed < timeout + 1_000
+        after
+          :gen_tcp.close(client)
+        end
+      end)
+
+      assert handoff_request(path, tls) =~ "200 OK"
+    end
+  end
+
+  @tag :public_handshake_timeout
+  test "configured child rejects invalid handshake deadlines before binding", %{tls: tls} do
+    {child_options, path} =
+      configure_endpoint(thousand_island_options: [transport_options: tls])
+
+    for invalid <- [:infinity, 0, -1, nil, 1.5, "250", true] do
+      assert {:error, reason} =
+               start_supervised({PhxPortHandoff, child_options ++ [handshake_timeout: invalid]})
+
+      assert inspect(reason) =~ inspect({:invalid_handshake_timeout, invalid})
+      refute File.exists?(path)
+    end
+  end
+
   @tag timeout: 30_000
   test "a stalled peer cannot hold an imported socket past the handshake deadline", %{tls: tls} do
     {listener, path, server} = start_handoff([handshake_timeout: 250] ++ tls)
@@ -147,6 +224,34 @@ defmodule PhxPortHandoff.TransportTest do
       Transport.close(listener)
       Task.shutdown(server)
     end
+  end
+
+  def report_connection_stop(_event, measurements, metadata, {pid, reference}) do
+    send(pid, {reference, measurements, metadata})
+  end
+
+  defp configure_endpoint(https) do
+    runtime = temporary_directory()
+    previous_runtime = System.get_env("PHX_PORT_RUNTIME_DIR")
+    previous_endpoint = Application.fetch_env(:phx_port_handoff, Endpoint)
+    System.put_env("PHX_PORT_RUNTIME_DIR", runtime)
+    Application.put_env(:phx_port_handoff, Endpoint, https: https)
+
+    on_exit(fn ->
+      if previous_runtime,
+        do: System.put_env("PHX_PORT_RUNTIME_DIR", previous_runtime),
+        else: System.delete_env("PHX_PORT_RUNTIME_DIR")
+
+      case previous_endpoint do
+        {:ok, options} -> Application.put_env(:phx_port_handoff, Endpoint, options)
+        :error -> Application.delete_env(:phx_port_handoff, Endpoint)
+      end
+    end)
+
+    identity = {:workload, "handshake-timeout-test"}
+
+    {[otp_app: :phx_port_handoff, endpoint: Endpoint, identity: identity],
+     PhxPortHandoff.endpoint_path(identity, "https")}
   end
 
   defp start_handoff(listen_options) do

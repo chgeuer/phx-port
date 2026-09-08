@@ -55,7 +55,10 @@ The child reads the endpoint's HTTPS options unchanged, derives the path or
 Workload identity, and returns `:ignore` when HTTPS is unset or explicitly
 `false`. Relative `:certfile` and `:keyfile` paths resolve against `:otp_app`.
 Handed-off connections must finish the TLS handshake within
-`:handshake_timeout` milliseconds (default `5_000`). The package
+`:handshake_timeout` milliseconds (default `5_000`). Set an override such as
+`handshake_timeout: 250` on the `PhxPortHandoff` child, never in the endpoint's
+`https:` options or shared transport options. It must be a positive integer;
+invalid values, including `:infinity`, fail listener startup. The package
 intentionally pins Rustler 0.36. Rustler 0.38 is unsupported.
 
 ## Manual fallback

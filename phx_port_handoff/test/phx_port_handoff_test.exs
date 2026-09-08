@@ -110,6 +110,37 @@ defmodule PhxPortHandoffTest do
              )
   end
 
+  test "Bandit helper keeps handoff deadlines separate from the shared TLS options" do
+    System.put_env("PHX_PORT_RUNTIME_DIR", Path.join(System.tmp_dir!(), "phxp-runtime"))
+    identity = {:workload, "child-options-test"}
+    path = PhxPortHandoff.endpoint_path(identity, "https")
+    transport_options = [:inet, alpn_preferred_protocols: ["h2"]]
+
+    https = [
+      port: 4043,
+      ip: {127, 0, 0, 1},
+      thousand_island_options: [read_timeout: 1_234, transport_options: transport_options]
+    ]
+
+    default = PhxPortHandoff.bandit_child_spec(__MODULE__.Endpoint, identity, "https", https)
+
+    configured =
+      PhxPortHandoff.bandit_child_spec(__MODULE__.Endpoint, identity, "https", https,
+        handshake_timeout: 250
+      )
+
+    for {spec, timeout_options} <- [{default, []}, {configured, [handshake_timeout: 250]}] do
+      assert %{start: {Bandit, :start_link, [options]}} = spec
+      refute Keyword.has_key?(options, :handshake_timeout)
+      assert options[:thousand_island_options][:transport_module] == PhxPortHandoff.Transport
+      assert options[:thousand_island_options][:read_timeout] == 1_234
+
+      assert options[:thousand_island_options][:transport_options] ==
+               [handoff_path: path, derived_handoff_path: false] ++
+                 timeout_options ++ transport_options
+    end
+  end
+
   test "native broker creates a private endpoint" do
     path = endpoint_path()
 

@@ -476,6 +476,12 @@ Declaration. The helper preserves the endpoint's existing nested Thousand
 Island TLS options and installs the handoff transport. It does not accept
 certificate paths separately.
 
+The optional fifth argument accepts `handshake_timeout: milliseconds` for the
+handoff transport only. The configured `PhxPortHandoff` child exposes the same
+option directly. Keep it out of the endpoint's shared HTTPS/TLS options so
+the ordinary listener remains valid; omission retains the 5,000 ms default,
+and invalid or infinite values fail handoff listener startup.
+
 For SNI-only configurations, the transport calls the configured `sni_fun` with
 the informational requested hostname to seed the base `certs_keys` required by
 OTP before handshake. The callback remains installed and selects the

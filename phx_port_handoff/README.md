@@ -57,8 +57,24 @@ explicitly `false`.
 A handed-off connection must complete its TLS handshake within
 `:handshake_timeout` milliseconds, which defaults to `5_000`. A peer that
 stalls mid-handshake is disconnected and its descriptor closed rather than
-holding an accepted slot. Set it in the endpoint's `https:` options to
-override; `:infinity` and non-positive values are rejected at listen time.
+holding an accepted slot. Override it on the handoff child only:
+
+```elixir
+{PhxPortHandoff,
+ otp_app: :my_app,
+ endpoint: MyAppWeb.Endpoint,
+ role: "https",
+ handshake_timeout: 250}
+```
+
+The value must be a positive integer; `:infinity`, zero, negative, and
+non-integer values fail listener startup. Do not put this key in the
+endpoint's `https:` options or its shared `thousand_island_options:
+[transport_options: ...]`: Bandit rejects it at the top level, and the
+ordinary OTP SSL listener does not accept it as a TLS option. The helper
+forwards it exclusively to `PhxPortHandoff.Transport`, which removes it
+before the TLS handshake. Direct callers of `bandit_child_spec/4` can pass
+`handshake_timeout: 250` as an optional fifth argument instead.
 
 The ordinary endpoint still listens on its assigned phx-port HTTPS port for
 certificate verification, health checks, and direct access. The additional

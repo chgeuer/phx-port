@@ -19,6 +19,10 @@ defmodule PhxPortHandoff do
 
   The child is ignored when the endpoint has no HTTPS configuration, allowing
   the same supervision tree to run in environments where HTTPS is disabled.
+
+  Set `:handshake_timeout` on this child, not in the endpoint's HTTPS options,
+  to override the handoff-only TLS handshake deadline. It defaults to 5,000
+  milliseconds and must be a positive integer; invalid values fail startup.
   """
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(options) do
@@ -47,7 +51,13 @@ defmodule PhxPortHandoff do
         identity = Keyword.get_lazy(options, :identity, &handoff_identity/0)
 
         %{start: {module, function, arguments}} =
-          bandit_child_spec(endpoint, identity, role, Keyword.put_new(https, :otp_app, otp_app))
+          bandit_child_spec(
+            endpoint,
+            identity,
+            role,
+            Keyword.put_new(https, :otp_app, otp_app),
+            options
+          )
 
         apply(module, function, arguments)
     end
@@ -69,12 +79,24 @@ defmodule PhxPortHandoff do
     end
   end
 
+  @doc """
+  Returns a handoff-only Bandit child using the endpoint's HTTPS options.
+
+  The optional fifth argument accepts `:handshake_timeout` with the same
+  finite, positive millisecond bound as `child_spec/1`. This handoff-only
+  option is kept separate from the shared endpoint TLS configuration.
+  """
   @spec bandit_child_spec(module(), endpoint_identity(), String.t(), keyword()) ::
           Supervisor.child_spec()
-  def bandit_child_spec(plug, identity, role, tls_options) do
+  @spec bandit_child_spec(module(), endpoint_identity(), String.t(), keyword(), keyword()) ::
+          Supervisor.child_spec()
+  def bandit_child_spec(plug, identity, role, tls_options, handoff_options \\ []) do
     {handoff_path, validate_runtime_root?} = derived_endpoint(identity, role)
     thousand_island_options = Keyword.get(tls_options, :thousand_island_options, [])
-    transport_options = Keyword.get(thousand_island_options, :transport_options, [])
+
+    transport_options =
+      Keyword.take(handoff_options, [:handshake_timeout]) ++
+        Keyword.get(thousand_island_options, :transport_options, [])
 
     thousand_island_options =
       thousand_island_options
