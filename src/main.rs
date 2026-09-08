@@ -111,7 +111,10 @@ fn home_dir() -> PathBuf {
 }
 
 pub(crate) fn config_path() -> PathBuf {
-    if let Ok(custom) = env::var("PHX_PORT_CONFIG") {
+    if let Some(custom) = env::var_os("PHX_PORT_CONFIG") {
+        if custom.is_empty() {
+            return exit_registry_error("PHX_PORT_CONFIG must not be empty".to_string());
+        }
         return PathBuf::from(custom);
     }
     home_dir().join(".config").join("phx-ports.toml")

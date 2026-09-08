@@ -75,6 +75,10 @@ export PHX_PORT_CONFIG="$HOME/.phx-ports.toml"       # Linux/macOS alternative
 export PHX_PORT_CONFIG="C:\Users\me\.phx-ports.toml"  # Windows
 ```
 
+An unset override retains the default per-user registry for allocation; an
+empty override is an error. Filesystem paths preserve their operating-system
+encoding, including non-UTF-8 Unix paths.
+
 Production workload automation can replace the current-directory key with an
 explicit logical Workload ID:
 

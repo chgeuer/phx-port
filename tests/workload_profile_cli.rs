@@ -379,6 +379,120 @@ fn output_port(output: &std::process::Output) -> u16 {
         .unwrap()
 }
 
+fn assert_config_override_allocation(relative_registry: &Path) {
+    let directory = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let registry = directory.path().join(relative_registry);
+    let fallback = home.path().join(".config/phx-ports.toml");
+    let output = allocation_command(
+        directory.path(),
+        &registry,
+        Some("ignored-environment-id"),
+        &["--workload-id", "config-path-web", "https"],
+    )
+    .env("HOME", home.path())
+    .env("USERPROFILE", home.path())
+    .output()
+    .unwrap();
+    let port = output_port(&output);
+    assert!(
+        registry.is_file(),
+        "explicit Port Registry missing: {registry:?}; HOME fallback created: {}",
+        fallback.exists()
+    );
+    assert!(
+        !fallback.exists(),
+        "explicit override created a HOME registry"
+    );
+    let document = fs::read_to_string(&registry)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(document["ports"].as_table().unwrap().len(), 1);
+    assert_eq!(
+        document["ports"]["config-path-web"]["https"].as_integer(),
+        Some(i64::from(port))
+    );
+
+    let repeated = allocation_command(
+        directory.path(),
+        &registry,
+        Some("config-path-web"),
+        &["https"],
+    )
+    .env("HOME", home.path())
+    .env("USERPROFILE", home.path())
+    .output()
+    .unwrap();
+    assert_eq!(output_port(&repeated), port);
+    assert!(!fallback.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn config_override_preserves_non_utf8_paths() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    for registry in [
+        Path::new(OsStr::from_bytes(b"registry-\xff")).join("ports.toml"),
+        Path::new("registry").join(OsStr::from_bytes(b"ports-\xff.toml")),
+    ] {
+        assert_config_override_allocation(&registry);
+    }
+}
+
+#[test]
+fn config_override_preserves_unicode_paths() {
+    assert_config_override_allocation(Path::new("registry-\u{e9}/ports-\u{e9}.toml"));
+}
+
+#[test]
+fn config_override_absent_uses_home_registry() {
+    let directory = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let registry = home.path().join(".config/phx-ports.toml");
+    let output = allocation_command(directory.path(), &registry, None, &[])
+        .env_remove("PHX_PORT_CONFIG")
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .output()
+        .unwrap();
+    let port = output_port(&output);
+    let document = fs::read_to_string(registry)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(document["ports"].as_table().unwrap().len(), 1);
+    assert_eq!(
+        document["ports"][directory.path().to_str().unwrap()]["main"].as_integer(),
+        Some(i64::from(port))
+    );
+    assert!(directory.path().read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn config_override_empty_is_rejected_without_writing() {
+    for workload_id in [None, Some("config-path-web")] {
+        let directory = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let output = allocation_command(directory.path(), Path::new(""), workload_id, &[])
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("PHX_PORT_CONFIG must not be empty"),
+            "unexpected empty override error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(directory.path().read_dir().unwrap().next().is_none());
+        assert!(home.path().read_dir().unwrap().next().is_none());
+    }
+}
+
 fn assert_existing_lookup_preserves_registry(workload_id: Option<&str>) {
     use std::time::{Duration, SystemTime};
 
