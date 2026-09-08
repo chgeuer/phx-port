@@ -73,6 +73,14 @@ cargo test \
 just test-frameworks
 ```
 
+For ingress capacity CLI checks, run `cargo test --locked --test
+ingress_limits_cli`. These fixtures always select the development Hosting
+Profile with a fresh home directory, clearing inherited `PHX_PORT_CONFIG`,
+`PHX_PORT_INGRESS_CONFIG`, `PHX_PORT_RUNTIME_DIR`, `PHX_PORT_WORKLOAD_ID`, and
+`XDG_RUNTIME_DIR`. The isolation regression supplies disposable caller paths
+to a child test process and exercises the CLI and daemon constructors without
+changing the parent process's environment.
+
 Platform and service-manager tests marked `ignored` require their documented
 host privileges. The adversarial harness is described separately in
 [the harness guide](../adversarial-public-ingress-harness.md). Do not treat its

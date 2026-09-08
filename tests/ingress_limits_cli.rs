@@ -1,8 +1,23 @@
+use std::path::Path;
 use std::process::Command;
+
+fn development_command(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_phx-port"));
+    command
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env_remove("PHX_PORT_CONFIG")
+        .env_remove("PHX_PORT_INGRESS_CONFIG")
+        .env_remove("PHX_PORT_RUNTIME_DIR")
+        .env_remove("PHX_PORT_WORKLOAD_ID")
+        .env_remove("XDG_RUNTIME_DIR");
+    command
+}
 
 #[test]
 fn invalid_capacity_is_rejected_before_listener_binding() {
-    let output = Command::new(env!("CARGO_BIN_EXE_phx-port"))
+    let home = tempfile::tempdir().unwrap();
+    let output = development_command(home.path())
         .args([
             "daemon",
             "--active-connections",
@@ -25,12 +40,51 @@ fn invalid_capacity_is_rejected_before_listener_binding() {
     );
 }
 
+#[test]
+fn development_fixtures_ignore_inherited_profile_and_runtime() {
+    let home = tempfile::tempdir().unwrap();
+    let tests = [
+        "invalid_capacity_is_rejected_before_listener_binding",
+        #[cfg(unix)]
+        "unix::daemon_constructors_use_isolated_development_environment",
+    ];
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "--test-threads=1", "--color=never"])
+        .args(tests)
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("PHX_PORT_CONFIG", home.path().join("ports.toml"))
+        .env("PHX_PORT_INGRESS_CONFIG", home.path().join("ingress.toml"))
+        .env("PHX_PORT_RUNTIME_DIR", home.path().join("runtime"))
+        .env("XDG_RUNTIME_DIR", home.path().join("xdg-runtime"))
+        .env("PHX_PORT_WORKLOAD_ID", "caller-workload")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "fixtures inherited the caller's environment:\n{stdout}\n{stderr}"
+    );
+    for test in tests {
+        assert!(
+            stdout.contains(&format!("test {test} ... ok")),
+            "fixture did not run successfully: {test}\n{stdout}"
+        );
+    }
+    assert!(
+        std::fs::read_dir(home.path()).unwrap().next().is_none(),
+        "fixtures wrote to the caller's paths"
+    );
+}
+
 #[cfg(unix)]
 mod unix {
+    use super::development_command;
     use std::io::{ErrorKind, Read, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
     use std::os::unix::net::UnixStream;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::{TempDir, tempdir_in};
@@ -63,7 +117,7 @@ mod unix {
             pre_routing_connections: usize,
         ) -> Self {
             let home = tempdir().unwrap();
-            let child = Command::new(env!("CARGO_BIN_EXE_phx-port"))
+            let child = development_command(home.path())
                 .args([
                     "daemon".to_string(),
                     "--listen".to_string(),
@@ -81,9 +135,6 @@ mod unix {
                     "--task-budget".to_string(),
                     "128".to_string(),
                 ])
-                .env("HOME", home.path())
-                .env_remove("PHX_PORT_CONFIG")
-                .env_remove("XDG_RUNTIME_DIR")
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -99,7 +150,7 @@ mod unix {
         #[cfg(target_os = "linux")]
         fn start_for_idle_scale(address: SocketAddr, connections: usize) -> Self {
             let home = tempdir().unwrap();
-            let child = Command::new(env!("CARGO_BIN_EXE_phx-port"))
+            let child = development_command(home.path())
                 .args([
                     "daemon".to_string(),
                     "--listen".to_string(),
@@ -127,9 +178,6 @@ mod unix {
                     "--task-budget".to_string(),
                     "128".to_string(),
                 ])
-                .env("HOME", home.path())
-                .env_remove("PHX_PORT_CONFIG")
-                .env_remove("XDG_RUNTIME_DIR")
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -256,6 +304,13 @@ mod unix {
             "idle ClientHello regression requires {required} file descriptors, hard limit is {hard}"
         );
         setrlimit(Resource::RLIMIT_NOFILE, required, hard).unwrap();
+    }
+
+    #[test]
+    fn daemon_constructors_use_isolated_development_environment() {
+        Daemon::start(reserve_address()).stop_and_stderr();
+        #[cfg(target_os = "linux")]
+        Daemon::start_for_idle_scale(reserve_address(), 1).stop_and_stderr();
     }
 
     #[test]
