@@ -909,9 +909,11 @@ protocols, and certificate hostname removal.
   probe verifies that complete server flight, sends an empty client
   certificate, and returns without waiting for the server's verdict. The route
   therefore activates on a genuine server proof. That is not mutual
-  authentication: the Workload rejects the anonymous probe connection with
-  `certificate_required` immediately afterwards, once per activation and once
-  per 30-second TLS revalidation. Over TLS 1.2 the same probe fails, because
+  authentication: the Workload rejects the anonymous probe connection, with
+  `certificate_required` in the measured OTP 29 case. Route activation and the
+  30-second TLS revalidation each open one such probe connection, so a
+  rejection is expected at that cadence whatever alert a given server sends.
+  Over TLS 1.2 the same probe fails, because
   the Workload's `handshake_failure` arrives before the client handshake
   completes, so no certificate proof is produced, no route activates, and
   preflight fails its route-certificate check. This concerns the probe

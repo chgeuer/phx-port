@@ -125,7 +125,7 @@ implementation are unqualified here.
 | Probe TLS version | Route certificates | Verified Route | Workload-side handshake |
 |---|---|---|---|
 | TLS 1.2 | `FAIL` (`TLS validation failed`, alert 40) | never activates | rejected, `handshake_failure` |
-| TLS 1.3 | `PASS` | activates normally | rejected, `certificate_required` |
+| TLS 1.3 | `PASS` | activates on the verified server flight | rejected, `certificate_required` |
 
 Over TLS 1.3 the server's `CertificateRequest` arrives in the same flight as
 its `Certificate`, `CertificateVerify`, and `Finished`. The probe verifies
@@ -149,9 +149,11 @@ own TLS session, version, and client authentication directly with the
 Workload. Nothing here requires client traffic to use the probe's TLS version.
 
 An activated TLS 1.3 mandatory-client-auth route is TCP-liveness checked each
-reconciliation pass and fully re-probed every 30 seconds, so expect one
-rejected `certificate_required` handshake per revalidation in Workload logs.
-That is normal ingress verification, not an attack.
+reconciliation pass and fully re-probed every 30 seconds. Route activation and
+each revalidation open one anonymous probe connection that the Workload
+rejects, so expect one rejected handshake at that cadence in Workload logs
+(`certificate_required` in the measured OTP 29 case). That is normal ingress
+verification, not an attack.
 
 The Linux CLI fixture records the matrix against a real OTP `:ssl` listener
 with `verify: :verify_peer` and `fail_if_no_peer_cert: true`. That is the
