@@ -112,6 +112,68 @@ This supports retaining the existing runtime behavior: the accepted bounded
 checks complete, and no required whole-command latency contract was violated.
 It is not data-plane load qualification, canary evidence, or Darwin evidence.
 
+### Mandatory client authentication
+
+A Workload may demand a client certificate. `phx-port` holds no Workload
+private key, so its probe never offers a client identity, and the route
+certificate check records the outcome the TLS version dictates.
+
+| Workload TLS version | Route certificates | Verified Route | Workload-side handshake |
+|---|---|---|---|
+| TLS 1.2 | `FAIL` (`TLS validation failed`, alert 40) | never activates | rejected, `handshake_failure` |
+| TLS 1.3 | `PASS` | activates normally | rejected, `certificate_required` |
+
+TLS 1.3 sends the server certificate and its signature before the client
+certificate, so the probe completes a chain- and exact-hostname-verified
+handshake and holds a complete proof; the Workload then aborts that probe
+connection. TLS 1.2 interleaves client authentication into the same
+handshake, so the Workload aborts before the probe can inspect anything.
+The TLS 1.2 outcome is fail-closed and correct: an unverified backend never
+becomes a Verified Route. Do not "fix" it by relaxing verification or by
+moving a Workload private key into ingress.
+
+An activated TLS 1.3 mandatory-client-auth route is TCP-liveness checked each
+reconciliation pass and fully re-probed every 30 seconds, so expect one
+rejected `certificate_required` handshake per revalidation in Workload logs.
+That is normal ingress verification, not an attack.
+
+The Linux CLI fixture records the matrix against a real OTP `:ssl` listener
+with `verify: :verify_peer` and `fail_if_no_peer_cert: true`, the same
+transport options Bandit and Cowboy pass through for a Phoenix endpoint:
+
+```bash
+timeout --kill-after=10s 600s \
+  cargo test --locked --test preflight_cli \
+    preflight_route_certificates_across_mandatory_client_auth_tls_versions \
+    -- --exact --ignored --nocapture
+```
+
+It generates its own fixture CA, leaf, and key in a fresh private temporary
+directory, keeps chain and exact-hostname verification enabled against that
+CA through `SSL_CERT_FILE`, and runs 20 real `proxy preflight` invocations per
+TLS version. It asserts that every probe reached the Workload, that the
+Workload never accepted a handshake, and that each version's ingress verdict
+and Workload alert are unanimous across the 20 attempts. The fixture is
+ignored by default because it needs an Elixir/OTP toolchain on `PATH`; it
+fails loudly rather than skipping when one is absent. Its Workload child is
+killed and reaped on drop.
+
+Executed ING-Q1 characterization on 2026-09-08 used Linux 7.1.9-arch1-2
+x86_64, rustc 1.95.0-nightly (`f134bbc78`), the locked debug build, Elixir
+1.20.4 on OTP 29, and `native-tls` dynamically linked against the system
+`libssl.so.3`/`libcrypto.so.3` (the host's `openssl version` reports OpenSSL
+3.6.3), from unchanged production source at
+`f4f70e243a6dbf216da01f3d13e4219b1e4cd64f`. Five consecutive fixture runs
+agreed: TLS 1.2 verified 0/20 with only
+`result=rejected alert=handshake_failure`, and TLS 1.3 verified 20/20 with
+only `result=rejected alert=certificate_required`. A separate out-of-band run
+of the real `daemon`, using the same committed Workload fixture script with
+separately generated fixture credentials, confirmed the runtime path: TLS 1.3
+logged `event=route result=activated`, and TLS 1.2 logged no activation at
+all. That daemon run is corroboration, not a committed regression. This is a
+Linux/OpenSSL characterization; the Darwin Security.framework backend was not
+measured and remains unqualified.
+
 ## Inputs
 
 Run as the same dedicated service identity and with the same environment and
@@ -343,7 +405,7 @@ worker demand.
 | Listener acquisition | For direct mode, find the exact owner of the address/port. For activation, verify descriptor names, count, TCP/listening state, address family, and configured address. |
 | System trust roots | Repair the platform CA installation and service sandbox access to it. Do not disable hostname or certificate verification. |
 | Registrations | Start the declared Workload with the shared `PHX_PORT_CONFIG`, exact `PHX_PORT_WORKLOAD_ID`, and declared role. Do not edit derived routes as authority. |
-| Route certificates | Connect only to the reported loopback port and inspect the Workload-owned chain, SAN, validity window, and SNI selection. Do not move private keys into ingress. |
+| Route certificates | Connect only to the reported loopback port and inspect the Workload-owned chain, SAN, validity window, and SNI selection. Do not move private keys into ingress. A Workload that demands a client certificate fails this check on TLS 1.2 and passes on TLS 1.3; see "Mandatory client authentication". |
 
 After all checks pass, remove any staging service override, start the real
 daemon, and require both commands to succeed before exposing traffic:

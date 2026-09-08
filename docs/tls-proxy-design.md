@@ -899,9 +899,17 @@ protocols, and certificate hostname removal.
 - Encrypted ClientHello can hide the inner hostname. Unless a usable outer name
   maps to a route, such connections cannot be dynamically routed by this
   design.
-- A backend requiring mutual TLS may prevent generic discovery if the probe
-  cannot complete enough of the handshake to verify the server. Such workloads
-  may require a future explicit hostname announcement mechanism.
+- A backend requiring a client certificate is verifiable only over TLS 1.3.
+  The probe holds no Workload private key and never offers a client identity.
+  Under TLS 1.3 the backend proves its own certificate before it demands the
+  client's, so the probe completes a fully verified handshake and the route
+  activates; the backend then aborts that probe connection with
+  `certificate_required`, once per activation and once per 30-second TLS
+  revalidation. Under TLS 1.2 the backend aborts with `handshake_failure`
+  before the probe can inspect the certificate, so the route never activates
+  and preflight fails its route-certificate check. Such TLS 1.2 workloads
+  may require a future explicit hostname announcement mechanism. The public
+  hosting preflight runbook records the measured matrix.
 - The first request for a non-default hostname waits for discovery and may time
   out under a large or unhealthy workload set.
 - A valid wildcard certificate can prove authority for a requested matching

@@ -10,9 +10,11 @@ use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, PKCS_RSA_SHA256,
 };
+#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 #[cfg(target_os = "linux")]
 use std::net::TcpStream;
 use std::net::{SocketAddr, TcpListener};
@@ -22,6 +24,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::Child;
 use std::process::{Command, Output, Stdio};
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
@@ -184,6 +188,128 @@ impl Drop for TlsBackend {
         self.shutdown.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             worker.join().unwrap();
+        }
+    }
+}
+
+/// A workload that demands a client certificate, run out of process on OTP's
+/// `:ssl` so the matrix observes a real handshake rather than a Rust stand-in.
+#[cfg(target_os = "linux")]
+struct MandatoryClientAuthWorkload {
+    port: u16,
+    child: Child,
+    transcript: Arc<Mutex<Vec<String>>>,
+    reader: Option<thread::JoinHandle<()>>,
+    _materials: TempDir,
+}
+
+#[cfg(target_os = "linux")]
+impl MandatoryClientAuthWorkload {
+    fn start(certificate: &TestCertificate, version: &str) -> Self {
+        let materials = tempdir().unwrap();
+        let certfile = materials.path().join("workload-chain.pem");
+        fs::write(&certfile, &certificate.chain_pem).unwrap();
+        let keyfile = materials.path().join("workload-key.pem");
+        fs::write(&keyfile, TEST_RSA_PRIVATE_KEY).unwrap();
+        fs::set_permissions(&keyfile, fs::Permissions::from_mode(0o600)).unwrap();
+        let cacertfile = materials.path().join("workload-root.pem");
+        fs::write(&cacertfile, &certificate.root_pem).unwrap();
+
+        let mut child = Command::new("elixir")
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/mandatory_client_auth_workload.exs"),
+            )
+            .arg(&certfile)
+            .arg(&keyfile)
+            .arg(&cacertfile)
+            .arg(version)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("the mandatory-client-auth matrix needs an Elixir/OTP toolchain on PATH");
+
+        let stdout = child.stdout.take().unwrap();
+        let transcript = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&transcript);
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) => collected.lock().unwrap().push(line),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut workload = Self {
+            port: 0,
+            child,
+            transcript,
+            reader: Some(reader),
+            _materials: materials,
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let port = loop {
+            if let Some(port) = workload
+                .lines()
+                .iter()
+                .find_map(|line| line.strip_prefix("LISTENING "))
+                .and_then(|port| port.parse::<u16>().ok())
+            {
+                break port;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the mandatory-client-auth workload never reported a listening port: {:?}",
+                workload.lines()
+            );
+            thread::sleep(Duration::from_millis(50));
+        };
+        workload.port = port;
+        workload
+    }
+
+    fn lines(&self) -> Vec<String> {
+        self.transcript.lock().unwrap().clone()
+    }
+
+    fn toolchain(&self) -> String {
+        self.lines()
+            .into_iter()
+            .find(|line| line.starts_with("OTP "))
+            .unwrap_or_else(|| "OTP unknown".to_string())
+    }
+
+    /// Server-side handshake results, once the workload has reported all of
+    /// them or the external deadline expires.
+    fn handshake_results(&self, expected: usize) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let results = self
+                .lines()
+                .into_iter()
+                .filter_map(|line| {
+                    line.strip_prefix("HANDSHAKE ")
+                        .and_then(|line| line.split_once(' '))
+                        .map(|(_index, result)| result.to_string())
+                })
+                .collect::<Vec<_>>();
+            if results.len() >= expected || Instant::now() >= deadline {
+                return results;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MandatoryClientAuthWorkload {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
         }
     }
 }
@@ -808,4 +934,114 @@ fn preflight_never_auto_detects_production() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!root.path().join(".config").exists());
+}
+
+#[cfg(target_os = "linux")]
+const MANDATORY_CLIENT_AUTH_ATTEMPTS: usize = 20;
+
+/// ING-Q1: characterize whether a workload that demands a client certificate
+/// can produce the completed certificate proof a Verified Route requires.
+///
+/// `phx-port` never holds a workload private key, so its probe offers no client
+/// identity. Preflight and runtime route activation share one probe, so this
+/// matrix drives the shipped `proxy preflight` gate and records both the
+/// ingress verdict and the workload's own handshake result per TLS version.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an Elixir/OTP toolchain to run a mandatory-client-auth workload"]
+fn preflight_route_certificates_across_mandatory_client_auth_tls_versions() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let mut matrix = Vec::new();
+
+    for version in ["tlsv1.2", "tlsv1.3"] {
+        let certificate = TestCertificate::for_hostname(HOSTNAME);
+        let workload = MandatoryClientAuthWorkload::start(&certificate, version);
+        let host = HostFixture::new(Some(workload.port), Some(&certificate.root_pem));
+
+        let mut verified = 0usize;
+        let mut ingress_details = BTreeSet::new();
+        for _ in 0..MANDATORY_CLIENT_AUTH_ATTEMPTS {
+            let output = host.command(&["--task-budget", "128"]);
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            if stdout.contains("PASS route certificates") {
+                assert!(
+                    output.status.success(),
+                    "a verified route must leave preflight passing:\n{stdout}"
+                );
+                verified += 1;
+            } else {
+                ingress_details.insert(
+                    stdout
+                        .lines()
+                        .find(|line| line.contains("route certificates"))
+                        .unwrap_or("route certificates check missing")
+                        .trim()
+                        .to_string(),
+                );
+            }
+        }
+
+        let results = workload.handshake_results(MANDATORY_CLIENT_AUTH_ATTEMPTS);
+        matrix.push((
+            version,
+            workload.toolchain(),
+            verified,
+            ingress_details,
+            results.iter().cloned().collect::<BTreeSet<_>>(),
+            results.len(),
+        ));
+    }
+
+    for (version, toolchain, verified, ingress_details, workload_results, attempts) in &matrix {
+        println!(
+            "ING-Q1 {version}: {toolchain} verified={verified}/{MANDATORY_CLIENT_AUTH_ATTEMPTS} \
+             workload_handshakes={attempts} workload_results={workload_results:?} \
+             ingress={ingress_details:?}"
+        );
+    }
+
+    for (version, _, _, _, workload_results, attempts) in &matrix {
+        assert_eq!(
+            *attempts, MANDATORY_CLIENT_AUTH_ATTEMPTS,
+            "{version}: every probe must reach the workload"
+        );
+        assert!(
+            !workload_results.contains("result=accepted"),
+            "{version}: the ingress must never present a client identity, got {workload_results:?}"
+        );
+    }
+
+    let (_, _, tls12_verified, tls12_details, tls12_results, _) = &matrix[0];
+    assert_eq!(
+        *tls12_verified, 0,
+        "TLS 1.2 mandatory client authentication must fail closed, not activate a route"
+    );
+    assert!(
+        tls12_details
+            .iter()
+            .all(|detail| detail.starts_with("FAIL route certificates")),
+        "TLS 1.2 must report a required-route certificate failure, got {tls12_details:?}"
+    );
+    assert!(
+        tls12_details
+            .iter()
+            .all(|detail| detail.contains("TLS validation failed")),
+        "TLS 1.2 must attribute the failure to the handshake, got {tls12_details:?}"
+    );
+    assert_eq!(
+        tls12_results.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec!["result=rejected alert=handshake_failure"],
+        "TLS 1.2 must reject the anonymous client during the handshake"
+    );
+
+    let (_, _, tls13_verified, tls13_details, tls13_results, _) = &matrix[1];
+    assert_eq!(
+        *tls13_verified, MANDATORY_CLIENT_AUTH_ATTEMPTS,
+        "TLS 1.3 must deterministically verify the workload certificate, saw {tls13_details:?}"
+    );
+    assert_eq!(
+        tls13_results.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec!["result=rejected alert=certificate_required"],
+        "TLS 1.3 must reject the anonymous client only after proving the server certificate"
+    );
 }
