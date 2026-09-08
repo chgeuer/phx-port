@@ -134,3 +134,25 @@ descriptors across restarts.
   NIF returns `{:error, :eagain}` immediately when no connection is pending
   and the retry delay is taken on an ordinary scheduler, so idle acceptors do
   not occupy a dirty-I/O scheduler and starve unrelated file or port work.
+
+## Transport regression tests
+
+On Linux, run the transport tests with an external OS-process watchdog:
+
+```bash
+cd phx_port_handoff
+timeout --kill-after=10s 180s mix test test/phx_port_handoff_transport_test.exs
+```
+
+These tests require Python 3 (standard library only) in addition to the package
+toolchain. Both the stalled-peer and complete-TLS scenarios use an external
+Python PHXP sender, assert its reported OS PID against the spawned process,
+and require an `ADOPTED` reply and successful process exit. The complete-TLS
+client also reports readiness and must exit successfully. Fixture callbacks
+reap unfinished child processes on failure; the sender has its own 15-second
+OS alarm. Listeners use ephemeral loopback ports and generated test certificates.
+
+An ExUnit timeout alone cannot stop a frozen VM. Do not move the PHXP sender
+back into the receiving BEAM: its socket operations can change the shared
+`O_NONBLOCK` flag after descriptor import. Moving only the TCP/TLS client does
+not remove that topology. The stalled TCP peer intentionally remains in-VM.

@@ -13,63 +13,6 @@ defmodule PhxPortHandoff.TransportTest do
     def call(conn, _options), do: Plug.Conn.send_resp(conn, 200, "handoff")
   end
 
-  # Minimal PHXP ingress: binds a throwaway TCP listener, accepts one
-  # connection, and hands its descriptor to a local PHXP endpoint.
-  defmodule Sender do
-    def listen do
-      {:ok, listener} = :socket.open(:inet, :stream, :tcp)
-      :ok = :socket.bind(listener, %{family: :inet, addr: {127, 0, 0, 1}, port: 0})
-      :ok = :socket.listen(listener)
-      {:ok, %{port: port}} = :socket.sockname(listener)
-      {listener, port}
-    end
-
-    def hand_off(listener, path) do
-      {:ok, accepted} = :socket.accept(listener, 10_000)
-
-      try do
-        transfer(accepted, path)
-      after
-        :socket.close(accepted)
-      end
-    end
-
-    defp transfer(accepted, path) do
-      {:ok, fd} = :socket.getopt(accepted, :otp, :fd)
-      type = if :os.type() == {:unix, :linux}, do: :seqpacket, else: :stream
-      {:ok, control} = :socket.open(:local, type, :default)
-
-      try do
-        :ok = :socket.connect(control, %{family: :local, path: path}, 2_000)
-        :ok = :socket.send(control, frame(1), 2_000)
-        {:ok, ready} = :socket.recv(control, 40, 2_000)
-        true = ready == frame(2)
-        id = <<System.unique_integer([:positive])::128>>
-
-        :ok =
-          :socket.sendmsg(
-            control,
-            %{
-              iov: [frame(3, id, "localhost")],
-              ctrl: [%{level: :socket, type: :rights, data: <<fd::native-signed-32>>}]
-            },
-            2_000
-          )
-
-        {:ok, adopted} = :socket.recv(control, 40, 2_000)
-        true = adopted == frame(4, id)
-        :ok
-      after
-        :socket.close(control)
-      end
-    end
-
-    defp frame(type, id \\ <<0::128>>, sni \\ "") do
-      <<"PHXP", 1, type, 0::16, id::binary-size(16), 0::32, 0::64, byte_size(sni)::16, 0::16,
-        sni::binary>>
-    end
-  end
-
   setup_all do
     tls =
       :public_key.pkix_test_data(%{
@@ -78,6 +21,40 @@ defmodule PhxPortHandoff.TransportTest do
       })
 
     %{tls: tls}
+  end
+
+  @tag :sender_topology
+  test "the receiving VM does not run the PHXP descriptor sender" do
+    {_source, in_vm_sends} =
+      __ENV__.file
+      |> File.read!()
+      |> Code.string_to_quoted!()
+      |> Macro.prewalk([], fn
+        {{:., _, [:socket, :sendmsg]}, metadata, _} = node, calls ->
+          {node, [Keyword.fetch!(metadata, :line) | calls]}
+
+        node, calls ->
+          {node, calls}
+      end)
+
+    assert in_vm_sends == [],
+           "PHXP sendmsg must run outside the receiving VM; in-VM calls at #{inspect(in_vm_sends, charlists: :as_lists)}"
+  end
+
+  @tag :sender_topology
+  test "a failed fixture callback terminates and reaps its external sender" do
+    reference = make_ref()
+    path = Path.join(temporary_directory(), "unused.sock")
+
+    assert_raise RuntimeError, "fixture callback failed", fn ->
+      with_sender(path, fn sender, _port ->
+        send(self(), {reference, sender})
+        raise "fixture callback failed"
+      end)
+    end
+
+    assert_receive {^reference, sender}
+    assert Port.info(sender) == nil
   end
 
   @tag timeout: 45_000
@@ -145,23 +122,29 @@ defmodule PhxPortHandoff.TransportTest do
 
   @tag timeout: 30_000
   test "a stalled peer cannot hold an imported socket past the handshake deadline", %{tls: tls} do
-    {listener, port, sender, server} = start_handoff([handshake_timeout: 250] ++ tls)
-
-    {:ok, client} =
-      :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, nodelay: true], 5_000)
+    {listener, path, server} = start_handoff([handshake_timeout: 250] ++ tls)
 
     try do
-      :ok = :gen_tcp.send(client, @truncated_client_hello)
+      with_sender(path, fn sender, port ->
+        {:ok, client} =
+          :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, nodelay: true], 5_000)
 
-      assert {:ok, outcome} = Task.yield(server, 20_000)
-      assert outcome.accepted_timeout == 250
-      assert outcome.result == {:error, :timeout}
-      assert outcome.elapsed < 5_000
-      assert outcome.closed?
+        try do
+          :ok = :gen_tcp.send(client, @truncated_client_hello)
+          assert finish_child(sender) == "ADOPTED\n"
+
+          assert {:ok, outcome} = Task.yield(server, 20_000)
+          assert outcome.accepted_timeout == 250
+          assert outcome.result == {:error, :timeout}
+          assert outcome.elapsed < 5_000
+          assert outcome.closed?
+          assert {:error, :closed} = :gen_tcp.recv(client, 0, 5_000)
+        after
+          :gen_tcp.close(client)
+        end
+      end)
     after
-      :gen_tcp.close(client)
       Transport.close(listener)
-      Task.shutdown(sender)
       Task.shutdown(server)
     end
   end
@@ -169,8 +152,6 @@ defmodule PhxPortHandoff.TransportTest do
   defp start_handoff(listen_options) do
     path = Path.join(temporary_directory(), "handoff.sock")
     {:ok, listener} = Transport.listen(443, [handoff_path: path] ++ listen_options)
-    {ingress, port} = Sender.listen()
-    on_exit(fn -> :socket.close(ingress) end)
 
     server =
       Task.async(fn ->
@@ -187,39 +168,111 @@ defmodule PhxPortHandoff.TransportTest do
         }
       end)
 
-    sender = Task.async(fn -> Sender.hand_off(ingress, path) end)
-
-    {listener, port, sender, server}
+    {listener, path, server}
   end
 
-  # Drives one connection through the full ingress path: a client connects to a
-  # throwaway TCP listener, PHXP hands that descriptor to the endpoint, and the
-  # handed-off socket must serve a complete HTTPS request.
-  # Drives one connection through the full ingress path: a client outside this
-  # VM connects to a throwaway TCP listener, PHXP hands that descriptor to the
-  # endpoint, and the handed-off socket must serve a complete HTTPS request.
+  # The sender, not the TCP peer, shares the imported open file description.
+  # Keep it outside this VM and never change its O_NONBLOCK flags after delivery.
   defp handoff_request(path, tls) do
-    {ingress, port} = Sender.listen()
     cacertfile = certificate_authority_file(tls)
-    sender = Task.async(fn -> Sender.hand_off(ingress, path) end)
-    client = Task.async(fn -> request(port, cacertfile) end)
+    script = Path.expand("support/tls_client.exs", __DIR__)
+
+    with_sender(path, fn sender, port ->
+      with_child(
+        "elixir",
+        ["--erl", "+S 2:2", script, Integer.to_string(port), cacertfile],
+        fn client, os_pid ->
+          assert read_child_line(client) == "READY #{os_pid}"
+          assert finish_child(sender) == "ADOPTED\n"
+          finish_child(client)
+        end
+      )
+    end)
+  end
+
+  defp with_sender(path, callback) do
+    script = Path.expand("support/phxp_sender.py", __DIR__)
+
+    with_child("python3", [script], fn sender, os_pid ->
+      expected_pid = Integer.to_string(os_pid)
+      assert ["READY", ^expected_pid, port] = String.split(read_child_line(sender))
+      port = String.to_integer(port)
+      assert port in 1..65_535
+      assert Port.command(sender, path <> "\n")
+      callback.(sender, port)
+    end)
+  end
+
+  defp with_child(executable, arguments, callback) do
+    executable =
+      System.find_executable(executable) || flunk("missing fixture tool: #{executable}")
+
+    child =
+      Port.open({:spawn_executable, executable}, [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        {:line, 4_096},
+        args: arguments
+      ])
+
+    {:os_pid, os_pid} = Port.info(child, :os_pid)
 
     try do
-      assert :ok = Task.await(sender, 15_000)
-      Task.await(client, 25_000)
+      refute Integer.to_string(os_pid) == System.pid(),
+             "the fixture must run outside the receiving BEAM VM"
+
+      callback.(child, os_pid)
     after
-      :socket.close(ingress)
+      case Port.info(child, :os_pid) do
+        nil ->
+          :ok
+
+        {:os_pid, ^os_pid} ->
+          {output, status} =
+            System.cmd("kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
+
+          # The child may have exited just before kill; its exit notification
+          # is the cleanup proof in either case, not kill's status alone.
+          assert_receive {^child, {:exit_status, _}},
+                         5_000,
+                         "fixture #{os_pid} was not reaped (kill status #{status}): #{output}"
+      end
     end
   end
 
-  defp request(port, cacertfile) do
-    script = Path.expand("support/tls_client.exs", __DIR__)
+  defp read_child_line(child) do
+    receive do
+      {^child, {:data, {:eol, line}}} ->
+        line
 
-    {output, status} =
-      System.cmd("elixir", [script, Integer.to_string(port), cacertfile], stderr_to_stdout: true)
+      {^child, event} ->
+        flunk("fixture did not report readiness: #{inspect(event)}")
+    after
+      10_000 -> flunk("fixture startup timed out")
+    end
+  end
 
-    assert status == 0, "the out-of-VM TLS client failed:\n#{output}"
+  defp finish_child(child) do
+    {output, status} = collect_child(child, System.monotonic_time(:millisecond) + 15_000, "")
+    assert status == 0, "fixture exited with status #{status}:\n#{output}"
     output
+  end
+
+  defp collect_child(child, deadline, output) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^child, {:data, {ending, data}}} when ending in [:eol, :noeol] ->
+        output = output <> data <> if(ending == :eol, do: "\n", else: "")
+        assert byte_size(output) <= 65_536, "fixture output exceeded 64 KiB"
+        collect_child(child, deadline, output)
+
+      {^child, {:exit_status, status}} ->
+        {output, status}
+    after
+      remaining -> flunk("fixture completion timed out:\n#{output}")
+    end
   end
 
   defp certificate_authority_file(tls) do

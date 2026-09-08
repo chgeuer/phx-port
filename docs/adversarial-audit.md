@@ -423,10 +423,17 @@ It added a new public NIF and a new failure path that closed the socket and
 rejected the connection if `fcntl` failed. Redundant code with a novel failure
 mode is a net loss, so it was removed.
 
-The regression test therefore drives TLS from a separate OS process, which is
-both deterministic and a more faithful topology. It was verified against
-unmodified `063d368` that this freeze is pre-existing and was not introduced by
-any fix in this pass. Do not record it as fixed.
+The original regression moved only the TLS client to a separate OS process,
+leaving the in-VM PHXP sender and therefore the freezing topology intact. The
+transport regressions now use `phx_port_handoff/test/support/phxp_sender.py`
+outside the receiving VM for both stalled-peer and complete-TLS scenarios.
+They check the sender's OS identity, readiness, adoption acknowledgement, and
+exit status; the stalled TCP peer intentionally remains in-VM. Run them under
+the external Linux watchdog documented in the handoff package README.
+
+This repairs the regression topology, not the underlying VM behavior. It was
+verified against unmodified `063d368` that the freeze is pre-existing and was
+not introduced by any fix in this pass. Do not record the VM freeze as fixed.
 
 Debugging notes for whoever revisits this. `:erlang.display/1` still writes
 from the emulator when the IO system is wedged, whereas `IO.puts` starves;

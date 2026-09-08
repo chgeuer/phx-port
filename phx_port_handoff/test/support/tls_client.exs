@@ -1,13 +1,12 @@
 # Drives one HTTPS request from outside the endpoint's own VM, the way a real
 # client reaches an ingress-fronted service. Prints the raw response to stdout.
 #
-# Running this out of process is a hard requirement, not a stylistic choice. A
-# PHXP sender or client inside the endpoint's own BEAM can clear O_NONBLOCK on
-# the open file description that SCM_RIGHTS shares with the receiver, after
-# which inet_drv blocks in recv(2) on a normal scheduler and freezes the whole
-# VM. See docs/adversarial-audit.md.
+# Moving this client is not sufficient: the PHXP sender must run outside the
+# receiving VM too. The sender, not the TCP peer, shares the imported open file
+# description and can clear O_NONBLOCK after import. See docs/adversarial-audit.md.
 [port, cacertfile] = System.argv()
 {:ok, _} = Application.ensure_all_started(:ssl)
+IO.puts("READY #{System.pid()}")
 
 {:ok, client} =
   :ssl.connect(
@@ -23,14 +22,26 @@
     10_000
   )
 
-:ok = :ssl.send(client, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+try do
+  :ok = :ssl.send(client, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
 
-read = fn read, acc ->
-  case :ssl.recv(client, 0, 10_000) do
-    {:ok, data} -> read.(read, acc <> data)
-    {:error, :closed} -> acc
-    {:error, reason} -> acc <> "READ ERROR: #{inspect(reason)}"
+  read = fn read, acc ->
+    case :ssl.recv(client, 0, 10_000) do
+      {:ok, data} when byte_size(acc) + byte_size(data) <= 65_536 ->
+        read.(read, acc <> data)
+
+      {:ok, _data} ->
+        raise "TLS response exceeded 64 KiB"
+
+      {:error, :closed} ->
+        acc
+
+      {:error, reason} ->
+        raise "TLS read failed: #{inspect(reason)}"
+    end
   end
-end
 
-IO.write(read.(read, ""))
+  IO.write(read.(read, ""))
+after
+  :ssl.close(client)
+end
