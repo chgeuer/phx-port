@@ -175,11 +175,17 @@ descriptors across restarts.
 
 ## Regression tests
 
-On Linux, run the startup and transport tests as an unprivileged user with an
-external OS-process watchdog:
+The default `mix format --check-formatted` inputs include the shipped
+`priv/installer/igniter.exs`. Installer tests verify that those inputs reject
+an intentionally unformatted installer in a private fixture directory.
+
+On Linux, run the installer, startup, and transport tests as an unprivileged
+user with an external OS-process watchdog:
 
 ```bash
 cd phx_port_handoff
+mix format --check-formatted
+timeout --kill-after=10s 180s mix test test/phx_port_handoff_install_test.exs
 timeout --kill-after=10s 180s mix test test/phx_port_handoff_test.exs test/phx_port_handoff_transport_test.exs
 timeout --kill-after=10s 180s mix test test/scheduler_probe_test.exs
 ```

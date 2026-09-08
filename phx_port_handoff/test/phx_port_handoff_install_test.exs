@@ -60,4 +60,36 @@ defmodule PhxPortHandoffInstallTest do
     |> Igniter.compose_task("phx_port_handoff.install")
     |> assert_unchanged("lib/test/application.ex")
   end
+
+  @tag :tmp_dir
+  test "the default formatter checks and formats the installer", %{tmp_dir: tmp_dir} do
+    File.chmod!(tmp_dir, 0o700)
+    on_exit(fn -> File.rm_rf!(tmp_dir) end)
+
+    File.cp!(Path.expand("../.formatter.exs", __DIR__), Path.join(tmp_dir, ".formatter.exs"))
+    installer = Path.join(tmp_dir, "priv/installer/igniter.exs")
+    File.mkdir_p!(Path.dirname(installer))
+
+    File.write!(installer, """
+    defmodule InstallerFixture do
+      def install( igniter ),do: igniter
+    end
+    """)
+
+    options = [cd: tmp_dir, stderr_to_stdout: true, env: [{"ERL_FLAGS", "+S 2:2"}]]
+    {output, status} = System.cmd("mix", ["format", "--check-formatted"], options)
+
+    assert status == 1,
+           "formatter must reject the unformatted installer (exit #{status}):\n#{output}"
+
+    assert output =~ "priv/installer/igniter.exs"
+    assert {"", 0} = System.cmd("mix", ["format"], options)
+    assert {"", 0} = System.cmd("mix", ["format", "--check-formatted"], options)
+
+    assert File.read!(installer) == """
+           defmodule InstallerFixture do
+             def install(igniter), do: igniter
+           end
+           """
+  end
 end
