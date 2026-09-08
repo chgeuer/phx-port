@@ -11,7 +11,7 @@ connected TCP descriptor with `SCM_RIGHTS`, acknowledges adoption, performs
 server-side TLS on the untouched socket, and feeds it into the same Axum router
 as the ordinary listeners. The response includes `peer` and `local`;
 on a handed-off socket these are the original client and daemon listener
-addresses. The handoff SNI is printed only as diagnostic metadata; rustls
+addresses. The handoff SNI is returned only as diagnostic response metadata; rustls
 processes the original ClientHello and does not trust that field for TLS.
 
 The example directly includes the repository's `src/handoff_protocol.rs`, so
@@ -98,6 +98,8 @@ All settings have CLI and environment forms:
 | `--workload-id ID` | `PHXP_WORKLOAD_ID` | unset |
 | `--role NAME` | `PHXP_ROLE` | `https` |
 | `--handoff-socket PATH` | `PHXP_HANDOFF_SOCKET` | PHXP-derived path |
+| `--max-connections N` | `PHXP_MAX_CONNECTIONS` | `128` |
+| `--max-control-workers N` | `PHXP_MAX_CONTROL_WORKERS` | `16` |
 
 Without `PHXP_WORKLOAD_ID`, the derived development endpoint is
 `$XDG_RUNTIME_DIR/phx-port/handoff/<hash>.sock` on Linux and
@@ -123,6 +125,46 @@ absolute deadline. Full queues, pending connections, timeouts, and operational
 errors fail startup without unlinking the endpoint. Only a refused connection
 confirms a stale socket for removal.
 
+## Admission and shutdown
+
+The sample shares one active-connection budget across direct HTTP, direct
+HTTPS, and PHXP. A PHXP negotiation reserves a connection permit before
+starting a control worker, then transfers that permit with the adopted
+socket. Queuing, TLS handshakes, HTTP keep-alive, and serving all retain the
+permit until the socket closes, including failures and cancellation.
+Draining the adoption channel does not release capacity.
+
+Control workers have an additional independent limit, acquired before
+spawning a native thread. When either limit is full, newly accepted sockets
+close without another worker or TLS handshake. Existing connections continue
+serving; capacity becomes available when they close. Limits must be positive
+integers; CLI values override their environment equivalents.
+
+The listeners and connection tasks are supervised. Listener errors, worker
+spawn failures, and panics stop serving with a reported error. Ordinary
+connection/negotiation failures and overload are counted in fixed-category
+summaries at most once per second, plus a final shutdown summary; these logs
+do not include SNI, client addresses, or arbitrary error payloads.
+
+Ctrl-C or SIGTERM stops admission, interrupts and joins PHXP control workers,
+closes queued adoptions, aborts and reaps active connection tasks, and removes
+only this receiver's socket endpoint. Cancellation interrupts Unix control
+sockets, never the delivered TCP descriptor from the sender side. Active
+connections are closed immediately rather than gracefully drained.
+
+These are bounded example defaults, not a production capacity claim or a
+replacement for Workload-specific request, stream, idle, and rate policies.
+No privileged setup or ingress service is needed for this admission policy.
+
+The isolated admission regressions generate temporary localhost certificates
+with OpenSSL, use ephemeral loopback listeners, and clean up their child
+processes. They cover both direct listeners, real PHXP descriptor adoption,
+slow negotiations, failure cleanup, and shutdown:
+
+```bash
+timeout --kill-after=10s 180s cargo test --locked --manifest-path samples/rust/Cargo.toml --test admission
+```
+
 ## Scope and limitations
 
 - Linux uses `SOCK_SEQPACKET`, `SO_PEERCRED`, and atomic close-on-exec flags.
@@ -132,7 +174,7 @@ confirms a stale socket for removal.
   and response framing on all three ingress paths.
 - One configured certificate chain/private key is used for both ordinary and
   handed-off TLS. There is no multi-certificate SNI resolver or client auth.
-- The PHXP control protocol uses blocking worker threads; adopted TCP
-  connections run as Tokio tasks.
+- The PHXP control protocol uses bounded blocking worker threads; adopted TCP
+  connections run as supervised Tokio tasks with lifetime permits.
 - The sample hostname and certificate directory are configurable through the
   root `justfile`.

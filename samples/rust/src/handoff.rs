@@ -5,12 +5,14 @@ use crate::handoff_stream::{complete_frame, read_frame};
 mod endpoint_probe;
 
 #[cfg(target_os = "macos")]
-use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+use nix::fcntl::FdFlag;
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 #[cfg(target_os = "macos")]
 use nix::sys::socket::accept;
 use nix::sys::socket::{
-    AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, SockaddrLike,
-    SockaddrStorage, UnixAddr, bind, getpeername, getsockopt, listen, recvmsg, socket, sockopt,
+    AddressFamily, Backlog, ControlMessageOwned, MsgFlags, Shutdown, SockFlag, SockType,
+    SockaddrLike, SockaddrStorage, UnixAddr, bind, getpeername, getsockopt, listen, recvmsg,
+    shutdown, socket, sockopt,
 };
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{accept4, recv, send};
@@ -22,9 +24,7 @@ use std::io::IoSliceMut;
 #[cfg(target_os = "macos")]
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
-#[cfg(target_os = "macos")]
-use std::os::fd::AsFd;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixStream;
@@ -32,7 +32,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::{Sender, error::TrySendError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 const REJECT_INVALID_DESCRIPTOR: u16 = 1;
@@ -51,8 +53,8 @@ pub(crate) struct AdoptedConn {
     pub(crate) local: Option<SocketAddr>,
     pub(crate) sni: String,
     pub(crate) peeked: u32,
-    pub(crate) connection_id: [u8; 16],
-    pub(crate) active_ids: Arc<Mutex<HashSet<[u8; 16]>>>,
+    pub(crate) active_id: ActiveIdGuard,
+    pub(crate) permit: OwnedSemaphorePermit,
 }
 
 pub(crate) struct ActiveIdGuard {
@@ -121,29 +123,124 @@ impl HandoffListener {
         })
     }
 
-    pub(crate) fn spawn(self, adopted_tx: Sender<AdoptedConn>) {
-        thread::Builder::new()
-            .name("phxp-listener".into())
-            .spawn(move || self.run_loop(adopted_tx))
-            .expect("failed to start PHXP listener thread");
+    pub(crate) async fn run(
+        self,
+        adopted_tx: Sender<AdoptedConn>,
+        admission: Arc<Semaphore>,
+        max_control_workers: usize,
+    ) -> Result<(), String> {
+        let flags = fcntl(&self.listener, FcntlArg::F_GETFL)
+            .map_err(|error| format!("cannot inspect PHXP listener flags: {error}"))?;
+        fcntl(
+            &self.listener,
+            FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK),
+        )
+        .map_err(|error| format!("cannot make PHXP listener nonblocking: {error}"))?;
+        let listener = AsyncFd::new(self.listener.as_fd())
+            .map_err(|error| format!("cannot register PHXP listener: {error}"))?;
+        let mut workers = ControlWorkers::default();
+        let mut stats = crate::ActivityStats::new("PHXP control");
+        let mut reporting = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            stats.failed = stats.failed.saturating_add(workers.reap()?);
+            tokio::select! {
+                _ = adopted_tx.closed() => return Err("PHXP consumer stopped unexpectedly".into()),
+                _ = reporting.tick() => stats.report(),
+                ready = listener.readable() => {
+                    let mut ready = ready.map_err(|error| format!("PHXP listener failed: {error}"))?;
+                    // Closed readiness cannot be cleared even when accept returns WouldBlock.
+                    if ready.ready().is_read_closed() || ready.ready().is_error() {
+                        return Err("PHXP listener failed: readiness closed".into());
+                    }
+                    let control = match ready.try_io(|listener| accept_control(listener.get_ref())) {
+                        Ok(Ok(control)) => control,
+                        Ok(Err(error)) => return Err(format!("PHXP listener failed: {error}")),
+                        Err(_) => continue,
+                    };
+                    stats.failed = stats.failed.saturating_add(workers.reap()?);
+                    if workers.0.len() >= max_control_workers {
+                        stats.rejected = stats.rejected.saturating_add(1);
+                        continue;
+                    }
+                    let Ok(permit) = Arc::clone(&admission).try_acquire_owned() else {
+                        stats.rejected = stats.rejected.saturating_add(1);
+                        continue;
+                    };
+                    workers.spawn(
+                        control,
+                        adopted_tx.clone(),
+                        Arc::clone(&self.active_ids),
+                        permit,
+                    )?;
+                }
+            }
+        }
+    }
+}
+
+struct ControlWorker {
+    control: OwnedFd,
+    thread: thread::JoinHandle<Result<(), String>>,
+}
+
+#[derive(Default)]
+struct ControlWorkers(Vec<ControlWorker>);
+
+impl ControlWorkers {
+    fn spawn(
+        &mut self,
+        control: Control,
+        adopted_tx: Sender<AdoptedConn>,
+        active_ids: Arc<Mutex<HashSet<[u8; 16]>>>,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<(), String> {
+        let interrupt = control
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|error| format!("cannot retain PHXP cancellation descriptor: {error}"))?;
+        let thread = thread::Builder::new()
+            .name("phxp-control".into())
+            .spawn(move || receive_handoff(control, adopted_tx, active_ids, permit))
+            .map_err(|error| format!("cannot start PHXP worker: {error}"))?;
+        self.0.push(ControlWorker {
+            control: interrupt,
+            thread,
+        });
+        Ok(())
     }
 
-    fn run_loop(self, adopted_tx: Sender<AdoptedConn>) {
-        loop {
-            let control = match accept_control(&self.listener) {
-                Ok(control) => control,
-                Err(error) => {
-                    eprintln!("PHXP accept failed: {error}");
-                    continue;
+    fn reap(&mut self) -> Result<u64, String> {
+        let mut failures = 0_u64;
+        let mut index = 0;
+        while index < self.0.len() {
+            if self.0[index].thread.is_finished() {
+                let worker = self.0.swap_remove(index);
+                let outcome = worker.thread.join().map_err(|_| "PHXP worker panicked")?;
+                if outcome.is_err() {
+                    failures = failures.saturating_add(1);
                 }
-            };
-            let tx = adopted_tx.clone();
-            let active_ids = Arc::clone(&self.active_ids);
-            thread::spawn(move || {
-                if let Err(error) = receive_handoff(control, tx, active_ids) {
-                    eprintln!("PHXP handoff failed: {error}");
-                }
-            });
+            } else {
+                index += 1;
+            }
+        }
+        Ok(failures)
+    }
+}
+
+impl Drop for ControlWorkers {
+    fn drop(&mut self) {
+        // Interrupt only the Unix control sockets, never delivered TCP descriptors.
+        for worker in &self.0 {
+            if let Err(error) = shutdown(worker.control.as_raw_fd(), Shutdown::Both)
+                && error != nix::errno::Errno::ENOTCONN
+            {
+                eprintln!("PHXP control cancellation failed: {error}");
+            }
+        }
+        for worker in self.0.drain(..) {
+            if worker.thread.join().is_err() {
+                eprintln!("PHXP worker panicked during shutdown");
+            }
         }
     }
 }
@@ -343,6 +440,7 @@ fn receive_handoff(
     mut control: Control,
     adopted_tx: Sender<AdoptedConn>,
     active_ids: Arc<Mutex<HashSet<[u8; 16]>>>,
+    permit: OwnedSemaphorePermit,
 ) -> Result<(), String> {
     authenticate_peer(&control)?;
     configure_control(&control)?;
@@ -418,8 +516,8 @@ fn receive_handoff(
         local,
         sni: handoff.requested_sni.clone(),
         peeked: handoff.peeked_length,
-        connection_id: handoff.connection_id,
-        active_ids: Arc::clone(&active_ids),
+        active_id: ActiveIdGuard::new(handoff.connection_id, active_ids),
+        permit,
     };
 
     if let Err(error) = adopted_tx.try_send(conn) {
@@ -428,32 +526,17 @@ fn receive_handoff(
             TrySendError::Closed(conn) => (conn, "async runtime shut down"),
         };
         drop(conn);
-        if let Ok(mut ids) = active_ids.lock() {
-            ids.remove(&handoff.connection_id);
-        }
         send_rejected(&mut control, handoff.connection_id, REJECT_ADOPTION_FAILED)?;
         return Err(format!("{reason}; rejected adoption"));
     }
 
-    if let Err(error) = send_packet(
+    send_packet(
         &mut control,
         &Message::Adopted {
             connection_id: handoff.connection_id,
         },
-    ) {
-        eprintln!(
-            "PHXP connection {} was adopted, but its acknowledgement was lost: {error}",
-            hex_id(&handoff.connection_id)
-        );
-    }
-    println!(
-        "adopted PHXP connection for {} from {} (peeked {} bytes, accepted_at_ns={})",
-        handoff.requested_sni,
-        peer.map(|address| address.to_string())
-            .unwrap_or_else(|| "unknown peer".into()),
-        handoff.peeked_length,
-        handoff.accepted_at_ns,
-    );
+    )
+    .map_err(|_| "PHXP descriptor was adopted but its acknowledgement was lost".to_string())?;
     Ok(())
 }
 
@@ -483,20 +566,20 @@ fn create_control_socket() -> Result<OwnedFd, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn accept_control(listener: &OwnedFd) -> Result<Control, String> {
-    let fd = accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC)
-        .map_err(|error| format!("cannot accept PHXP connection: {error}"))?;
+fn accept_control(listener: &impl AsRawFd) -> std::io::Result<Control> {
+    let fd = accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC)?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 #[cfg(target_os = "macos")]
-fn accept_control(listener: &OwnedFd) -> Result<Control, String> {
-    let fd = accept(listener.as_raw_fd())
-        .map_err(|error| format!("cannot accept PHXP connection: {error}"))?;
+fn accept_control(listener: &impl AsRawFd) -> std::io::Result<Control> {
+    let fd = accept(listener.as_raw_fd())?;
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    set_cloexec(&fd)?;
-    set_no_sigpipe(&fd)?;
-    Ok(UnixStream::from(fd))
+    set_cloexec(&fd).map_err(std::io::Error::other)?;
+    set_no_sigpipe(&fd).map_err(std::io::Error::other)?;
+    let control = UnixStream::from(fd);
+    control.set_nonblocking(false)?;
+    Ok(control)
 }
 
 #[cfg(target_os = "linux")]
@@ -682,10 +765,6 @@ fn set_no_sigpipe(fd: &impl AsFd) -> Result<(), String> {
     Ok(())
 }
 
-fn hex_id(id: &[u8; 16]) -> String {
-    id.iter().map(|byte| format!("{byte:02X}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -704,6 +783,83 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn consumer_failure_is_reported_and_removes_the_endpoint() {
+        let directory = tempdir().unwrap();
+        let endpoint = directory.path().join("handoff").join("receiver.sock");
+        let listener = HandoffListener::bind(&endpoint, false).unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            listener.run(
+                sender,
+                std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+                1,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err(), "PHXP consumer stopped unexpectedly");
+        assert!(!endpoint.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn listener_accept_failure_is_reported_instead_of_retried_forever() {
+        let directory = tempdir().unwrap();
+        let endpoint = directory.path().join("handoff").join("receiver.sock");
+        let listener = HandoffListener::bind(&endpoint, false).unwrap();
+        nix::sys::socket::shutdown(
+            listener.listener.as_raw_fd(),
+            nix::sys::socket::Shutdown::Both,
+        )
+        .unwrap();
+        nix::fcntl::fcntl(
+            &listener.listener,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .unwrap();
+        assert_eq!(
+            super::accept_control(&listener.listener)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            listener.run(
+                sender,
+                std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+                1,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().contains("PHXP listener failed"));
+        assert!(!endpoint.exists());
+    }
+
+    #[test]
+    fn control_worker_panics_are_observed_when_reaped() {
+        let (control, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let thread = std::thread::spawn(|| -> Result<(), String> {
+            panic!("injected control worker failure");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !thread.is_finished() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut workers = super::ControlWorkers(vec![super::ControlWorker {
+            control: control.into(),
+            thread,
+        }]);
+        assert_eq!(workers.reap().unwrap_err(), "PHXP worker panicked");
+        assert!(workers.0.is_empty());
+    }
 
     #[test]
     fn endpoint_name_matches_the_daemon_algorithm() {

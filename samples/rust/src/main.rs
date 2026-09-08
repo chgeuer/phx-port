@@ -11,7 +11,9 @@ mod handoff_stream;
 
 use std::env;
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fs::File;
+use std::future::Future;
 use std::io::{self, BufReader};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -25,6 +27,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio::task::{JoinError, JoinSet};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -32,6 +36,43 @@ use tower::Service;
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_MAX_CONNECTIONS: usize = 128;
+const DEFAULT_MAX_CONTROL_WORKERS: usize = 16;
+
+type ConnectionResult = Result<(), Box<dyn Error + Send + Sync>>;
+
+struct ActivityStats {
+    label: &'static str,
+    rejected: u64,
+    failed: u64,
+}
+
+impl ActivityStats {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            rejected: 0,
+            failed: 0,
+        }
+    }
+
+    fn report(&mut self) {
+        if self.rejected != 0 || self.failed != 0 {
+            eprintln!(
+                "{}: rejected={}, failed={}",
+                self.label, self.rejected, self.failed
+            );
+            self.rejected = 0;
+            self.failed = 0;
+        }
+    }
+}
+
+impl Drop for ActivityStats {
+    fn drop(&mut self) {
+        self.report();
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ConnMeta {
@@ -85,11 +126,7 @@ fn build_app() -> Router {
     Router::new().fallback(diagnostics)
 }
 
-async fn serve_connection<I>(
-    stream: I,
-    app: Router,
-    meta: Arc<ConnMeta>,
-) -> Result<(), Box<dyn Error + Send + Sync>>
+async fn serve_connection<I>(stream: I, app: Router, meta: Arc<ConnMeta>) -> ConnectionResult
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -108,103 +145,26 @@ where
     Ok(())
 }
 
-async fn run_http(listener: TcpListener, app: Router) {
-    loop {
-        let (tcp, peer) = match listener.accept().await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("HTTP accept error: {e}");
-                continue;
-            }
-        };
-        let local = tcp.local_addr().ok();
-        let meta = Arc::new(ConnMeta {
-            listener: "http",
-            peer: Some(peer),
-            local,
-            sni: None,
-            peeked: None,
-        });
-        let app = app.clone();
-        tokio::spawn(async move {
-            if let Err(error) = serve_connection(tcp, app, meta).await
-                && !is_expected_disconnect(error.as_ref())
-            {
-                eprintln!("HTTP connection error: {error}");
-            }
-        });
-    }
+async fn serve_tls(
+    tcp: tokio::net::TcpStream,
+    app: Router,
+    meta: Arc<ConnMeta>,
+    tls: TlsAcceptor,
+) -> ConnectionResult {
+    let tls_stream = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, tls.accept(tcp))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
+    serve_connection(tls_stream, app, meta).await
 }
 
-async fn run_https(listener: TcpListener, app: Router, tls: TlsAcceptor) {
-    loop {
-        let (tcp, peer) = match listener.accept().await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("HTTPS accept error: {e}");
-                continue;
-            }
-        };
-        let local = tcp.local_addr().ok();
-        let tls = tls.clone();
-        let app = app.clone();
-        tokio::spawn(async move {
-            let tls_stream =
-                match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, tls.accept(tcp)).await {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(error)) => {
-                        // Handshake failures from probes/scanners are not actionable.
-                        if !is_expected_disconnect(&error) {
-                            eprintln!("TLS handshake from {peer}: {error}");
-                        }
-                        return;
-                    }
-                    Err(_) => {
-                        eprintln!("TLS handshake from {peer} timed out");
-                        return;
-                    }
-                };
-            let meta = Arc::new(ConnMeta {
-                listener: "https",
-                peer: Some(peer),
-                local,
-                sni: None,
-                peeked: None,
-            });
-            if let Err(error) = serve_connection(tls_stream, app, meta).await
-                && !is_expected_disconnect(error.as_ref())
-            {
-                eprintln!("HTTPS connection error: {error}");
-            }
-        });
-    }
-}
-
-async fn serve_adopted(conn: handoff::AdoptedConn, app: Router, tls: TlsAcceptor) {
-    let _guard = handoff::ActiveIdGuard::new(conn.connection_id, Arc::clone(&conn.active_ids));
-
-    let tcp = match tokio::net::TcpStream::from_std(conn.stream) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("PHXP: cannot adopt fd into Tokio: {e}");
-            return;
-        }
-    };
-
-    let tls_stream = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, tls.accept(tcp)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => {
-            if !is_expected_disconnect(&error) {
-                eprintln!("PHXP TLS handshake failed: {error}");
-            }
-            return;
-        }
-        Err(_) => {
-            eprintln!("PHXP TLS handshake timed out");
-            return;
-        }
-    };
-
+async fn serve_adopted(
+    conn: handoff::AdoptedConn,
+    app: Router,
+    tls: TlsAcceptor,
+) -> ConnectionResult {
+    let _permit = conn.permit;
+    let _guard = conn.active_id;
+    let tcp = tokio::net::TcpStream::from_std(conn.stream)?;
     let meta = Arc::new(ConnMeta {
         listener: "phxp-handoff-https",
         peer: conn.peer,
@@ -213,20 +173,164 @@ async fn serve_adopted(conn: handoff::AdoptedConn, app: Router, tls: TlsAcceptor
         peeked: Some(conn.peeked),
     });
 
-    if let Err(error) = serve_connection(tls_stream, app, meta).await
-        && !is_expected_disconnect(error.as_ref())
-    {
-        eprintln!("PHXP connection error: {error}");
+    serve_tls(tcp, app, meta, tls).await
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AdmissionLimits {
+    max_connections: usize,
+    max_control_workers: usize,
+}
+
+struct Server {
+    http: TcpListener,
+    https: TcpListener,
+    handoff: handoff::HandoffListener,
+    app: Router,
+    tls: TlsAcceptor,
+    limits: AdmissionLimits,
+}
+
+impl Server {
+    async fn serve(self, shutdown: impl Future<Output = Result<(), String>>) -> Result<(), String> {
+        let Self {
+            http,
+            https,
+            handoff,
+            app,
+            tls,
+            limits,
+        } = self;
+        let admission = Arc::new(Semaphore::new(limits.max_connections));
+        let (adopted_tx, mut adopted_rx) = tokio::sync::mpsc::channel(limits.max_connections);
+        let mut handoff = Box::pin(handoff.run(
+            adopted_tx,
+            Arc::clone(&admission),
+            limits.max_control_workers,
+        ));
+        let mut connections = JoinSet::new();
+        let mut stats = ActivityStats::new("connections");
+        let mut reporting = tokio::time::interval(Duration::from_secs(1));
+        tokio::pin!(shutdown);
+
+        let mut result = loop {
+            let mut failure = None;
+            while let Some(joined) = connections.try_join_next() {
+                if let Err(error) = observe_connection(joined, &mut stats) {
+                    failure = Some(error);
+                }
+            }
+            if let Some(error) = failure {
+                break Err(error);
+            }
+            tokio::select! {
+                result = &mut shutdown => break result,
+                result = &mut handoff => {
+                    break result.and_then(|()| Err("PHXP listener stopped unexpectedly".into()));
+                }
+                joined = connections.join_next(), if !connections.is_empty() => {
+                    if let Err(error) = observe_connection(joined.expect("nonempty task set"), &mut stats) {
+                        break Err(error);
+                    }
+                }
+                _ = reporting.tick() => stats.report(),
+                conn = adopted_rx.recv() => {
+                    let Some(conn) = conn else {
+                        break Err("PHXP adoption channel closed unexpectedly".into());
+                    };
+                    connections.spawn(serve_adopted(conn, app.clone(), tls.clone()));
+                }
+                accepted = http.accept() => {
+                    let (tcp, peer) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => break Err(format!("HTTP listener failed: {error}")),
+                    };
+                    let Ok(permit) = Arc::clone(&admission).try_acquire_owned() else {
+                        stats.rejected = stats.rejected.saturating_add(1);
+                        continue;
+                    };
+                    let meta = Arc::new(ConnMeta {
+                        listener: "http",
+                        peer: Some(peer),
+                        local: tcp.local_addr().ok(),
+                        sni: None,
+                        peeked: None,
+                    });
+                    let app = app.clone();
+                    connections.spawn(async move {
+                        let _permit = permit;
+                        serve_connection(tcp, app, meta).await
+                    });
+                }
+                accepted = https.accept() => {
+                    let (tcp, peer) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => break Err(format!("HTTPS listener failed: {error}")),
+                    };
+                    let Ok(permit) = Arc::clone(&admission).try_acquire_owned() else {
+                        stats.rejected = stats.rejected.saturating_add(1);
+                        continue;
+                    };
+                    let meta = Arc::new(ConnMeta {
+                        listener: "https",
+                        peer: Some(peer),
+                        local: tcp.local_addr().ok(),
+                        sni: None,
+                        peeked: None,
+                    });
+                    let app = app.clone();
+                    let tls = tls.clone();
+                    connections.spawn(async move {
+                        let _permit = permit;
+                        serve_tls(tcp, app, meta, tls).await
+                    });
+                }
+            }
+        };
+
+        drop(http);
+        drop(https);
+        drop(handoff);
+        drop(adopted_rx);
+        connections.abort_all();
+        while let Some(joined) = connections.join_next().await {
+            if matches!(&joined, Err(error) if error.is_cancelled()) {
+                continue;
+            }
+            if let Err(error) = observe_connection(joined, &mut stats) {
+                eprintln!("{error}");
+                result = Err(error);
+            }
+        }
+        result
     }
 }
 
-async fn consume_adopted(
-    mut rx: tokio::sync::mpsc::Receiver<handoff::AdoptedConn>,
-    app: Router,
-    tls: TlsAcceptor,
-) {
-    while let Some(conn) = rx.recv().await {
-        tokio::spawn(serve_adopted(conn, app.clone(), tls.clone()));
+fn observe_connection(
+    joined: Result<ConnectionResult, JoinError>,
+    stats: &mut ActivityStats,
+) -> Result<(), String> {
+    match joined {
+        Ok(Err(error)) if !is_expected_disconnect(error.as_ref()) => {
+            stats.failed = stats.failed.saturating_add(1);
+        }
+        Err(error) if error.is_panic() => return Err("connection task panicked".into()),
+        Err(_) => return Err("connection task was cancelled unexpectedly".into()),
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn shutdown_signal() -> Result<(), String> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|error| format!("cannot observe SIGTERM: {error}"))?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.map_err(|error| format!("cannot observe Ctrl-C: {error}"))
+        }
+        signal = terminate.recv() => {
+            signal.ok_or_else(|| "SIGTERM listener closed unexpectedly".into())
+        }
     }
 }
 
@@ -322,23 +426,16 @@ async fn run() -> Result<(), String> {
     println!("project: {}", config.project);
     println!("role:    {}", config.role);
 
-    let app = build_app();
-    let tls_acceptor = TlsAcceptor::from(tls_config);
-
-    let (adopted_tx, adopted_rx) = tokio::sync::mpsc::channel(128);
-
-    handoff.spawn(adopted_tx);
-
-    tokio::spawn(run_http(http_listener, app.clone()));
-    tokio::spawn(consume_adopted(
-        adopted_rx,
-        app.clone(),
-        tls_acceptor.clone(),
-    ));
-
-    run_https(https_listener, app, tls_acceptor).await;
-
-    Ok(())
+    Server {
+        http: http_listener,
+        https: https_listener,
+        handoff,
+        app: build_app(),
+        tls: TlsAcceptor::from(tls_config),
+        limits: config.limits,
+    }
+    .serve(shutdown_signal())
+    .await
 }
 
 #[derive(Debug)]
@@ -351,6 +448,7 @@ struct Config {
     role: String,
     handoff_socket: PathBuf,
     validate_handoff_runtime_root: bool,
+    limits: AdmissionLimits,
 }
 
 impl Config {
@@ -363,6 +461,10 @@ impl Config {
         let mut workload_id = env_value("PHXP_WORKLOAD_ID");
         let mut role = env_value("PHXP_ROLE").unwrap_or_else(|| "https".into());
         let mut handoff_socket = env_value("PHXP_HANDOFF_SOCKET").map(PathBuf::from);
+        let mut max_connections = env::var_os("PHXP_MAX_CONNECTIONS")
+            .unwrap_or_else(|| DEFAULT_MAX_CONNECTIONS.to_string().into());
+        let mut max_control_workers = env::var_os("PHXP_MAX_CONTROL_WORKERS")
+            .unwrap_or_else(|| DEFAULT_MAX_CONTROL_WORKERS.to_string().into());
 
         let mut arguments = env::args().skip(1);
         while let Some(argument) = arguments.next() {
@@ -382,6 +484,8 @@ impl Config {
                 "--handoff-socket" => {
                     handoff_socket = Some(PathBuf::from(value(&mut arguments)?));
                 }
+                "--max-connections" => max_connections = value(&mut arguments)?.into(),
+                "--max-control-workers" => max_control_workers = value(&mut arguments)?.into(),
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -430,8 +534,25 @@ impl Config {
             role,
             handoff_socket,
             validate_handoff_runtime_root,
+            limits: AdmissionLimits {
+                max_connections: parse_limit(&max_connections, "max-connections")?,
+                max_control_workers: parse_limit(&max_control_workers, "max-control-workers")?,
+            },
         })
     }
+}
+
+fn parse_limit(value: &OsStr, name: &str) -> Result<usize, String> {
+    value
+        .to_str()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|limit| (1..=Semaphore::MAX_PERMITS).contains(limit))
+        .ok_or_else(|| {
+            format!(
+                "{name} must be a positive integer no greater than {}",
+                Semaphore::MAX_PERMITS
+            )
+        })
 }
 
 fn validate_workload_id(workload_id: &str) -> Result<(), String> {
@@ -468,6 +589,8 @@ fn print_help() {
            --workload-id ID        Explicit logical production Workload [env PHXP_WORKLOAD_ID]\n\
            --role NAME             Registered TLS role [env PHXP_ROLE, default https]\n\
            --handoff-socket PATH   Override derived PHXP endpoint [env PHXP_HANDOFF_SOCKET]\n\
+           --max-connections N    Shared connection limit [env PHXP_MAX_CONNECTIONS, default 128]\n\
+           --max-control-workers N PHXP negotiation limit [env PHXP_MAX_CONTROL_WORKERS, default 16]\n\
            -h, --help              Show this help"
     );
 }
@@ -476,9 +599,108 @@ fn print_help() {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn localhost(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    fn unused_tls_acceptor() -> TlsAcceptor {
+        TlsAcceptor::from(Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(
+                    tokio_rustls::rustls::server::ResolvesServerCertUsingSni::new(),
+                )),
+        ))
+    }
+
+    #[test]
+    fn connection_limits_reject_zero_invalid_and_non_unicode_values() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(parse_limit(OsStr::new("2"), "limit").unwrap(), 2);
+        for value in [
+            OsStr::new("0"),
+            OsStr::new(""),
+            OsStr::new("-1"),
+            OsStr::new("invalid"),
+            OsStr::new("18446744073709551616"),
+            OsStr::from_bytes(b"\xff"),
+        ] {
+            assert!(parse_limit(value, "limit").is_err(), "{value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_and_unpolled_adoptions_release_ids_and_permits_when_dropped() {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        for queued in [true, false] {
+            let listener = std::net::TcpListener::bind(localhost(0)).unwrap();
+            let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            let admission = Arc::new(Semaphore::new(1));
+            let ids = Arc::new(Mutex::new(HashSet::from([[1; 16]])));
+            let conn = handoff::AdoptedConn {
+                stream,
+                peer: None,
+                local: None,
+                sni: "localhost".into(),
+                peeked: 0,
+                active_id: handoff::ActiveIdGuard::new([1; 16], Arc::clone(&ids)),
+                permit: Arc::clone(&admission).try_acquire_owned().unwrap(),
+            };
+            if queued {
+                let (sender, receiver) = tokio::sync::mpsc::channel(1);
+                assert!(sender.try_send(conn).is_ok());
+                drop(receiver);
+            } else {
+                drop(serve_adopted(conn, build_app(), unused_tls_acceptor()));
+            }
+            assert_eq!(admission.available_permits(), 1);
+            assert!(ids.lock().unwrap().is_empty());
+            client.set_nonblocking(true).unwrap();
+            assert_eq!(std::io::Read::read(&mut &client, &mut [0]).unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_task_panic_stops_the_server_and_cleans_up() {
+        async fn fail_connection() -> &'static str {
+            panic!("injected connection task failure");
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = directory.path().join("handoff").join("receiver.sock");
+        let http = TcpListener::bind(localhost(0)).await.unwrap();
+        let address = http.local_addr().unwrap();
+        let server = Server {
+            http,
+            https: TcpListener::bind(localhost(0)).await.unwrap(),
+            handoff: handoff::HandoffListener::bind(&endpoint, false).unwrap(),
+            app: Router::new().fallback(fail_connection),
+            tls: unused_tls_acceptor(),
+            limits: AdmissionLimits {
+                max_connections: 2,
+                max_control_workers: 1,
+            },
+        };
+        let worker = tokio::spawn(server.serve(std::future::pending()));
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err(), "connection task panicked");
+        assert!(!endpoint.exists());
+        assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
     }
 
     #[test]
