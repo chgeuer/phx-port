@@ -3979,6 +3979,7 @@ async fn prepare_handoff(
         }
     };
     let queued = QueuedConnection::new(Arc::clone(&state.queued_connections));
+    let (caller, _cancel_on_drop) = oneshot::channel::<()>();
     // Cancellation may detach blocking work, so the closure owns the socket through the
     // irreversible PHXP outcome; only an awaited pre-delivery failure can return it for relay.
     tokio::task::spawn_blocking(move || {
@@ -3997,13 +3998,17 @@ async fn prepare_handoff(
             .client
             .set_read_timeout(None)
             .map_err(|error| format!("cannot clear accepted client timeout: {error}"))?;
-        perform_handoff(handoff, &state)
+        perform_handoff(handoff, &state, &|| caller.is_closed())
     })
     .await
     .map_err(|error| format!("blocking PHXP task failed: {error}"))?
 }
 
-fn perform_handoff(handoff: HandoffJob, state: &ProxyState) -> Result<Option<RelayJob>, String> {
+fn perform_handoff(
+    handoff: HandoffJob,
+    state: &ProxyState,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<RelayJob>, String> {
     let HandoffJob {
         mut client,
         accepted_at,
@@ -4039,6 +4044,7 @@ fn perform_handoff(handoff: HandoffJob, state: &ProxyState) -> Result<Option<Rel
                 peeked_length,
                 connection_id,
                 accepted_at_ns,
+                cancelled,
             ) {
                 handoff::Outcome::Transferred => {
                     state.successful_handoffs.fetch_add(1, Ordering::Relaxed);
@@ -5702,6 +5708,10 @@ mod tests {
     use super::{
         HandoffJob, IngressLimits, SystemCapacity, drain_connection_tasks, prepare_handoff,
     };
+    #[cfg(target_os = "macos")]
+    use super::{HandoffJob, prepare_handoff};
+    #[cfg(target_os = "macos")]
+    use crate::handoff;
     use crate::{
         admission::AdmissionRejection,
         ingress_config::{
@@ -7268,6 +7278,271 @@ mod tests {
         assert_eq!(admission.global.in_use, 0);
         assert_eq!(admission.pre_routing.in_use, 0);
         assert_eq!(admission.handoff.in_use, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn darwin_handoff_fixture<T>(
+        receiver: &handoff::darwin_tests::Receiver<T>,
+    ) -> (Arc<ProxyState>, HandoffJob, TcpStream) {
+        let state = Arc::new(ProxyState::new_with_profile_connector_and_runtime(
+            receiver.directory.path().join("ports.toml"),
+            HostingProfile::Development,
+            TlsConnector::new().unwrap(),
+            receiver.directory.path().to_path_buf(),
+        ));
+        let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = TcpStream::connect(frontend.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let (client, source) = frontend.accept().unwrap();
+        let handoff = HandoffJob {
+            client,
+            accepted_at: Instant::now(),
+            admission: state.admission.try_admit(source.ip()).unwrap(),
+            hostname: "deadline.example.test".to_string(),
+            peeked_length: 0,
+            backend: Backend {
+                project: handoff::darwin_tests::WORKLOAD.to_string(),
+                role: "https".to_string(),
+                port: 1,
+            },
+            cached_route: None,
+            relay_idle_timeout: None,
+        };
+        (state, handoff, peer)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn wait_for_darwin_handoff_release(state: &ProxyState) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let admission = state.admission.snapshot();
+                if admission.global.in_use == 0
+                    && admission.pre_routing.in_use == 0
+                    && admission.handoff.in_use == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("Darwin PHXP worker retained admission");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_cancelled_handoff_releases_capacity_before_delivery() {
+        let (observed, waiting) = oneshot::channel();
+        let receiver = handoff::darwin_tests::Receiver::start(move |mut control| {
+            observed.send(()).unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(control.read(&mut byte).unwrap(), 0);
+        });
+        let (state, handoff, _peer) = darwin_handoff_fixture(&receiver);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        let elapsed = runtime.block_on(async {
+            let task = tokio::spawn(prepare_handoff(handoff, Arc::clone(&state)));
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.admission.snapshot().handoff.in_use, 1);
+            let cancelled_at = Instant::now();
+            task.abort();
+            assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+            wait_for_darwin_handoff_release(&state).await;
+            cancelled_at.elapsed()
+        });
+        receiver.finish();
+        eprintln!("Darwin pre-delivery cancellation released admission in {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "cancelled caller retained a blocking PHXP worker: {elapsed:?}"
+        );
+        assert_eq!(state.successful_handoffs.load(Ordering::Acquire), 0);
+        assert_eq!(state.relayed_connections.load(Ordering::Acquire), 0);
+        assert_eq!(state.queued_connections.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_handoff_deadline_before_delivery_returns_only_safe_fallback() {
+        use crate::handoff_protocol::{Message, encode};
+        let receiver = handoff::darwin_tests::Receiver::start(|mut control| {
+            handoff::darwin_tests::write_fragmented(
+                &mut control,
+                &encode(&Message::Ready).unwrap(),
+                Duration::from_millis(40),
+            )
+        });
+        let (state, handoff, mut peer) = darwin_handoff_fixture(&receiver);
+        peer.write_all(b"client hello").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let mut relay = runtime
+            .block_on(prepare_handoff(handoff, Arc::clone(&state)))
+            .unwrap()
+            .expect("pre-delivery deadline must preserve safe fallback");
+        let elapsed = started.elapsed();
+        let written = receiver.finish();
+        assert!(elapsed < Duration::from_millis(1350), "{elapsed:?}");
+        assert!((10..40).contains(&written));
+        assert_eq!(state.admission.snapshot().handoff.in_use, 0);
+        assert_eq!(state.admission.snapshot().global.in_use, 1);
+        let mut hello = [0_u8; 12];
+        relay.client.read_exact(&mut hello).unwrap();
+        assert_eq!(&hello, b"client hello");
+        drop(relay);
+        runtime.block_on(wait_for_darwin_handoff_release(&state));
+        assert_eq!(state.handoff_fallbacks.load(Ordering::Acquire), 1);
+        assert_eq!(state.delivered_handoff_failures.load(Ordering::Acquire), 0);
+        assert_eq!(state.relayed_connections.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_handoff_post_delivery_failures_never_return_a_relay() {
+        use crate::handoff_protocol::{Message, encode};
+        use handoff::darwin_tests::{Receiver, receive_descriptor, write_fragmented};
+        for failure in ["deadline", "rejected", "malformed", "eof"] {
+            let receiver = Receiver::start(move |mut control| {
+                let ready = encode(&Message::Ready).unwrap();
+                let delay = if failure == "deadline" {
+                    Duration::from_millis(20)
+                } else {
+                    Duration::ZERO
+                };
+                assert_eq!(write_fragmented(&mut control, &ready, delay), ready.len());
+                let (client, connection_id) = receive_descriptor(&mut control);
+                match failure {
+                    "deadline" => {
+                        let written = write_fragmented(
+                            &mut control,
+                            &encode(&Message::Adopted { connection_id }).unwrap(),
+                            delay,
+                        );
+                        assert!(written > 0 && written < 40);
+                    }
+                    "rejected" => {
+                        control
+                            .write_all(
+                                &encode(&Message::Rejected {
+                                    connection_id,
+                                    reason_code: 1,
+                                })
+                                .unwrap(),
+                            )
+                            .unwrap();
+                    }
+                    "malformed" => {
+                        let mut response = encode(&Message::Adopted { connection_id }).unwrap();
+                        response[0] = b'X';
+                        control.write_all(&response).unwrap();
+                    }
+                    "eof" => {
+                        let response = encode(&Message::Adopted { connection_id }).unwrap();
+                        control.write_all(&response[..20]).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                client
+            });
+            let (state, handoff, mut peer) = darwin_handoff_fixture(&receiver);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .enable_time()
+                .build()
+                .unwrap();
+            let started = Instant::now();
+            let outcome = runtime.block_on(prepare_handoff(handoff, Arc::clone(&state)));
+            let elapsed = started.elapsed();
+            let mut received = receiver.finish();
+            assert!(
+                matches!(outcome, Err(error) if error.contains("descriptor")),
+                "{failure} reversed PHXP ownership"
+            );
+            assert!(
+                elapsed < Duration::from_millis(1350),
+                "{failure}: {elapsed:?}"
+            );
+            runtime.block_on(wait_for_darwin_handoff_release(&state));
+            assert_eq!(
+                state.delivered_handoff_failures.load(Ordering::Acquire),
+                1,
+                "{failure}"
+            );
+            assert_eq!(
+                state.handoff_fallbacks.load(Ordering::Acquire),
+                0,
+                "{failure}"
+            );
+            assert_eq!(
+                state.relayed_connections.load(Ordering::Acquire),
+                0,
+                "{failure}"
+            );
+            received.write_all(b"owned").unwrap();
+            let mut reply = [0_u8; 5];
+            peer.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"owned");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_cancelled_handoff_after_delivery_preserves_ownership() {
+        use crate::handoff_protocol::{Message, encode};
+        let (observed, waiting) = oneshot::channel();
+        let (acknowledge, wait_for_acknowledgement) = mpsc::sync_channel(1);
+        let receiver = handoff::darwin_tests::Receiver::start(move |mut control| {
+            control
+                .write_all(&encode(&Message::Ready).unwrap())
+                .unwrap();
+            let (client, connection_id) = handoff::darwin_tests::receive_descriptor(&mut control);
+            observed.send(()).unwrap();
+            wait_for_acknowledgement
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            control
+                .write_all(&encode(&Message::Adopted { connection_id }).unwrap())
+                .unwrap();
+            client
+        });
+        let (state, handoff, mut peer) = darwin_handoff_fixture(&receiver);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let task = tokio::spawn(prepare_handoff(handoff, Arc::clone(&state)));
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+            task.abort();
+            assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(state.admission.snapshot().handoff.in_use, 1);
+            acknowledge.send(()).unwrap();
+            wait_for_darwin_handoff_release(&state).await;
+        });
+        let mut received = receiver.finish();
+        assert_eq!(state.successful_handoffs.load(Ordering::Acquire), 1);
+        assert_eq!(state.handoff_fallbacks.load(Ordering::Acquire), 0);
+        assert_eq!(state.relayed_connections.load(Ordering::Acquire), 0);
+        received.write_all(b"owned").unwrap();
+        let mut reply = [0_u8; 5];
+        peer.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"owned");
     }
 
     #[cfg(target_os = "linux")]

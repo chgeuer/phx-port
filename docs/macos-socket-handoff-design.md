@@ -198,6 +198,38 @@ daemon                                      receiver
 There is no pipelining and no second handoff on the same control connection.
 This constraint makes stream framing deterministic and bounds all buffering.
 
+### Sender exchange deadline and cancellation
+
+The Darwin sender uses one **one-second absolute deadline**, starting before
+connection establishment, for connect, HELLO, fragmented READY, the initial
+descriptor-bearing send, any remaining HANDOFF bytes, and fragmented ADOPTED.
+Progress does not refresh the budget. The shared bounded Unix connector is
+unchanged; after connecting, the control stream uses nonblocking I/O and
+readiness waits capped at 25 ms and the remaining exchange budget.
+
+Dropping the awaiting ingress task cancels a pre-delivery exchange. Cancellation
+is checked before connecting, after connecting, and between control I/O attempts.
+An in-progress connect still uses the shared connector's absolute deadline;
+it does not acquire a fresh timeout or a separate cancellation thread. On an
+awaited pre-delivery failure, the original unconsumed client is available only
+to the existing safe relay path. On caller cancellation the detached worker
+releases its owned socket and admission when it completes.
+
+A positive descriptor-bearing `sendmsg` result is recorded before any later
+deadline or cancellation check, even if the sender is descheduled across the
+deadline immediately after the syscall. It disables caller cancellation for
+the remaining exchange. Remaining-frame and acknowledgement failures are
+always post-delivery failures, never relay fallback. The inert sender
+descriptor is retained until that bounded outcome, without `shutdown`.
+
+Darwin regression coverage is in `src/handoff_darwin_tests.rs`, the Darwin
+platform tests in `src/handoff.rs`, and the handoff dispatcher tests in
+`src/proxy.rs` (`cargo test --locked --bin phx-port handoff`). These exercise
+real local stream sockets and descriptor delivery, including fragmented
+deadline expiry, backpressure, cancellation and admission release, and the
+no-relay boundary. They do not replace the full framework/daemon end-to-end
+qualification listed above.
+
 ### Frame format
 
 The existing PHXP v1 envelope remains the frame:

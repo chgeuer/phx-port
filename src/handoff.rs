@@ -18,6 +18,10 @@ pub enum Outcome {
     Delivered(String),
 }
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "handoff_darwin_tests.rs"]
+pub(crate) mod darwin_tests;
+
 #[derive(Clone, Copy)]
 pub enum EndpointIdentity<'a> {
     Development(&'a str),
@@ -35,6 +39,7 @@ pub fn try_transfer(
     peeked_length: usize,
     connection_id: [u8; 16],
     accepted_at_ns: u64,
+    cancelled: &dyn Fn() -> bool,
 ) -> Outcome {
     let path = match endpoint_path(identity, role, runtime_override) {
         Ok(path) => path,
@@ -47,6 +52,7 @@ pub fn try_transfer(
         peeked_length,
         connection_id,
         accepted_at_ns,
+        cancelled,
     )
 }
 
@@ -60,6 +66,7 @@ pub fn try_transfer(
     _peeked_length: usize,
     _connection_id: [u8; 16],
     _accepted_at_ns: u64,
+    _cancelled: &dyn Fn() -> bool,
 ) -> Outcome {
     Outcome::Unavailable(client)
 }
@@ -205,6 +212,7 @@ mod platform {
         peeked_length: usize,
         connection_id: [u8; 16],
         accepted_at_ns: u64,
+        _cancelled: &dyn Fn() -> bool,
     ) -> Outcome {
         let socket = match connect_endpoint(path) {
             Ok(socket) => socket,
@@ -492,6 +500,7 @@ mod platform {
                     12,
                     connection_id,
                     42,
+                    &|| false,
                 ),
                 Outcome::Transferred
             ));
@@ -506,17 +515,83 @@ mod platform {
     use super::{Outcome, TcpStream};
     use crate::handoff_protocol::{self, Handoff, Message};
     use crate::handoff_stream::read_frame;
+    use nix::errno::Errno;
     use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    use nix::poll::{PollFd, PollFlags, poll};
     use nix::sys::socket::{
         AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr, sendmsg, socket,
     };
-    use std::io::{IoSlice, Write};
+    use std::io::{self, IoSlice, Read, Write};
     use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+    const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+    struct ControlExchange<'a> {
+        stream: UnixStream,
+        deadline: Instant,
+        cancelled: Option<&'a dyn Fn() -> bool>,
+    }
+
+    impl ControlExchange<'_> {
+        fn remaining(&self) -> io::Result<Duration> {
+            if self.cancelled.is_some_and(|cancelled| cancelled()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "PHXP caller cancelled before descriptor delivery",
+                ));
+            }
+            self.deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::TimedOut, "PHXP exchange deadline elapsed")
+                })
+        }
+
+        fn io<T>(
+            &self,
+            interest: PollFlags,
+            mut operation: impl FnMut(&UnixStream) -> io::Result<T>,
+        ) -> io::Result<T> {
+            loop {
+                self.remaining()?;
+                match operation(&self.stream) {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    // Never replace a successful syscall result with a later deadline or
+                    // cancellation error: a positive sendmsg has already delivered SCM_RIGHTS.
+                    result => return result,
+                }
+                let wait = self.remaining()?.min(CANCELLATION_POLL_INTERVAL);
+                let timeout_ms = wait.as_millis().clamp(1, u16::MAX as u128) as u16;
+                let mut fds = [PollFd::new(self.stream.as_fd(), interest)];
+                match poll(&mut fds, timeout_ms) {
+                    Ok(_) | Err(Errno::EINTR) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
+
+    impl Read for ControlExchange<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.io(PollFlags::POLLIN, |mut stream| stream.read(buffer))
+        }
+    }
+
+    impl Write for ControlExchange<'_> {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.io(PollFlags::POLLOUT, |mut stream| stream.write(buffer))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
 
     pub(super) fn try_transfer_to_endpoint(
         client: TcpStream,
@@ -525,10 +600,20 @@ mod platform {
         peeked_length: usize,
         connection_id: [u8; 16],
         accepted_at_ns: u64,
+        cancelled: &dyn Fn() -> bool,
     ) -> Outcome {
-        let mut control = match connect_endpoint(path) {
+        let deadline = Instant::now() + CONTROL_TIMEOUT;
+        if cancelled() {
+            return Outcome::Unavailable(client);
+        }
+        let stream = match connect_endpoint(path, deadline) {
             Ok(control) => control,
             Err(_) => return Outcome::Unavailable(client),
+        };
+        let mut control = ControlExchange {
+            stream,
+            deadline,
+            cancelled: Some(cancelled),
         };
         if capability_handshake(&mut control).is_err() {
             return Outcome::Unavailable(client);
@@ -549,22 +634,35 @@ mod platform {
         let descriptor = [client.as_raw_fd()];
         let ancillary = [ControlMessage::ScmRights(&descriptor)];
         let sent = match classify_initial_send(
-            sendmsg::<UnixAddr>(
-                control.as_raw_fd(),
-                &[IoSlice::new(&packet)],
-                &ancillary,
-                MsgFlags::empty(),
-                None,
-            )
-            .map_err(|error| format!("cannot send client descriptor: {error}")),
+            control
+                .io(PollFlags::POLLOUT, |stream| {
+                    sendmsg::<UnixAddr>(
+                        stream.as_raw_fd(),
+                        &[IoSlice::new(&packet)],
+                        &ancillary,
+                        MsgFlags::empty(),
+                        None,
+                    )
+                    .map_err(io::Error::from)
+                })
+                .map_err(|error| format!("cannot send client descriptor: {error}")),
         ) {
             Ok(sent) => sent,
             Err(_) => return Outcome::Unavailable(client),
         };
 
-        if sent < packet.len()
-            && let Err(error) = control.write_all(&packet[sent..])
-        {
+        finish_delivery(client, control, &packet[sent..], connection_id)
+    }
+
+    fn finish_delivery(
+        client: TcpStream,
+        mut control: ControlExchange<'_>,
+        remaining_frame: &[u8],
+        connection_id: [u8; 16],
+    ) -> Outcome {
+        // Ownership is irreversible even if the deadline or caller expires as sendmsg returns.
+        control.cancelled = None;
+        if let Err(error) = control.write_all(remaining_frame) {
             return Outcome::Delivered(format!(
                 "client descriptor was transferred but the remaining PHXP frame failed: {error}"
             ));
@@ -578,11 +676,16 @@ mod platform {
                 ));
             }
         };
+        if let Err(error) = control.remaining() {
+            return Outcome::Delivered(format!(
+                "client descriptor was transferred but acknowledgement failed: {error}"
+            ));
+        }
         drop(client);
         validate_response(&response, connection_id)
     }
 
-    fn connect_endpoint(path: &Path) -> Result<UnixStream, String> {
+    fn connect_endpoint(path: &Path, deadline: Instant) -> Result<UnixStream, String> {
         let address = UnixAddr::new(path)
             .map_err(|error| format!("invalid handoff endpoint {}: {error}", path.display()))?;
         let socket = socket(
@@ -594,20 +697,13 @@ mod platform {
         .map_err(|error| format!("cannot create handoff socket: {error}"))?;
         set_cloexec(&socket)?;
         set_no_sigpipe(&socket)?;
-        crate::unix_socket::connect_until(
-            &socket,
-            &address,
-            std::time::Instant::now() + CONTROL_TIMEOUT,
-        )
-        .map_err(|error| format!("cannot connect to handoff endpoint: {error}"))?;
+        crate::unix_socket::connect_until(&socket, &address, deadline)
+            .map_err(|error| format!("cannot connect to handoff endpoint: {error}"))?;
 
         let stream = UnixStream::from(socket);
         stream
-            .set_read_timeout(Some(CONTROL_TIMEOUT))
-            .map_err(|error| format!("cannot configure handoff receive timeout: {error}"))?;
-        stream
-            .set_write_timeout(Some(CONTROL_TIMEOUT))
-            .map_err(|error| format!("cannot configure handoff send timeout: {error}"))?;
+            .set_nonblocking(true)
+            .map_err(|error| format!("cannot configure nonblocking handoff control: {error}"))?;
         let (peer_euid, _) = nix::unistd::getpeereid(&stream)
             .map_err(|error| format!("cannot inspect handoff peer credentials: {error}"))?;
         if peer_euid != nix::unistd::geteuid() {
@@ -616,7 +712,7 @@ mod platform {
         Ok(stream)
     }
 
-    fn capability_handshake(control: &mut UnixStream) -> Result<(), String> {
+    fn capability_handshake(control: &mut ControlExchange<'_>) -> Result<(), String> {
         let hello = handoff_protocol::encode(&Message::Hello)?;
         control
             .write_all(&hello)
@@ -683,26 +779,29 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::{
-            Outcome, classify_initial_send, set_cloexec, set_no_sigpipe, try_transfer_to_endpoint,
+            ControlExchange, Outcome, classify_initial_send, finish_delivery, set_cloexec,
+            set_no_sigpipe, try_transfer_to_endpoint,
         };
         use crate::handoff::{
             EndpointIdentity, endpoint_hash, endpoint_path, endpoint_path_in, try_transfer,
         };
-        use crate::handoff_protocol::{MAX_PACKET_LENGTH, Message, decode, encode};
+        use crate::handoff_protocol::{Handoff, MAX_PACKET_LENGTH, Message, decode, encode};
         use crate::handoff_stream::{complete_frame, read_frame};
         use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+        use nix::poll::PollFlags;
         use nix::sys::socket::{
-            AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr,
-            accept, bind, listen, recvmsg, socket,
+            AddressFamily, Backlog, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag,
+            SockType, UnixAddr, accept, bind, listen, recvmsg, sendmsg, socket,
         };
-        use std::io::{IoSliceMut, Read, Write};
+        use std::cell::Cell;
+        use std::io::{IoSlice, IoSliceMut, Read, Write};
         use std::net::{TcpListener, TcpStream};
         use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::net::UnixStream;
         use std::path::Path;
         use std::sync::mpsc;
         use std::thread;
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
         use tempfile::tempdir_in;
 
         #[test]
@@ -720,6 +819,108 @@ mod platform {
             assert!(classify_initial_send(Err("failed".to_string())).is_err());
             assert!(classify_initial_send(Ok(0)).is_err());
             assert_eq!(classify_initial_send(Ok(1)).unwrap(), 1);
+        }
+
+        #[test]
+        fn positive_descriptor_send_survives_immediate_deadline_and_cancellation() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let (client, _) = listener.accept().unwrap();
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            sender.set_nonblocking(true).unwrap();
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let cancelled = Cell::new(false);
+            let is_cancelled = || cancelled.get();
+            let deadline = Instant::now() + Duration::from_millis(100);
+            let control = ControlExchange {
+                stream: sender,
+                deadline,
+                cancelled: Some(&is_cancelled),
+            };
+            let packet = encode(&Message::Handoff(Handoff {
+                connection_id: [0xD4; 16],
+                peeked_length: 0,
+                accepted_at_ns: 0,
+                requested_sni: "deadline.example.test".to_string(),
+            }))
+            .unwrap();
+            let sent = control.io(PollFlags::POLLOUT, |stream| {
+                let result = sendmsg::<UnixAddr>(
+                    stream.as_raw_fd(),
+                    &[IoSlice::new(&packet[..1])],
+                    &[ControlMessage::ScmRights(&[client.as_raw_fd()])],
+                    MsgFlags::empty(),
+                    None,
+                )
+                .map_err(std::io::Error::from);
+                // Model descheduling immediately after the real descriptor-bearing syscall.
+                cancelled.set(true);
+                thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(10),
+                );
+                result
+            });
+            let sent = classify_initial_send(sent.map_err(|error| error.to_string())).unwrap();
+            assert_eq!(
+                sent, 1,
+                "a delivered descriptor was masked by a later error"
+            );
+            let outcome = finish_delivery(client, control, &packet[sent..], [0xD4; 16]);
+            assert!(
+                matches!(outcome, Outcome::Delivered(error) if error.contains("remaining PHXP frame"))
+            );
+
+            let mut byte = [0_u8; 1];
+            let mut ancillary = nix::cmsg_space!([i32; 2]);
+            let mut iov = [IoSliceMut::new(&mut byte)];
+            let message = recvmsg::<UnixAddr>(
+                receiver.as_raw_fd(),
+                &mut iov,
+                Some(&mut ancillary),
+                MsgFlags::empty(),
+            )
+            .unwrap();
+            assert_eq!(message.bytes, 1);
+            assert!(
+                !message
+                    .flags
+                    .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC)
+            );
+            let mut descriptors = message
+                .cmsgs()
+                .unwrap()
+                .flat_map(|control| match control {
+                    ControlMessageOwned::ScmRights(descriptors) => descriptors,
+                    _ => Vec::new(),
+                })
+                .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+                .collect::<Vec<_>>();
+            assert_eq!(descriptors.len(), 1);
+            let mut received = TcpStream::from(descriptors.pop().unwrap());
+            received.write_all(b"owned").unwrap();
+            let mut reply = [0_u8; 5];
+            peer.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"owned");
+        }
+
+        #[test]
+        fn control_writes_cannot_outlive_the_exchange_deadline() {
+            let (sender, _receiver) = UnixStream::pair().unwrap();
+            sender.set_nonblocking(true).unwrap();
+            nix::sys::socket::setsockopt(&sender, nix::sys::socket::sockopt::SndBuf, &2048)
+                .unwrap();
+            let started = Instant::now();
+            let mut control = ControlExchange {
+                stream: sender,
+                deadline: started + Duration::from_millis(100),
+                cancelled: None,
+            };
+            let error = control.write_all(&[0_u8; 64 * 1024]).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(started.elapsed() < Duration::from_millis(350));
         }
 
         #[test]
@@ -835,6 +1036,7 @@ mod platform {
                     12,
                     connection_id,
                     42,
+                    &|| false,
                 ),
                 Outcome::Transferred
             ));
@@ -932,6 +1134,7 @@ mod platform {
                     0,
                     connection_id,
                     42,
+                    &|| false,
                 )
             });
 
