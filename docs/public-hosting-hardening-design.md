@@ -342,6 +342,15 @@ single retry uses a newer valid Verified Route without discovery admission
 when available; otherwise it follows normal bounded rediscovery. Routing
 locks are never held across network I/O.
 
+Public reconciliation collects at most one proof per Route Declaration in a
+bounded pass and publishes changed proofs in one cache transaction. Persisted
+proofs are compared before writing, so unchanged restart proofs do not rewrite
+the cache; unchanged warm refreshes need no cache I/O. Publication rechecks the
+declaration generation, route observation, certificate expiry, and capacity.
+The transaction remains ordered with reload pruning, with disk I/O outside
+routing and profile locks and the private byte limit enforced before atomic
+replacement. Persisted state remains a hint, never certificate authority.
+
 ### Configuration and state
 
 Production configuration should be separated from derived state:

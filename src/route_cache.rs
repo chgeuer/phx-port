@@ -143,28 +143,41 @@ pub fn store(
     role: &str,
     certificate_fingerprint: &str,
 ) -> Result<(), String> {
-    store_until(
+    store_batch_until(
         path,
         storage,
-        hostname,
-        project,
-        role,
-        certificate_fingerprint,
+        &BTreeMap::from([(
+            hostname.to_string(),
+            CachedRoute {
+                project: project.to_string(),
+                role: role.to_string(),
+                certificate_fingerprint: certificate_fingerprint.to_string(),
+            },
+        )]),
         None,
     )
 }
 
-pub(crate) fn store_until(
+pub(crate) fn store_batch_until(
     path: &Path,
     storage: Storage,
-    hostname: &str,
-    project: &str,
-    role: &str,
-    certificate_fingerprint: &str,
+    updates: &BTreeMap<String, CachedRoute>,
     deadline: Option<port_registry::AccessDeadline<'_>>,
 ) -> Result<(), String> {
-    if storage == Storage::SeparateState {
-        validate_route_fields(hostname, project, role, certificate_fingerprint)?;
+    if updates.len() > MAX_CACHED_ROUTES {
+        return Err(format!(
+            "route publication batch exceeds the limit of {MAX_CACHED_ROUTES}"
+        ));
+    }
+    for (hostname, route) in updates {
+        if storage == Storage::SeparateState {
+            validate_route_fields(
+                hostname,
+                &route.project,
+                &route.role,
+                &route.certificate_fingerprint,
+            )?;
+        }
     }
     let verified_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -173,22 +186,43 @@ pub(crate) fn store_until(
         .try_into()
         .unwrap_or(i64::MAX);
 
-    port_registry::update_until(path, storage.security(), deadline, |document| {
-        discard_invalid_combined_routes(document, storage);
+    port_registry::update_if_changed_until(path, storage.security(), deadline, |document| {
+        let mut changed = discard_invalid_combined_routes(document, storage);
         if !document.contains_table(TABLE) {
             document[TABLE] = toml_edit::table();
+            changed = true;
+        }
+        for (hostname, route) in updates {
+            let existing = document[TABLE]
+                .as_table()
+                .and_then(|routes| routes.get(hostname))
+                .and_then(|route| route.as_table());
+            if existing.is_some_and(|existing| {
+                existing.get("project").and_then(|item| item.as_str()) == Some(&route.project)
+                    && existing.get("role").and_then(|item| item.as_str()) == Some(&route.role)
+                    && existing
+                        .get("certificate_fingerprint")
+                        .and_then(|item| item.as_str())
+                        == Some(&route.certificate_fingerprint)
+            }) {
+                continue;
+            }
+            document[TABLE][hostname] = toml_edit::table();
+            document[TABLE][hostname]["project"] = value(&route.project);
+            document[TABLE][hostname]["role"] = value(&route.role);
+            document[TABLE][hostname]["certificate_fingerprint"] =
+                value(&route.certificate_fingerprint);
+            document[TABLE][hostname]["last_verified_unix"] = value(verified_at);
+            changed = true;
         }
         let routes = document[TABLE]
             .as_table_mut()
             .expect("the discovered route table was just created");
-        let target_len = routes
-            .len()
-            .saturating_add(usize::from(!routes.contains_key(hostname)));
-        let remove_count = target_len.saturating_sub(MAX_CACHED_ROUTES);
+        let remove_count = routes.len().saturating_sub(MAX_CACHED_ROUTES);
         if remove_count > 0 {
             let mut oldest = routes
                 .iter()
-                .filter(|(candidate, _)| *candidate != hostname)
+                .filter(|(candidate, _)| !updates.contains_key(*candidate))
                 .map(|(candidate, item)| {
                     (
                         item.as_table()
@@ -203,13 +237,10 @@ pub(crate) fn store_until(
             for (_, candidate) in oldest.into_iter().take(remove_count) {
                 routes.remove(&candidate);
             }
+            changed = true;
         }
-        document[TABLE][hostname] = toml_edit::table();
-        document[TABLE][hostname]["project"] = value(project);
-        document[TABLE][hostname]["role"] = value(role);
-        document[TABLE][hostname]["certificate_fingerprint"] = value(certificate_fingerprint);
-        document[TABLE][hostname]["last_verified_unix"] = value(verified_at);
-        validate_document(document, storage)
+        validate_document(document, storage)?;
+        Ok(((), changed))
     })
 }
 
@@ -408,9 +439,11 @@ fn validate_route_fields(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CACHED_ROUTES, Storage, load, prepare, remove, remove_for_registration, store,
+        CachedRoute, MAX_CACHED_ROUTES, Storage, TABLE, load, prepare, remove,
+        remove_for_registration, store, store_batch_until,
     };
     use crate::{read_config, update_config};
+    use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -610,5 +643,120 @@ mod tests {
         assert_eq!(routes.len(), MAX_CACHED_ROUTES);
         assert!(!routes.contains_key("host-0.example.com"));
         assert!(routes.contains_key("newest.example.com"));
+    }
+
+    #[test]
+    fn batch_publication_compares_once_and_evicts_only_untouched_routes() {
+        use crate::port_registry::{DerivedIoCounts, take_derived_io_counts};
+
+        let directory = tempdir().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("routes.toml");
+        let route = CachedRoute {
+            project: "web".into(),
+            role: "https".into(),
+            certificate_fingerprint: "AA:BB".into(),
+        };
+        let initial = (0..MAX_CACHED_ROUTES)
+            .map(|index| (format!("host-{index:04}.example.com"), route.clone()))
+            .collect::<BTreeMap<_, _>>();
+        store_batch_until(&path, Storage::SeparateState, &initial, None).unwrap();
+        let before = fs::read(&path).unwrap();
+        take_derived_io_counts();
+        store_batch_until(&path, Storage::SeparateState, &initial, None).unwrap();
+        assert_eq!(
+            take_derived_io_counts(),
+            DerivedIoCounts {
+                reads: 1,
+                ..DerivedIoCounts::default()
+            }
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let mut oversized = initial.clone();
+        oversized.insert("overflow.example.com".into(), route.clone());
+        assert!(
+            store_batch_until(&path, Storage::SeparateState, &oversized, None)
+                .unwrap_err()
+                .contains("batch exceeds")
+        );
+        assert_eq!(take_derived_io_counts(), DerivedIoCounts::default());
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let mut invalid = route.clone();
+        invalid.role = "invalid role".into();
+        assert!(
+            store_batch_until(
+                &path,
+                Storage::SeparateState,
+                &BTreeMap::from([("invalid.example.com".into(), invalid)]),
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(take_derived_io_counts(), DerivedIoCounts::default());
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let updates = BTreeMap::from([
+            ("host-0000.example.com".into(), route.clone()),
+            ("new-a.example.com".into(), route.clone()),
+            ("new-b.example.com".into(), route),
+        ]);
+        store_batch_until(&path, Storage::SeparateState, &updates, None).unwrap();
+        assert_eq!(
+            take_derived_io_counts(),
+            DerivedIoCounts {
+                reads: 1,
+                writes: 1,
+                route_entries_written: MAX_CACHED_ROUTES,
+            }
+        );
+        let document = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let routes = document["discovered_routes"].as_table().unwrap();
+        assert_eq!(routes.len(), MAX_CACHED_ROUTES);
+        for hostname in updates.keys() {
+            assert!(routes.contains_key(hostname));
+        }
+        assert!(!routes.contains_key("host-0001.example.com"));
+        assert!(!routes.contains_key("host-0002.example.com"));
+    }
+
+    #[test]
+    fn unchanged_batch_still_persists_legacy_port_migration() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ports.toml");
+        fs::write(
+            &path,
+            "[ports]\n\"/project\" = 4401\n\
+             [discovered_routes.\"www.example.com\"]\n\
+             project = \"/project\"\nrole = \"main\"\n\
+             certificate_fingerprint = \"AA:BB\"\nlast_verified_unix = 1\n",
+        )
+        .unwrap();
+        store(
+            &path,
+            Storage::CombinedRegistry,
+            "www.example.com",
+            "/project",
+            "main",
+            "AA:BB",
+        )
+        .unwrap();
+        let document = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            document["ports"]["/project"]["main"].as_integer(),
+            Some(4401)
+        );
+        assert_eq!(
+            document[TABLE]["www.example.com"]["last_verified_unix"].as_integer(),
+            Some(1)
+        );
     }
 }

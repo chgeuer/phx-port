@@ -17,6 +17,30 @@ const LAST_ASSIGNED_PORT: i64 = u16::MAX as i64;
 const MAX_ROLE_LENGTH: usize = 128;
 const MAX_PRIVATE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DerivedIoCounts {
+    pub reads: usize,
+    pub writes: usize,
+    pub route_entries_written: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DERIVED_IO_COUNTS: std::cell::Cell<DerivedIoCounts> = const {
+        std::cell::Cell::new(DerivedIoCounts {
+            reads: 0,
+            writes: 0,
+            route_entries_written: 0,
+        })
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn take_derived_io_counts() -> DerivedIoCounts {
+    DERIVED_IO_COUNTS.with(std::cell::Cell::take)
+}
+
 pub type LogicalAssignments = BTreeMap<(String, String), u16>;
 
 #[derive(Clone, Copy)]
@@ -180,6 +204,17 @@ pub(crate) fn update_until<R>(
     deadline: Option<AccessDeadline<'_>>,
     update: impl FnOnce(&mut DocumentMut) -> Result<R, String>,
 ) -> Result<R, String> {
+    update_if_changed_until(path, security, deadline, |document| {
+        update(document).map(|result| (result, true))
+    })
+}
+
+pub(crate) fn update_if_changed_until<R>(
+    path: &Path,
+    security: RegistrySecurity,
+    deadline: Option<AccessDeadline<'_>>,
+    update: impl FnOnce(&mut DocumentMut) -> Result<(R, bool), String>,
+) -> Result<R, String> {
     if let Some(deadline) = deadline {
         deadline.remaining()?;
     }
@@ -188,15 +223,17 @@ pub(crate) fn update_until<R>(
     lock_for_access(&lock, &path, true, deadline)?;
 
     let result = (|| {
-        let mut document = load(&path, security)?;
-        let result = update(&mut document)?;
+        let (mut document, migrated) = load_with_policy(&path, security, false)?;
+        let (result, changed) = update(&mut document)?;
         if security == RegistrySecurity::LogicalWorkload {
             validate_logical_assignments(&document)?;
         }
         if let Some(deadline) = deadline {
             deadline.remaining()?;
         }
-        write_atomic(&path, &document, security)?;
+        if changed || migrated {
+            write_atomic(&path, &document, security)?;
+        }
         Ok(result)
     })();
     unlock(lock, &path, result)
@@ -570,6 +607,14 @@ fn load_with_policy(
     security: RegistrySecurity,
     require_existing: bool,
 ) -> Result<(DocumentMut, bool), String> {
+    #[cfg(test)]
+    if security == RegistrySecurity::DerivedState {
+        DERIVED_IO_COUNTS.with(|counts| {
+            let mut count = counts.get();
+            count.reads += 1;
+            counts.set(count);
+        });
+    }
     let mut document = match read_content(path, security)? {
         Some(content) => content
             .parse::<DocumentMut>()
@@ -859,6 +904,18 @@ fn write_atomic(
             )
         })?;
         validate_private_file(&file, path, kind)?;
+    }
+    #[cfg(test)]
+    if security == RegistrySecurity::DerivedState {
+        DERIVED_IO_COUNTS.with(|counts| {
+            let mut count = counts.get();
+            count.writes += 1;
+            count.route_entries_written += document
+                .get("discovered_routes")
+                .and_then(|routes| routes.as_table())
+                .map_or(0, toml_edit::Table::len);
+            counts.set(count);
+        });
     }
     Ok(())
 }

@@ -292,6 +292,21 @@ struct ProbeMatch {
     certificate: CertificateProof,
 }
 
+struct PendingRoute {
+    hostname: String,
+    matched: ProbeMatch,
+    declaration_generation: Option<u64>,
+    observed: Option<Option<ActiveRoute>>,
+}
+
+struct PreparedRoute {
+    pending: PendingRoute,
+    same_certificate: bool,
+    rotated: bool,
+    last_expiry_warning: Option<CertificateExpiryState>,
+    warning_to_emit: Option<CertificateExpiryState>,
+}
+
 #[derive(Clone, Debug)]
 struct ActiveRoute {
     backend: Backend,
@@ -4748,8 +4763,17 @@ fn reconcile_public_workloads(
     }
     let start = state.reconciliation_cursor.load(Ordering::Relaxed) % declarations.len();
     let mut examined = 0;
-    let launch_deadline = deadline.checked_sub(PROBE_TIMEOUT).unwrap_or(deadline);
-    while examined < declarations.len() && state.check_running_until(launch_deadline).is_ok() {
+    let mut verified = Vec::with_capacity(declarations.len());
+    // Leave part of the pass for one bounded publication after collecting proofs.
+    let publication_budget =
+        (deadline.saturating_duration_since(Instant::now()) / 4).min(DISCOVERY_TIMEOUT);
+    let proof_deadline = deadline.checked_sub(publication_budget).unwrap_or(deadline);
+    let launch_deadline = proof_deadline
+        .checked_sub(PROBE_TIMEOUT)
+        .unwrap_or(proof_deadline);
+    'reconcile: while examined < declarations.len()
+        && state.check_running_until(launch_deadline).is_ok()
+    {
         let mut pending = Vec::with_capacity(MAX_RECONCILIATION_PROBES);
         while examined < declarations.len()
             && pending.len() < MAX_RECONCILIATION_PROBES
@@ -4818,7 +4842,7 @@ fn reconcile_public_workloads(
             let job_backend = desired.clone();
             let connector = state.probe_connector_override.clone();
             let cancelled = Arc::clone(&state.shutdown_requested);
-            let probe_deadline = deadline.min(Instant::now() + PROBE_TIMEOUT);
+            let probe_deadline = proof_deadline.min(Instant::now() + PROBE_TIMEOUT);
             let Some(background_permit) = state.reconciliation_probes.acquire(probe_deadline)
             else {
                 continue;
@@ -4860,14 +4884,50 @@ fn reconcile_public_workloads(
             break;
         }
         for (hostname, backend, active, receiver) in pending {
-            let result = receive_probe_until(receiver, state, deadline);
-            if state.check_running_until(deadline).is_err() {
-                return;
+            let result = receive_probe_until(receiver, state, proof_deadline);
+            if state.check_running_until(proof_deadline).is_err() {
+                break 'reconcile;
             }
-            apply_reconciled_probe(
-                state, snapshot, &hostname, backend, active, result, deadline,
-            );
+            if let Some(pending) =
+                apply_reconciled_probe(state, snapshot, &hostname, backend, active, result)
+            {
+                verified.push(pending);
+            }
         }
+    }
+    if !verified.is_empty() {
+        publish_reconciled_routes(state, verified, deadline);
+    }
+}
+
+fn publish_reconciled_routes(state: &ProxyState, verified: Vec<PendingRoute>, deadline: Instant) {
+    let results = match install_active_routes_until(state, verified, deadline) {
+        Ok(results) => results,
+        Err(_) => {
+            eprintln!("event=route result=activation_failed");
+            return;
+        }
+    };
+    let mut rejected = 0;
+    for result in results {
+        match result {
+            Ok(pending) => {
+                clear_route_failure(state, &pending.hostname);
+                if pending.observed.is_some_and(|observed| observed.is_none()) {
+                    eprintln!(
+                        "event=route result=activated hostname={} workload={} role={} backend_port={}",
+                        pending.hostname,
+                        pending.matched.backend.project,
+                        pending.matched.backend.role,
+                        pending.matched.backend.port
+                    );
+                }
+            }
+            Err(_) => rejected += 1,
+        }
+    }
+    if rejected > 0 {
+        eprintln!("event=route result=activation_rejected count={rejected}");
     }
 }
 
@@ -4894,30 +4954,17 @@ fn apply_reconciled_probe(
     backend: Backend,
     observed: Option<ActiveRoute>,
     result: Result<ReconciledProbe, String>,
-    deadline: Instant,
-) {
+) -> Option<PendingRoute> {
     if let Ok(ReconciledProbe::Certificate(Ok(certificate))) = result {
-        let activated = install_active_route_observed_until(
-            state,
-            hostname,
-            ProbeMatch {
-                backend: backend.clone(),
+        return Some(PendingRoute {
+            hostname: hostname.to_string(),
+            matched: ProbeMatch {
+                backend,
                 certificate,
             },
-            Some(snapshot.generation),
-            deadline.min(Instant::now() + DISCOVERY_TIMEOUT),
-            Some(&observed),
-        );
-        if activated.is_ok() {
-            clear_route_failure(state, hostname);
-            if observed.is_none() {
-                eprintln!(
-                    "event=route result=activated hostname={hostname} workload={} role={} backend_port={}",
-                    backend.project, backend.role, backend.port
-                );
-            }
-        }
-        return;
+            declaration_generation: Some(snapshot.generation),
+            observed: Some(observed),
+        });
     }
     let profile = state
         .hosting_profile
@@ -4927,14 +4974,14 @@ fn apply_reconciled_probe(
         .public_snapshot()
         .is_none_or(|current| current.generation != snapshot.generation)
     {
-        return;
+        return None;
     }
     let mut routes = state
         .routes
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !route_observation_matches(routes.get(hostname), observed.as_ref()) {
-        return;
+        return None;
     }
     match result {
         Ok(ReconciledProbe::Alive) => {
@@ -4973,6 +5020,7 @@ fn apply_reconciled_probe(
         }
         Ok(ReconciledProbe::Certificate(Ok(_))) => unreachable!(),
     }
+    None
 }
 
 fn supports_eager_discovery(backend: &Backend) -> bool {
@@ -5201,32 +5249,101 @@ fn install_active_route_until(
     declaration_generation: Option<u64>,
     deadline: Instant,
 ) -> Result<(), String> {
-    install_active_route_observed_until(
+    install_active_routes_until(
         state,
-        hostname,
-        matched,
-        declaration_generation,
+        vec![PendingRoute {
+            hostname: hostname.to_string(),
+            matched,
+            declaration_generation,
+            observed: None,
+        }],
         deadline,
-        None,
-    )
+    )?
+    .pop()
+    .expect("one route installation returns one result")
+    .map(|_| ())
 }
 
-fn install_active_route_observed_until(
+fn install_active_routes_until(
     state: &ProxyState,
-    hostname: &str,
-    matched: ProbeMatch,
-    declaration_generation: Option<u64>,
+    pending: Vec<PendingRoute>,
     deadline: Instant,
-    observed: Option<&Option<ActiveRoute>>,
-) -> Result<(), String> {
+) -> Result<Vec<Result<PendingRoute, String>>, String> {
+    if pending.len() > MAX_VERIFIED_ROUTES {
+        return Err(format!(
+            "route installation batch exceeds the limit of {MAX_VERIFIED_ROUTES}"
+        ));
+    }
     let _transaction = state.cache_transaction_until(deadline)?;
+    let profile = state.hosting_profile();
+    let routes = state
+        .routes
+        .read()
+        .map_err(|_| "route table lock poisoned".to_string())?;
+    let mut reserved = 0;
+    let prepared = pending
+        .into_iter()
+        .map(|pending| {
+            let new_route = !routes.contains_key(&pending.hostname);
+            let prepared = prepare_active_route(state, &profile, &routes, pending, reserved);
+            if prepared.is_ok() && new_route {
+                reserved += 1;
+            }
+            prepared
+        })
+        .collect::<Vec<_>>();
+    drop(routes);
+    let updates = prepared
+        .iter()
+        .filter_map(|prepared| prepared.as_ref().ok())
+        .filter(|prepared| !prepared.same_certificate)
+        .map(|prepared| {
+            let pending = &prepared.pending;
+            (
+                pending.hostname.clone(),
+                route_cache::CachedRoute {
+                    project: pending.matched.backend.project.clone(),
+                    role: pending.matched.backend.role.clone(),
+                    certificate_fingerprint: pending.matched.certificate.fingerprint.clone(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if !updates.is_empty()
+        && let Some((path, storage)) = state.route_cache_for_profile(&profile)
+    {
+        route_cache::store_batch_until(
+            path,
+            storage,
+            &updates,
+            Some(state.access_deadline(deadline)),
+        )
+        .inspect_err(|_| eprintln!("event=route_state_update result=failed"))?;
+    }
+    Ok(prepared
+        .into_iter()
+        .map(|prepared| {
+            prepared.and_then(|prepared| publish_active_route(state, prepared, deadline))
+        })
+        .collect())
+}
+
+fn prepare_active_route(
+    state: &ProxyState,
+    profile: &HostingProfile,
+    routes: &HashMap<String, ActiveRoute>,
+    pending: PendingRoute,
+    reserved: usize,
+) -> Result<PreparedRoute, String> {
+    let hostname = pending.hostname.as_str();
+    let matched = &pending.matched;
+    let declaration_generation = pending.declaration_generation;
     let now_unix_seconds = current_unix_seconds();
     let expiry_state = matched.certificate.expiry_state_at(now_unix_seconds);
     if expiry_state == CertificateExpiryState::Expired {
         return Err("certificate expired before route activation".to_string());
     }
-    let profile = state.hosting_profile();
-    match (declaration_generation, &profile) {
+    match (declaration_generation, profile) {
         (Some(generation), HostingProfile::Public(snapshot))
             if snapshot.generation == generation =>
         {
@@ -5255,18 +5372,14 @@ fn install_active_route_observed_until(
         }
         (None, HostingProfile::Development) => {}
     }
-    let route_cache = state.route_cache_for_profile(&profile);
-
-    let routes = state
-        .routes
-        .read()
-        .map_err(|_| "route table lock poisoned".to_string())?;
-    if observed
+    if pending
+        .observed
+        .as_ref()
         .is_some_and(|observed| !route_observation_matches(routes.get(hostname), observed.as_ref()))
     {
         return Err("route changed while certificate proof was pending".to_string());
     }
-    if !routes.contains_key(hostname) && routes.len() >= MAX_VERIFIED_ROUTES {
+    if !routes.contains_key(hostname) && routes.len() + reserved >= MAX_VERIFIED_ROUTES {
         let _ = state.route_capacity_rejections.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
@@ -5301,19 +5414,29 @@ fn install_active_route_observed_until(
         (Some(previous), Some(current)) => Some(previous.max(current)),
         (previous, current) => previous.or(current),
     };
-    drop(routes);
-    if !same_certificate && let Some((route_cache_path, route_cache_storage)) = route_cache {
-        route_cache::store_until(
-            route_cache_path,
-            route_cache_storage,
-            hostname,
-            &matched.backend.project,
-            &matched.backend.role,
-            &matched.certificate.fingerprint,
-            Some(state.access_deadline(deadline)),
-        )
-        .inspect_err(|_| eprintln!("event=route_state_update result=failed"))?;
-    }
+    Ok(PreparedRoute {
+        pending,
+        same_certificate,
+        rotated,
+        last_expiry_warning,
+        warning_to_emit,
+    })
+}
+
+fn publish_active_route(
+    state: &ProxyState,
+    prepared: PreparedRoute,
+    deadline: Instant,
+) -> Result<PendingRoute, String> {
+    let PreparedRoute {
+        pending,
+        rotated,
+        last_expiry_warning,
+        warning_to_emit,
+        ..
+    } = prepared;
+    let hostname = pending.hostname.as_str();
+    let matched = &pending.matched;
     state.check_running_until(deadline)?;
     if matched.certificate.expiry_state_at(current_unix_seconds())
         == CertificateExpiryState::Expired
@@ -5324,7 +5447,9 @@ fn install_active_route_observed_until(
         .routes
         .write()
         .map_err(|_| "route table lock poisoned".to_string())?;
-    if observed
+    if pending
+        .observed
+        .as_ref()
         .is_some_and(|observed| !route_observation_matches(routes.get(hostname), observed.as_ref()))
     {
         return Err("route changed while certificate proof was pending".to_string());
@@ -5335,13 +5460,12 @@ fn install_active_route_observed_until(
             backend: matched.backend.clone(),
             certificate: matched.certificate.clone(),
             last_expiry_warning,
-            declaration_generation,
+            declaration_generation: pending.declaration_generation,
             last_tls_check: Instant::now(),
             tcp_failures: 0,
         },
     );
     drop(routes);
-    drop(profile);
 
     if rotated {
         eprintln!(
@@ -5359,7 +5483,7 @@ fn install_active_route_observed_until(
         );
     }
 
-    Ok(())
+    Ok(pending)
 }
 
 fn read_development_registry_until(
@@ -6771,16 +6895,18 @@ mod tests {
             .write()
             .unwrap()
             .insert("www.example.test".into(), refreshed);
-        super::apply_reconciled_probe(
-            &state,
-            &state.public_snapshot().unwrap(),
-            "www.example.test",
-            backend,
-            Some(observed),
-            Ok(super::ReconciledProbe::Certificate(Err(
-                "old probe failed".into()
-            ))),
-            Instant::now() + Duration::from_secs(1),
+        assert!(
+            super::apply_reconciled_probe(
+                &state,
+                &state.public_snapshot().unwrap(),
+                "www.example.test",
+                backend,
+                Some(observed),
+                Ok(super::ReconciledProbe::Certificate(Err(
+                    "old probe failed".into()
+                ))),
+            )
+            .is_none()
         );
         assert_eq!(
             state.routes.read().unwrap()["www.example.test"]
@@ -7019,6 +7145,373 @@ mod tests {
         assert!(status.contains("active_routes=2"), "{status}");
         assert!(status.contains("ready=true"), "{status}");
         assert!(status.contains("degraded_routes=0"), "{status}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciled_cache_publication_is_coalesced_at_route_scale() {
+        use crate::port_registry::{DerivedIoCounts, take_derived_io_counts};
+
+        let hostnames = (0..MAX_ROUTE_DECLARATIONS)
+            .map(|index| format!("route-{index:04}.example.test"))
+            .collect::<Vec<_>>();
+        let names = hostnames.iter().map(String::as_str).collect::<Vec<_>>();
+        let initial = TestCertificate::for_hostnames_valid_for(
+            &names,
+            Duration::from_secs(60 * 24 * 60 * 60),
+        );
+        let rotated = TestCertificate::for_hostnames_valid_for(
+            &names,
+            Duration::from_secs(59 * 24 * 60 * 60),
+        );
+        let backend = TestTlsBackend::start(&initial, b"cache");
+        let directory = tempdir().unwrap();
+        let registry = write_logical_registry(directory.path(), &[("web", backend.port())]);
+        let assignments_before = fs::read(&registry).unwrap();
+        let HostingProfile::Public(mut snapshot) = public_profile(&hostnames[0], "web") else {
+            unreachable!()
+        };
+        let declaration = snapshot.routes.values().next().unwrap().clone();
+        Arc::make_mut(&mut snapshot).routes = hostnames
+            .iter()
+            .map(|hostname| {
+                let mut declaration = declaration.clone();
+                declaration.hostname = hostname.clone();
+                (hostname.clone(), declaration)
+            })
+            .collect();
+        let cache = directory.path().join("routes.toml");
+        let mut state = ProxyState::new_with_production_paths(
+            HostingProfile::Public(snapshot),
+            ProductionPaths {
+                port_registry: registry.clone(),
+                route_cache: cache.clone(),
+                runtime_root: directory.path().join("runtime"),
+            },
+        );
+        state.probe_connector_override =
+            Some(TestCertificate::connector_for(&[&initial, &rotated]));
+
+        let mut measurements = Vec::new();
+        let mut previous_fingerprint = None;
+        for phase in ["cold", "restart", "rotation", "warm"] {
+            match phase {
+                "restart" => state.routes.write().unwrap().clear(),
+                "rotation" => backend.replace_certificate(&rotated),
+                _ => {}
+            }
+            for active in state.routes.write().unwrap().values_mut() {
+                active.last_tls_check = Instant::now() - TLS_REVALIDATION_INTERVAL;
+            }
+            take_derived_io_counts();
+            super::reconcile_workloads_until(&state, Instant::now() + Duration::from_secs(60));
+            let counts = take_derived_io_counts();
+            eprintln!("cache_publication phase={phase} counts={counts:?}");
+            assert_eq!(
+                state.routes.read().unwrap().len(),
+                MAX_ROUTE_DECLARATIONS,
+                "{phase}: every declaration must receive a real certificate proof"
+            );
+            measurements.push((phase, counts));
+            assert_eq!(fs::read(&registry).unwrap(), assignments_before);
+            route_cache::validate(&cache, route_cache::Storage::SeparateState).unwrap();
+            let document = fs::read_to_string(&cache)
+                .unwrap()
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            let active = state.routes.read().unwrap();
+            let fingerprint = &active[&hostnames[0]].certificate.fingerprint;
+            match phase {
+                "rotation" => assert_ne!(previous_fingerprint.as_ref(), Some(fingerprint)),
+                "restart" | "warm" => {
+                    assert_eq!(previous_fingerprint.as_ref(), Some(fingerprint));
+                }
+                _ => {}
+            }
+            for hostname in &hostnames {
+                let route = &active[hostname];
+                assert_eq!(route.declaration_generation, Some(1));
+                assert_eq!(route.backend.project, "web");
+                assert_eq!(route.backend.role, "https");
+                assert_eq!(route.backend.port, backend.port());
+                assert_eq!(&route.certificate.fingerprint, fingerprint);
+                assert_eq!(
+                    document["discovered_routes"][hostname]["certificate_fingerprint"].as_str(),
+                    Some(fingerprint.as_str())
+                );
+            }
+            previous_fingerprint = Some(fingerprint.clone());
+        }
+        assert_eq!(
+            measurements,
+            [
+                (
+                    "cold",
+                    DerivedIoCounts {
+                        reads: 1,
+                        writes: 1,
+                        route_entries_written: MAX_ROUTE_DECLARATIONS,
+                    },
+                ),
+                (
+                    "restart",
+                    DerivedIoCounts {
+                        reads: 1,
+                        ..DerivedIoCounts::default()
+                    },
+                ),
+                (
+                    "rotation",
+                    DerivedIoCounts {
+                        reads: 1,
+                        writes: 1,
+                        route_entries_written: MAX_ROUTE_DECLARATIONS,
+                    },
+                ),
+                ("warm", DerivedIoCounts::default()),
+            ],
+        );
+    }
+
+    #[cfg(unix)]
+    fn cached_public_state(hostnames: &[&str]) -> (TempDir, ProxyState) {
+        let directory = tempdir().unwrap();
+        let registry = write_logical_registry(directory.path(), &[("web", 4401)]);
+        let ingress_config = directory.path().join("ingress.toml");
+        let mut contents = String::from("[ingress]\nmode = \"public\"\n");
+        for hostname in hostnames {
+            contents.push_str(&format!(
+                "[ingress.hosts.\"{hostname}\"]\nworkload = \"web\"\nrole = \"https\"\n"
+            ));
+        }
+        fs::write(&ingress_config, contents).unwrap();
+        let profile = HostingProfile::load(Some(ingress_config)).unwrap();
+        let state = ProxyState::new_with_production_paths(
+            profile,
+            ProductionPaths {
+                port_registry: registry,
+                route_cache: directory.path().join("routes.toml"),
+                runtime_root: directory.path().join("runtime"),
+            },
+        );
+        (directory, state)
+    }
+
+    #[cfg(unix)]
+    fn reconciled_proofs(
+        state: &ProxyState,
+        hostnames: &[&str],
+        fingerprint: &str,
+    ) -> Vec<super::PendingRoute> {
+        let snapshot = state.public_snapshot().unwrap();
+        let routes = state.routes.read().unwrap();
+        hostnames
+            .iter()
+            .map(|hostname| {
+                super::apply_reconciled_probe(
+                    state,
+                    &snapshot,
+                    hostname,
+                    Backend {
+                        project: "web".into(),
+                        role: "https".into(),
+                        port: 4401,
+                    },
+                    routes.get(*hostname).cloned(),
+                    Ok(super::ReconciledProbe::Certificate(Ok(CertificateProof {
+                        fingerprint: fingerprint.into(),
+                        not_after_unix_seconds: u64::MAX,
+                    }))),
+                )
+                .expect("a successful reconciliation proof awaits publication")
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciled_cache_batch_rechecks_observations_expiry_and_reload_generation() {
+        use crate::port_registry::{DerivedIoCounts, take_derived_io_counts};
+
+        let hosts = [
+            "fresh.example.com",
+            "stale.example.com",
+            "expired.example.com",
+        ];
+        let (_directory, state) = cached_public_state(&hosts);
+        let install = |pending| {
+            super::install_active_routes_until(
+                &state,
+                pending,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap()
+        };
+        assert!(
+            install(reconciled_proofs(&state, &hosts, "AA"))
+                .iter()
+                .all(Result::is_ok)
+        );
+        let mut pending = reconciled_proofs(&state, &hosts, "BB");
+        pending[2].matched.certificate.not_after_unix_seconds = 0;
+        assert!(
+            install(reconciled_proofs(&state, &[hosts[1]], "CC"))
+                .iter()
+                .all(Result::is_ok)
+        );
+        take_derived_io_counts();
+        let results = install(pending);
+        assert!(results[0].is_ok());
+        assert!(
+            results[1]
+                .as_ref()
+                .is_err_and(|error| error.contains("route changed"))
+        );
+        assert!(
+            results[2]
+                .as_ref()
+                .is_err_and(|error| error.contains("certificate expired"))
+        );
+        assert_eq!(
+            take_derived_io_counts(),
+            DerivedIoCounts {
+                reads: 1,
+                writes: 1,
+                route_entries_written: 3
+            }
+        );
+        let cache = &state.production_paths.as_ref().unwrap().route_cache;
+        for (hostname, fingerprint) in hosts.iter().zip(["BB", "CC", "AA"]) {
+            assert_eq!(
+                state.routes.read().unwrap()[*hostname]
+                    .certificate
+                    .fingerprint,
+                fingerprint
+            );
+            assert_eq!(
+                route_cache::load(cache, hostname, route_cache::Storage::SeparateState)
+                    .unwrap()
+                    .unwrap()
+                    .certificate_fingerprint,
+                fingerprint
+            );
+        }
+
+        let pending = reconciled_proofs(&state, &hosts, "DD");
+        fs::write(
+            &state.public_snapshot().unwrap().ingress_config,
+            "[ingress]\nmode = \"public\"\n[ingress.hosts.\"stale.example.com\"]\nworkload = \"web\"\nrole = \"https\"\n",
+        ).unwrap();
+        assert_eq!(
+            reload_public_profile(&state),
+            super::ConfigReloadOutcome::Accepted(2)
+        );
+        let after_reload = fs::read(cache).unwrap();
+        take_derived_io_counts();
+        assert!(install(pending).iter().all(|result| {
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("generation changed"))
+        }));
+        assert_eq!(take_derived_io_counts(), DerivedIoCounts::default());
+        assert_eq!(fs::read(cache).unwrap(), after_reload);
+        let routes = state.routes.read().unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[hosts[1]].declaration_generation, Some(2));
+        assert_eq!(routes[hosts[1]].certificate.fingerprint, "CC");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciled_cache_batch_byte_limit_failure_publishes_no_active_changes() {
+        use crate::port_registry::take_derived_io_counts;
+
+        let hosts = ["one.example.com", "two.example.com"];
+        let (_directory, state) = cached_public_state(&hosts);
+        let initial = super::install_active_routes_until(
+            &state,
+            reconciled_proofs(&state, &hosts, "AA"),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(initial.iter().all(Result::is_ok));
+        let cache = &state.production_paths.as_ref().unwrap().route_cache;
+        let mut contents = fs::read_to_string(cache).unwrap();
+        let padding = 4 * 1024 * 1024 - contents.len() - 2;
+        contents.push('#');
+        contents.push_str(&"x".repeat(padding));
+        contents.push('\n');
+        fs::write(cache, &contents).unwrap();
+        route_cache::validate(cache, route_cache::Storage::SeparateState).unwrap();
+        take_derived_io_counts();
+        let error = super::install_active_routes_until(
+            &state,
+            reconciled_proofs(&state, &hosts, "BB:CC:DD:EE"),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .err()
+        .expect("oversized batch must fail");
+        assert!(error.contains("exceeds the 4194304 byte limit"), "{error}");
+        assert_eq!(take_derived_io_counts().writes, 0);
+        assert!(fs::read_to_string(cache).unwrap() == contents);
+        for hostname in hosts {
+            assert_eq!(
+                state.routes.read().unwrap()[hostname]
+                    .certificate
+                    .fingerprint,
+                "AA"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciled_cache_pass_publishes_proofs_before_its_deadline() {
+        let certificate = TestCertificate::for_hostname("a-ready.example.com");
+        let backend = TestTlsBackend::start(&certificate, b"ready");
+        let (directory, silent, mut state) =
+            silent_public_workloads(super::MAX_RECONCILIATION_PROBES + 1);
+        let registry = write_logical_registry(
+            directory.path(),
+            &[
+                ("silent", silent.local_addr().unwrap().port()),
+                ("web", backend.port()),
+            ],
+        );
+        let HostingProfile::Public(mut snapshot) = state.hosting_profile() else {
+            unreachable!()
+        };
+        let ready = public_profile("a-ready.example.com", "web")
+            .public_snapshot()
+            .unwrap();
+        Arc::make_mut(&mut snapshot)
+            .routes
+            .extend(ready.routes.clone());
+        *state.hosting_profile.write().unwrap() = HostingProfile::Public(snapshot);
+        state.production_paths = Some(ProductionPaths {
+            port_registry: registry,
+            route_cache: directory.path().join("routes.toml"),
+            runtime_root: directory.path().join("runtime"),
+        });
+        state.probe_connector_override = Some(certificate.connector());
+        super::reconcile_workloads_until(&state, Instant::now() + Duration::from_millis(300));
+        assert_eq!(state.routes.read().unwrap().len(), 1);
+        assert!(
+            state
+                .routes
+                .read()
+                .unwrap()
+                .contains_key("a-ready.example.com")
+        );
+        assert!(
+            route_cache::load(
+                &state.production_paths.as_ref().unwrap().route_cache,
+                "a-ready.example.com",
+                route_cache::Storage::SeparateState,
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[cfg(target_os = "linux")]
