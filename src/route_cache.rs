@@ -65,6 +65,7 @@ pub fn prepare(path: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
 pub fn load(path: &Path, hostname: &str, storage: Storage) -> Result<Option<CachedRoute>, String> {
     load_until(path, hostname, storage, None)
 }

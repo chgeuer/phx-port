@@ -16,7 +16,7 @@ use crate::{
     },
     is_port_open, observability, port_registry, privilege,
     production_paths::{IntentOwner, ProductionPaths},
-    read_config, relay, route_cache, tls_client_hello,
+    relay, route_cache, tls_client_hello,
     worker_pool::BoundedWorkerPool,
 };
 use native_tls::TlsConnector;
@@ -970,6 +970,7 @@ impl ProxyState {
         )
     }
 
+    #[cfg(test)]
     fn discover_once(
         &self,
         hostname: &str,
@@ -1617,7 +1618,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
                 let deadline = Instant::now() + RECONCILIATION_PASS_TIMEOUT;
                 reload_public_profile(&state);
                 reconcile_workloads_until(&state, deadline);
-                reconcile_routes(&state);
+                reconcile_routes_until(&state, deadline);
             }
         })
     };
@@ -4229,7 +4230,7 @@ fn resolve_backend_until(
         Some(state.access_deadline(deadline)),
     )?;
     ensure_before_route_deadline(deadline)?;
-    let candidates = candidate_backends_until(&state.config, cached.as_ref(), deadline);
+    let candidates = candidate_backends_until(state, cached.as_ref(), deadline)?;
     observe_workloads(state, &candidates);
     ensure_before_route_deadline(deadline)?;
 
@@ -4402,19 +4403,6 @@ fn load_public_registry_until(
     Ok(assignments)
 }
 
-fn discover_backend(
-    hostname: &str,
-    state: &ProxyState,
-    candidates: Vec<Backend>,
-) -> Result<Backend, String> {
-    discover_backend_until(
-        hostname,
-        state,
-        candidates,
-        Instant::now() + DISCOVERY_TIMEOUT,
-    )
-}
-
 fn discover_backend_until(
     hostname: &str,
     state: &ProxyState,
@@ -4446,7 +4434,7 @@ fn discover_backend_until(
     let matched = matches.into_iter().next().unwrap();
     let backend = matched.backend.clone();
     ensure_before_route_deadline(deadline)?;
-    install_active_route(state, hostname, matched, None).inspect_err(|_| {
+    install_active_route_until(state, hostname, matched, None, deadline).inspect_err(|_| {
         cache_negative(state, hostname);
     })?;
     clear_conflict(state, hostname);
@@ -4548,17 +4536,21 @@ fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
         reconcile_public_workloads(state, &snapshot, deadline);
         return;
     }
-    let candidates = candidate_backends(&state.config, None);
+    let candidates = match candidate_backends_until(state, None, deadline) {
+        Ok(candidates) => candidates,
+        Err(_) => return,
+    };
     let added = observe_workloads(state, &candidates);
 
-    for backend in added {
-        if state.shutdown_requested.load(Ordering::Acquire) {
+    for (index, backend) in added.iter().enumerate() {
+        if state.check_running_until(deadline).is_err() {
+            defer_eager_workloads(state, &added[index..]);
             return;
         }
-        if !supports_eager_discovery(&backend) {
+        if !supports_eager_discovery(backend) {
             continue;
         }
-        let names = match default_certificate_dns_names(state, &backend) {
+        let names = match default_certificate_dns_names_until(state, backend, deadline) {
             Ok(names) => names,
             Err(error) => {
                 eprintln!(
@@ -4570,7 +4562,8 @@ fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
         };
 
         for hostname in names {
-            if state.shutdown_requested.load(Ordering::Acquire) {
+            if state.check_running_until(deadline).is_err() {
+                defer_eager_workloads(state, &added[index..]);
                 return;
             }
             let incumbent = state
@@ -4579,12 +4572,12 @@ fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
                 .ok()
                 .and_then(|routes| routes.get(&hostname).cloned());
             if let Some(incumbent) = incumbent {
-                if incumbent.backend != backend
+                if &incumbent.backend != backend
                     && probe_declared_backend_until(
                         &hostname,
-                        &backend,
+                        backend,
                         state,
-                        Instant::now() + DISCOVERY_TIMEOUT,
+                        deadline.min(Instant::now() + DISCOVERY_TIMEOUT),
                     )
                     .is_ok()
                 {
@@ -4595,21 +4588,49 @@ fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
             let Some((route_cache_path, route_cache_storage)) = state.route_cache() else {
                 continue;
             };
-            let cached = match route_cache::load(route_cache_path, &hostname, route_cache_storage) {
+            let cached = match route_cache::load_until(
+                route_cache_path,
+                &hostname,
+                route_cache_storage,
+                Some(state.access_deadline(deadline)),
+            ) {
                 Ok(cached) => cached,
                 Err(_) => {
                     eprintln!("event=route_state_read result=failed");
-                    continue;
+                    defer_eager_workloads(state, &added[index..]);
+                    return;
                 }
             };
-            let candidates = candidate_backends(&state.config, cached.as_ref());
-            let result =
-                state.discover_once(&hostname, || discover_backend(&hostname, state, candidates));
+            let candidates = match candidate_backends_until(state, cached.as_ref(), deadline) {
+                Ok(candidates) => candidates,
+                Err(_) => {
+                    defer_eager_workloads(state, &added[index..]);
+                    return;
+                }
+            };
+            let result = state.discover_once_until(
+                &hostname,
+                deadline.min(Instant::now() + DISCOVERY_TIMEOUT),
+                |deadline| discover_backend_until(&hostname, state, candidates, deadline),
+            );
             if let Err(error) = result {
                 eprintln!("Eager TLS discovery rejected {hostname}: {error}");
+                if state.check_running_until(deadline).is_err() {
+                    defer_eager_workloads(state, &added[index..]);
+                    return;
+                }
             }
         }
     }
+}
+
+fn defer_eager_workloads(state: &ProxyState, pending: &[Backend]) {
+    // Keep unfinished Workloads eligible as additions on the next pass.
+    state
+        .workloads
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|workload| !pending.contains(workload));
 }
 
 enum ReconciledProbe {
@@ -4873,17 +4894,18 @@ fn supports_eager_discovery(backend: &Backend) -> bool {
     backend.role == "https"
 }
 
-fn default_certificate_dns_names(
+fn default_certificate_dns_names_until(
     state: &ProxyState,
     backend: &Backend,
+    deadline: Instant,
 ) -> Result<Vec<String>, String> {
-    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let deadline = deadline.min(Instant::now() + PROBE_TIMEOUT);
     state.check_running_until(deadline)?;
     let _permit = state
         .probes
         .acquire(deadline)
         .ok_or_else(|| "probe capacity unavailable".to_string())?;
-    let stream = connect_backend_with_timeout(backend, PROBE_TIMEOUT)
+    let stream = connect_backend_with_timeout(backend, route_deadline_remaining(deadline)?)
         .map_err(|error| format!("TCP connection failed: {error}"))?;
     let mut builder = TlsConnector::builder();
     builder.use_sni(false);
@@ -4933,8 +4955,13 @@ fn dns_names_from_certificate(der: &[u8]) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+#[cfg(test)]
 fn reconcile_routes(state: &ProxyState) {
-    if state.shutdown_requested.load(Ordering::Acquire) || state.public_snapshot().is_some() {
+    reconcile_routes_until(state, Instant::now() + RECONCILIATION_PASS_TIMEOUT);
+}
+
+fn reconcile_routes_until(state: &ProxyState, deadline: Instant) {
+    if state.check_running_until(deadline).is_err() || state.public_snapshot().is_some() {
         return;
     }
     let routes: Vec<(String, ActiveRoute)> = match state.routes.read() {
@@ -4946,7 +4973,7 @@ fn reconcile_routes(state: &ProxyState) {
     };
 
     for (hostname, route) in routes {
-        if state.shutdown_requested.load(Ordering::Acquire) {
+        if state.check_running_until(deadline).is_err() {
             return;
         }
         let now_unix_seconds = current_unix_seconds();
@@ -4954,9 +4981,13 @@ fn reconcile_routes(state: &ProxyState) {
             deactivate_expired_route(state, &hostname, now_unix_seconds);
             continue;
         }
-        if !registration_matches(&state.config, &route.backend) {
-            deactivate_route(state, &hostname, true, "registration_removed");
-            continue;
+        match registration_matches_until(state, &route.backend, deadline) {
+            Ok(true) => {}
+            Ok(false) => {
+                deactivate_route(state, &hostname, true, "registration_removed");
+                continue;
+            }
+            Err(_) => return,
         }
 
         if !is_port_open(i64::from(route.backend.port)) {
@@ -4967,7 +4998,7 @@ fn reconcile_routes(state: &ProxyState) {
         let recovered = route.tcp_failures > 0;
         let tls_due = route.last_tls_check.elapsed() >= TLS_REVALIDATION_INTERVAL;
         if recovered || tls_due {
-            revalidate_hostname(state, &hostname, &route);
+            revalidate_hostname_until(state, &hostname, &route, deadline);
         } else if let Ok(mut routes) = state.routes.write()
             && let Some(active) = routes.get_mut(&hostname)
         {
@@ -4976,15 +5007,20 @@ fn reconcile_routes(state: &ProxyState) {
     }
 }
 
-fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRoute) {
+fn revalidate_hostname_until(
+    state: &ProxyState,
+    hostname: &str,
+    incumbent: &ActiveRoute,
+    deadline: Instant,
+) {
     if let Ok(certificate) = probe_declared_backend_until(
         hostname,
         &incumbent.backend,
         state,
-        Instant::now() + DISCOVERY_TIMEOUT,
+        deadline.min(Instant::now() + DISCOVERY_TIMEOUT),
     ) {
         clear_conflict(state, hostname);
-        let _ = install_active_route(
+        let _ = install_active_route_until(
             state,
             hostname,
             ProbeMatch {
@@ -4992,28 +5028,45 @@ fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRou
                 certificate,
             },
             None,
+            deadline,
         );
         return;
     }
 
-    if state.shutdown_requested.load(Ordering::Acquire) {
+    if state.check_running_until(deadline).is_err() {
         return;
     }
     let Some((route_cache_path, route_cache_storage)) = state.route_cache() else {
         return;
     };
-    let cached = match route_cache::load(route_cache_path, hostname, route_cache_storage) {
+    let cached = match route_cache::load_until(
+        route_cache_path,
+        hostname,
+        route_cache_storage,
+        Some(state.access_deadline(deadline)),
+    ) {
         Ok(cached) => cached,
         Err(_) => {
             eprintln!("event=route_state_read result=failed");
             return;
         }
     };
-    let candidates = candidate_backends(&state.config, cached.as_ref())
-        .into_iter()
-        .filter(|backend| backend != &incumbent.backend)
-        .collect();
-    let mut matches = probe_candidates(hostname, candidates, state);
+    let candidates = match candidate_backends_until(state, cached.as_ref(), deadline) {
+        Ok(candidates) => candidates,
+        Err(_) => return,
+    }
+    .into_iter()
+    .filter(|backend| backend != &incumbent.backend)
+    .collect();
+    let mut matches = probe_candidates_until(
+        hostname,
+        candidates,
+        state,
+        deadline.min(Instant::now() + DISCOVERY_TIMEOUT),
+    );
+    if state.check_running_until(deadline).is_err() {
+        return;
+    }
 
     match matches.len() {
         0 => {
@@ -5027,7 +5080,7 @@ fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRou
                 "event=route result=moved hostname={hostname} from_port={} to_port={}",
                 incumbent.backend.port, replacement.backend.port
             );
-            let _ = install_active_route(state, hostname, replacement, None);
+            let _ = install_active_route_until(state, hostname, replacement, None, deadline);
         }
         _ => {
             record_conflict(
@@ -5040,6 +5093,7 @@ fn revalidate_hostname(state: &ProxyState, hostname: &str, incumbent: &ActiveRou
     }
 }
 
+#[cfg(test)]
 fn install_active_route(
     state: &ProxyState,
     hostname: &str,
@@ -5223,9 +5277,27 @@ fn install_active_route_observed_until(
     Ok(())
 }
 
-fn registration_matches(config: &Path, backend: &Backend) -> bool {
-    let document = read_config(config);
-    document
+fn read_development_registry_until(
+    state: &ProxyState,
+    deadline: Instant,
+) -> Result<toml_edit::DocumentMut, String> {
+    state.check_running_until(deadline)?;
+    port_registry::read_until(
+        &state.config,
+        port_registry::RegistrySecurity::Development,
+        Some(state.access_deadline(deadline)),
+    )
+    .inspect_err(|_| record_registry_snapshot_failure(state))
+    .inspect(|_| record_registry_snapshot_success(state))
+}
+
+fn registration_matches_until(
+    state: &ProxyState,
+    backend: &Backend,
+    deadline: Instant,
+) -> Result<bool, String> {
+    let document = read_development_registry_until(state, deadline)?;
+    Ok(document
         .get("ports")
         .and_then(|item| item.as_table())
         .and_then(|projects| projects.get(&backend.project))
@@ -5233,7 +5305,7 @@ fn registration_matches(config: &Path, backend: &Backend) -> bool {
         .and_then(|roles| roles.get(&backend.role))
         .and_then(|item| item.as_integer())
         .and_then(|port| u16::try_from(port).ok())
-        == Some(backend.port)
+        == Some(backend.port))
 }
 
 fn record_tcp_failure(state: &ProxyState, hostname: &str) {
@@ -5297,35 +5369,21 @@ fn deactivate_route(state: &ProxyState, hostname: &str, remove_cached: bool, rea
     }
 }
 
-fn candidate_backends(config: &Path, cached: Option<&route_cache::CachedRoute>) -> Vec<Backend> {
-    candidate_backends_before(config, cached, None)
-}
-
 fn candidate_backends_until(
-    config: &Path,
+    state: &ProxyState,
     cached: Option<&route_cache::CachedRoute>,
     deadline: Instant,
-) -> Vec<Backend> {
-    candidate_backends_before(config, cached, Some(deadline))
-}
-
-fn candidate_backends_before(
-    config: &Path,
-    cached: Option<&route_cache::CachedRoute>,
-    deadline: Option<Instant>,
-) -> Vec<Backend> {
-    let document = read_config(config);
+) -> Result<Vec<Backend>, String> {
+    let document = read_development_registry_until(state, deadline)?;
     let mut candidates = Vec::new();
 
     if let Some(projects) = document.get("ports").and_then(|value| value.as_table()) {
-        'projects: for (project, roles) in projects {
+        for (project, roles) in projects {
             let Some(roles) = roles.as_table() else {
                 continue;
             };
             for role in ["https", "main"] {
-                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    break 'projects;
-                }
+                state.check_running_until(deadline)?;
                 let Some(port) = roles
                     .get(role)
                     .and_then(|value| value.as_integer())
@@ -5333,16 +5391,11 @@ fn candidate_backends_before(
                 else {
                     continue;
                 };
-                let is_open = if let Some(deadline) = deadline {
-                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                        break 'projects;
-                    };
-                    let address: SocketAddr = ([127, 0, 0, 1], port).into();
+                let remaining = route_deadline_remaining(deadline)?;
+                let address: SocketAddr = ([127, 0, 0, 1], port).into();
+                let is_open =
                     TcpStream::connect_timeout(&address, remaining.min(Duration::from_millis(100)))
-                        .is_ok()
-                } else {
-                    is_port_open(i64::from(port))
-                };
+                        .is_ok();
                 if !is_open {
                     continue;
                 }
@@ -5369,20 +5422,8 @@ fn candidate_backends_before(
     {
         candidates.swap(0, index);
     }
-    candidates.into_iter().take(MAX_PROBES).collect()
-}
-
-fn probe_candidates(
-    hostname: &str,
-    candidates: Vec<Backend>,
-    state: &ProxyState,
-) -> Vec<ProbeMatch> {
-    probe_candidates_until(
-        hostname,
-        candidates,
-        state,
-        Instant::now() + DISCOVERY_TIMEOUT,
-    )
+    state.check_running_until(deadline)?;
+    Ok(candidates.into_iter().take(MAX_PROBES).collect())
 }
 
 fn probe_candidates_until(
@@ -6146,6 +6187,233 @@ mod tests {
             TlsConnector::new().unwrap(),
         );
         (directory, listener, state)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn development_registry_reads_release_worker_capacity_at_deadline() {
+        type RegistryRead = fn(&ProxyState, Instant);
+        let readers: [(&str, RegistryRead); 5] = [
+            ("workload reconciliation", |state, deadline| {
+                super::reconcile_workloads_until(state, deadline);
+            }),
+            ("on-demand candidates", |state, deadline| {
+                let _ = super::candidate_backends_until(state, None, deadline);
+            }),
+            ("route registration", |state, deadline| {
+                let _ = super::registration_matches_until(state, &backend(), deadline);
+            }),
+            ("route reconciliation", |state, deadline| {
+                super::reconcile_routes_until(state, deadline);
+            }),
+            ("on-demand route selection", |state, deadline| {
+                let _ = super::resolve_backend_until("deadline.example", state, deadline);
+            }),
+        ];
+        let directory = tempdir().unwrap();
+        let registry = directory.path().join("ports.toml");
+        update_config(&registry, |_| ());
+        let state = Arc::new(ProxyState::new(registry));
+        state
+            .routes
+            .write()
+            .unwrap()
+            .insert("registered.example".to_string(), active_route(backend()));
+        *state.workloads.lock().unwrap() = vec![backend()];
+        cache_negative(&state, "missing.example");
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join("ports.toml.lock"))
+            .unwrap();
+        let mut failures = Vec::new();
+
+        for (name, read) in readers {
+            fs2::FileExt::lock_exclusive(&lock).unwrap();
+            let worker_state = Arc::clone(&state);
+            let (finished, receiver) = mpsc::channel();
+            let pool = super::BoundedWorkerPool::start(
+                "development-registry-deadline",
+                1,
+                1,
+                move |deadline: Option<Instant>| {
+                    if let Some(deadline) = deadline {
+                        read(&worker_state, deadline);
+                    }
+                    finished.send(()).unwrap();
+                },
+            )
+            .unwrap();
+            pool.sender()
+                .send(Some(Instant::now() + Duration::from_millis(50)))
+                .unwrap();
+            pool.sender().send(None).unwrap();
+            let completed = receiver
+                .recv_timeout(Duration::from_millis(500))
+                .and_then(|()| receiver.recv_timeout(Duration::from_millis(500)));
+            fs2::FileExt::unlock(&lock).unwrap();
+            pool.join().unwrap();
+            if completed.is_err() {
+                failures.push(name);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "registry reads retained worker capacity past their 50ms deadline: {failures:?}"
+        );
+        assert_eq!(*state.workloads.lock().unwrap(), vec![backend()]);
+        assert!(
+            state
+                .routes
+                .read()
+                .unwrap()
+                .contains_key("registered.example")
+        );
+        assert!(
+            state
+                .negative
+                .lock()
+                .unwrap()
+                .contains_key("missing.example")
+        );
+    }
+
+    #[test]
+    fn development_registry_failure_preserves_snapshots_until_valid_recovery() {
+        let directory = tempdir().unwrap();
+        let registry = directory.path().join("ports.toml");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let backend = Backend {
+            project: "/project".to_string(),
+            role: "main".to_string(),
+            port: listener.local_addr().unwrap().port(),
+        };
+        update_config(&registry, |document| {
+            document["ports"][&backend.project] = toml_edit::table();
+            document["ports"][&backend.project][&backend.role] = value(i64::from(backend.port));
+        });
+        let state = ProxyState::new(registry);
+        reconcile_workloads(&state);
+        state.routes.write().unwrap().insert(
+            "registered.example".to_string(),
+            active_route(backend.clone()),
+        );
+        cache_negative(&state, "missing.example");
+        let valid_registry = fs::read(&state.config).unwrap();
+        fs::write(&state.config, "[ports\n").unwrap();
+
+        reconcile_workloads(&state);
+        reconcile_routes(&state);
+        assert!(
+            super::candidate_backends_until(&state, None, Instant::now() + Duration::from_secs(1))
+                .unwrap_err()
+                .contains("cannot parse")
+        );
+        assert!(
+            super::registration_matches_until(
+                &state,
+                &backend,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err()
+            .contains("cannot parse")
+        );
+        assert!(!state.registry_valid.load(Ordering::Acquire));
+        assert_eq!(state.rejected_registry_snapshots.load(Ordering::Acquire), 1);
+        assert_eq!(*state.workloads.lock().unwrap(), vec![backend.clone()]);
+        assert!(
+            state
+                .routes
+                .read()
+                .unwrap()
+                .contains_key("registered.example")
+        );
+        assert!(
+            state
+                .negative
+                .lock()
+                .unwrap()
+                .contains_key("missing.example")
+        );
+
+        fs::write(&state.config, valid_registry).unwrap();
+        reconcile_workloads(&state);
+        reconcile_routes(&state);
+        assert!(state.registry_valid.load(Ordering::Acquire));
+        assert!(
+            state
+                .routes
+                .read()
+                .unwrap()
+                .contains_key("registered.example")
+        );
+        update_config(&state.config, |document| {
+            document["ports"]
+                .as_table_mut()
+                .unwrap()
+                .remove(&backend.project);
+        });
+        reconcile_routes(&state);
+        assert!(state.routes.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancelled_development_registry_reads_do_not_touch_the_filesystem() {
+        let directory = tempdir().unwrap();
+        let state = ProxyState::new(directory.path().join("ports.toml"));
+        state.shutdown_requested.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(
+            super::candidate_backends_until(&state, None, deadline)
+                .unwrap_err()
+                .contains("shutting down")
+        );
+        assert!(
+            super::registration_matches_until(&state, &backend(), deadline)
+                .unwrap_err()
+                .contains("shutting down")
+        );
+        assert!(!directory.path().join("ports.toml.lock").exists());
+    }
+
+    #[test]
+    fn development_eager_discovery_resumes_after_an_expired_pass() {
+        const HOSTNAME: &str = "deferred.example.test";
+        let directory = tempdir().unwrap();
+        let registry = directory.path().join("ports.toml");
+        let certificate = TestCertificate::for_hostname(HOSTNAME);
+        let backend = TestTlsBackend::start(&certificate, b"deferred");
+        update_config(&registry, |document| {
+            document["ports"]["/project"] = toml_edit::table();
+            document["ports"]["/project"]["https"] = value(i64::from(backend.port()));
+        });
+        let state = Arc::new(ProxyState::new_with_profile_and_connector(
+            registry,
+            HostingProfile::Development,
+            certificate.connector(),
+        ));
+        let workloads = state.workloads.lock().unwrap();
+        let worker_state = Arc::clone(&state);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let worker = thread::spawn(move || {
+            super::reconcile_workloads_until(&worker_state, deadline);
+        });
+        while backend.accepted() == 0 {
+            assert!(Instant::now() < deadline, "candidate scan did not start");
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(10),
+        );
+        drop(workloads);
+        worker.join().unwrap();
+        assert!(state.routes.read().unwrap().is_empty());
+
+        reconcile_workloads(&state);
+        assert!(
+            state.routes.read().unwrap().contains_key(HOSTNAME),
+            "an expired pass permanently suppressed eager discovery"
+        );
     }
 
     #[cfg(unix)]

@@ -701,6 +701,7 @@ struct HarnessHost {
     runtime: PathBuf,
     registry: PathBuf,
     ingress_config: PathBuf,
+    public_profile: bool,
     root_certificate: PathBuf,
     stderr: PathBuf,
     metrics_address: SocketAddr,
@@ -752,6 +753,7 @@ impl HarnessHost {
             runtime,
             registry,
             ingress_config,
+            public_profile: true,
             root_certificate,
             stderr,
             metrics_address,
@@ -762,6 +764,11 @@ impl HarnessHost {
         }
     }
 
+    fn start_development(mut self) -> Daemon {
+        self.public_profile = false;
+        self.start()
+    }
+
     fn start(self) -> Daemon {
         let stderr = File::create(&self.stderr).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_phx-port"));
@@ -770,9 +777,10 @@ impl HarnessHost {
             command.args(["--listen", &address.to_string()]);
         }
         let limits = &self.limits;
+        if self.public_profile {
+            command.arg("--ingress-config").arg(&self.ingress_config);
+        }
         command.args([
-            "--ingress-config",
-            self.ingress_config.to_str().unwrap(),
             "--active-connections",
             &limits.active.to_string(),
             "--pre-routing-connections",
@@ -868,7 +876,15 @@ impl Daemon {
     }
 
     fn control_path(&self) -> PathBuf {
-        self.host.runtime.join("control/control.sock")
+        if self.host.public_profile {
+            self.host.runtime.join("control/control.sock")
+        } else {
+            self.host
+                .registry
+                .parent()
+                .unwrap()
+                .join("phx-port-runtime/control.sock")
+        }
     }
 
     fn wait_until_live(&mut self) {
@@ -1399,6 +1415,132 @@ fn relay_handoff_and_phxp_failures_are_end_to_end() {
     post_receiver.finish();
     let stderr = daemon.stop();
     assert!(!stderr.contains("undeclared.phase8.test"));
+}
+
+#[test]
+fn development_registry_failure_preserves_established_relay_and_recovers() {
+    let _guard = harness_lock();
+    const HOSTNAME: &str = "registry.development.test";
+    let ca = TestCa::new();
+    let identity = ca.issue(HOSTNAME, Duration::from_secs(60 * 24 * 60 * 60));
+    let backend = TestBackend::start(&identity, HOSTNAME);
+    let mut host = HarnessHost::new(
+        &ca.root_pem,
+        vec![Route::new(HOSTNAME, "development-workload", backend.port())],
+        HarnessLimits::default(),
+        false,
+    );
+    let project = host.root.path().canonicalize().unwrap();
+    host.routes[0].workload = project.to_str().unwrap().to_string();
+    fs::write(
+        &host.registry,
+        format!(
+            "[ports.\"{}\"]\nhttps = {}\n",
+            project.display(),
+            backend.port()
+        ),
+    )
+    .unwrap();
+    let mut daemon = host.start_development();
+    daemon.wait_until_ready();
+    assert_eq!(daemon.status()["hosting_profile"], "development");
+    let mut peer = connect_tls(&ca.connector(), HOSTNAME, daemon.address_v4()).unwrap();
+    peer.write_all(b"before").unwrap();
+    let mut response = [0; 6];
+    peer.read_exact(&mut response).unwrap();
+    assert_eq!(&response, b"before");
+    daemon.wait_counter_at_least("relayed_connections", 1);
+    let valid_registry = fs::read(&daemon.host.registry).unwrap();
+    let registry_lock = File::options()
+        .read(true)
+        .write(true)
+        .open(daemon.host.registry.with_extension("toml.lock"))
+        .unwrap();
+
+    for (index, unreadable) in [false, true].into_iter().enumerate() {
+        fs2::FileExt::lock_exclusive(&registry_lock).unwrap();
+        if unreadable {
+            fs::remove_file(&daemon.host.registry).unwrap();
+            fs::create_dir(&daemon.host.registry).unwrap();
+        } else {
+            fs::write(&daemon.host.registry, "[ports\n").unwrap();
+        }
+        fs2::FileExt::unlock(&registry_lock).unwrap();
+        wait_until(
+            "development registry failure to be reported without exiting",
+            || {
+                if let Some(status) = daemon.child.as_mut().unwrap().try_wait().unwrap() {
+                    panic!(
+                        "development registry failure terminated the daemon ({status}):\n{}",
+                        fs::read_to_string(&daemon.host.stderr).unwrap()
+                    );
+                }
+                daemon.status()["configuration"]["rejected_registry_snapshots"].as_u64()
+                    == Some(index as u64 + 1)
+            },
+        );
+        let status = daemon.status();
+        assert_eq!(status["configuration"]["registry_valid"], false);
+        assert_eq!(status["active_routes"], 1);
+        assert_eq!(status["draining"], false);
+        peer.write_all(b"during").unwrap();
+        peer.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"during");
+
+        fs2::FileExt::lock_exclusive(&registry_lock).unwrap();
+        if unreadable {
+            fs::remove_dir(&daemon.host.registry).unwrap();
+        }
+        fs::write(&daemon.host.registry, &valid_registry).unwrap();
+        fs2::FileExt::unlock(&registry_lock).unwrap();
+        wait_until("development registry recovery", || {
+            daemon.status()["configuration"]["registry_valid"] == true
+        });
+        assert_eq!(daemon.status()["active_routes"], 1);
+        assert_eq!(fs::read(&daemon.host.registry).unwrap(), valid_registry);
+        tls_round_trip(&ca.connector(), HOSTNAME, daemon.address_v4(), b"recovered");
+    }
+
+    let signalled =
+        unsafe { nix::libc::kill(daemon.pid() as nix::libc::pid_t, nix::libc::SIGTERM) };
+    assert_eq!(signalled, 0);
+    wait_until("development ingress to enter coordinated drain", || {
+        daemon.status()["draining"] == true
+    });
+    peer.write_all(b"drain!").unwrap();
+    peer.read_exact(&mut response).unwrap();
+    assert_eq!(&response, b"drain!");
+    drop(peer);
+    wait_until("development relay drain to complete", || {
+        daemon.child.as_mut().unwrap().try_wait().unwrap().is_some()
+    });
+    assert!(daemon.child.take().unwrap().wait().unwrap().success());
+    let stderr = fs::read_to_string(&daemon.host.stderr).unwrap();
+    assert_eq!(stderr.matches("event=ingress_shutdown ").count(), 1);
+    assert!(
+        stderr.contains("event=ingress_shutdown result=complete "),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn development_cli_registry_read_errors_still_exit() {
+    let directory = tempdir().unwrap();
+    let registry = directory.path().join("ports.toml");
+    fs::write(&registry, "[ports\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_phx-port"))
+        .args(["list", "--flat"])
+        .env("HOME", directory.path())
+        .env("PHX_PORT_CONFIG", registry)
+        .env_remove("PHX_PORT_INGRESS_CONFIG")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("Error: cannot parse")
+    );
 }
 
 #[test]

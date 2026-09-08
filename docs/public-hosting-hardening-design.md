@@ -208,6 +208,13 @@ parsing, Tokio-based daemon I/O, and bug fixes. Production-only declarations,
 permissions, service management, and filesystem layout do not leak into the
 default allocator workflow.
 
+Development ingress reads the Port Registry under routing and reconciliation
+deadlines. A malformed, unreadable, or lock-contended snapshot is unavailable,
+not an authoritative empty registry: existing Workload and Verified Route
+state is retained while the failure is reported through bounded diagnostics.
+Reconciliation resumes after a valid snapshot returns; CLI-only registry
+readers retain their command-exit error policy.
+
 ## Threat model
 
 ### Protected assets
