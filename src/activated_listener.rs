@@ -132,22 +132,14 @@ fn launchd_descriptors(
 ) -> Result<Option<Vec<LaunchdDescriptor>>, String> {
     let mut names = BTreeMap::new();
     for listener in expected {
-        if names.insert(listener.descriptor_name, ()).is_some() {
-            return Err(format!(
-                "launchd activation requires at most one configured {} listener",
-                if listener.address.is_ipv4() {
-                    "IPv4"
-                } else {
-                    "IPv6"
-                }
-            ));
-        }
+        names.entry(listener.descriptor_name).or_insert(listener);
     }
 
     let mut descriptors = Vec::new();
     let mut missing = Vec::new();
 
-    for listener in expected {
+    // Probe each name once; acquire_launchd rejects conflicts only after activation.
+    for listener in names.into_values() {
         let name = CString::new(listener.descriptor_name)
             .expect("launchd listener descriptor names are static and contain no NUL");
         let mut raw_fds = std::ptr::null_mut();
@@ -693,5 +685,257 @@ mod tests {
             }
         }
         panic!("could not reserve one dual-stack test port after 32 attempts");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod darwin_tests {
+    use super::{
+        IPV4_DESCRIPTOR_NAME, IPV6_DESCRIPTOR_NAME, LaunchdDescriptor, ListenerOrigin, acquire,
+        acquire_launchd, bind_listener, expected_listeners,
+    };
+    use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::io::ErrorKind;
+    use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn non_launchd_acquisition_binds_multiple_ipv4_listeners() {
+        assert!(!nix::unistd::geteuid().is_root(), "test must run rootless");
+        let listeners = acquire(&["127.0.0.1:0".to_string(), "127.0.0.1:0".to_string()])
+            .unwrap_or_else(|error| panic!("non-launchd listener acquisition failed: {error}"));
+        assert_eq!(listeners.len(), 2);
+        let addresses = listeners
+            .iter()
+            .map(|acquired| {
+                assert_eq!(acquired.origin, ListenerOrigin::Direct);
+                let address = acquired.listener.local_addr().unwrap();
+                assert!(address.is_ipv4() && address.ip().is_loopback());
+                assert_ne!(address.port(), 0);
+                address
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(addresses[0], addresses[1]);
+
+        for (acquired, address) in listeners.iter().zip(addresses) {
+            assert_eq!(
+                acquired.listener.accept().unwrap_err().kind(),
+                ErrorKind::WouldBlock
+            );
+            let client = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (accepted, peer) = loop {
+                match acquired.listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "listener {address} did not accept"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("listener {address} could not accept: {error}"),
+                }
+            };
+            assert_eq!(peer, client.local_addr().unwrap());
+            assert_eq!(accepted.local_addr().unwrap(), address);
+        }
+    }
+
+    #[test]
+    fn activated_listeners_preserve_configuration_order_and_descriptor_flags() {
+        let ipv4 = bind_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+        let ipv6 = bind_listener("[::1]:0".parse().unwrap()).unwrap();
+        let addresses = [ipv4.local_addr().unwrap(), ipv6.local_addr().unwrap()];
+        let expected = expected_listeners(&addresses.map(|address| address.to_string())).unwrap();
+        let listeners = acquire_launchd(
+            &expected,
+            vec![
+                LaunchdDescriptor {
+                    fd: ipv6.into(),
+                    name: IPV6_DESCRIPTOR_NAME.to_string(),
+                },
+                LaunchdDescriptor {
+                    fd: ipv4.into(),
+                    name: IPV4_DESCRIPTOR_NAME.to_string(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(listeners.len(), 2);
+        for (index, acquired) in listeners.iter().enumerate() {
+            assert_eq!(acquired.listener.local_addr().unwrap(), addresses[index]);
+            assert_eq!(
+                acquired.origin,
+                ListenerOrigin::Launchd(expected[index].descriptor_name.to_string())
+            );
+            let status = fcntl(&acquired.listener, FcntlArg::F_GETFL).unwrap();
+            assert!(OFlag::from_bits_truncate(status).contains(OFlag::O_NONBLOCK));
+            let flags = fcntl(&acquired.listener, FcntlArg::F_GETFD).unwrap();
+            assert!(FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC));
+        }
+    }
+
+    #[test]
+    fn activation_rejects_duplicate_configured_families_and_closes_descriptors() {
+        for (configured, name, family) in [
+            ("127.0.0.1:0", IPV4_DESCRIPTOR_NAME, "IPv4"),
+            ("[::1]:0", IPV6_DESCRIPTOR_NAME, "IPv6"),
+        ] {
+            let listener = bind_listener(configured.parse().unwrap()).unwrap();
+            let address = listener.local_addr().unwrap();
+            let expected =
+                expected_listeners(&[address.to_string(), configured.to_string()]).unwrap();
+            let error = acquire_launchd(
+                &expected,
+                vec![LaunchdDescriptor {
+                    fd: listener.into(),
+                    name: name.to_string(),
+                }],
+            )
+            .err()
+            .expect("duplicate configured activation names must be rejected");
+            assert_eq!(
+                error,
+                format!("launchd activation requires at most one configured {family} listener")
+            );
+            bind_listener(address).expect("rejected activation must release its descriptor");
+        }
+    }
+
+    #[test]
+    fn activation_rejects_duplicate_supplied_names_and_closes_every_descriptor() {
+        let listeners = (0..3)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect::<Vec<_>>();
+        let addresses = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect::<Vec<_>>();
+        let expected = expected_listeners(&[addresses[0].to_string()]).unwrap();
+        let descriptors = listeners
+            .into_iter()
+            .map(|listener| LaunchdDescriptor {
+                fd: listener.into(),
+                name: IPV4_DESCRIPTOR_NAME.to_string(),
+            })
+            .collect();
+        let error = acquire_launchd(&expected, descriptors)
+            .err()
+            .expect("duplicate supplied activation names must be rejected");
+        assert!(
+            error.contains("duplicate listener descriptor name \"tls-ipv4\""),
+            "{error}"
+        );
+        for address in addresses {
+            bind_listener(address)
+                .expect("error must release acquired, rejected, and unvisited descriptors");
+        }
+    }
+
+    #[test]
+    fn activation_rejects_missing_and_unexpected_names_without_retaining_listeners() {
+        for unexpected in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut configured = vec![address.to_string()];
+            if !unexpected {
+                configured.push("[::1]:0".to_string());
+            }
+            let expected = expected_listeners(&configured).unwrap();
+            let error = acquire_launchd(
+                &expected,
+                vec![LaunchdDescriptor {
+                    fd: listener.into(),
+                    name: if unexpected {
+                        IPV6_DESCRIPTOR_NAME
+                    } else {
+                        IPV4_DESCRIPTOR_NAME
+                    }
+                    .to_string(),
+                }],
+            )
+            .err()
+            .expect("incomplete or unexpected activation must be rejected");
+            assert!(
+                error.contains(if unexpected {
+                    "unexpected listener descriptor name \"tls-ipv6\""
+                } else {
+                    "did not supply required listener descriptor tls-ipv6"
+                }),
+                "{error}"
+            );
+            bind_listener(address).expect("invalid activation must release its listener");
+        }
+    }
+
+    #[test]
+    fn activation_rejects_non_listening_and_non_tcp_descriptors() {
+        let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let stream = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        stream.bind(&address.into()).unwrap();
+        let datagram = UdpSocket::bind(address).unwrap();
+        let expected = expected_listeners(&[address.to_string()]).unwrap();
+        for (fd, message) in [
+            (stream.into(), "not a listening socket"),
+            (datagram.into(), "not a TCP stream socket"),
+        ] {
+            let error = acquire_launchd(
+                &expected,
+                vec![LaunchdDescriptor {
+                    fd,
+                    name: IPV4_DESCRIPTOR_NAME.to_string(),
+                }],
+            )
+            .err()
+            .expect("activation must validate the actual socket");
+            assert!(error.contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn activation_requires_exact_addresses_and_ipv6_only_listeners() {
+        let ipv4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ipv4_address = ipv4.local_addr().unwrap();
+        let wrong_address = format!("0.0.0.0:{}", ipv4_address.port());
+        let ipv6 = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        ipv6.set_only_v6(false).unwrap();
+        ipv6.bind(&"[::1]:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        ipv6.listen(16).unwrap();
+        let ipv6: TcpListener = ipv6.into();
+        let ipv6_address = ipv6.local_addr().unwrap();
+
+        for (listener, actual, configured, name, message) in [
+            (
+                ipv4,
+                ipv4_address,
+                wrong_address,
+                IPV4_DESCRIPTOR_NAME,
+                "descriptor listens on",
+            ),
+            (
+                ipv6,
+                ipv6_address,
+                ipv6_address.to_string(),
+                IPV6_DESCRIPTOR_NAME,
+                "IPv6 descriptor must be configured IPv6-only",
+            ),
+        ] {
+            let expected = expected_listeners(&[configured]).unwrap();
+            let error = acquire_launchd(
+                &expected,
+                vec![LaunchdDescriptor {
+                    fd: listener.into(),
+                    name: name.to_string(),
+                }],
+            )
+            .err()
+            .expect("invalid listener metadata must reject activation");
+            assert!(error.contains(message), "{error}");
+            bind_listener(actual).expect("failed validation must release its listener");
+        }
     }
 }

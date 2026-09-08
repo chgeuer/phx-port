@@ -1451,6 +1451,11 @@ The service manager owns public port 443 and the ingress process runs
 unprivileged. Explicit `--listen` binding remains available for foreground and
 development use.
 
+Development direct binding may use several addresses from the same family,
+including on macOS when launchd supplies no sockets. Activated listeners still
+require a unique configuration for each named descriptor, and the public
+Hosting Profile retains its one-IPv4/one-IPv6 listener declaration bound.
+
 **Recommendation:** systemd socket activation on Linux and launchd socket
 activation on macOS. Use ambient `CAP_NET_BIND_SERVICE` only as an intermediate
 Linux step. Never run as root.
