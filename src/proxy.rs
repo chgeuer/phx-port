@@ -4659,7 +4659,7 @@ fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
         return;
     }
     if let Some(snapshot) = state.public_snapshot() {
-        reconcile_public_workloads(state, &snapshot, deadline);
+        reconcile_public_workloads(state, &snapshot, PROBE_TIMEOUT, deadline);
         return;
     }
     let candidates = match candidate_backends_until(state, None, deadline) {
@@ -4776,6 +4776,7 @@ enum ReconciledProbe {
 fn reconcile_public_workloads(
     state: &ProxyState,
     snapshot: &PublicIngressSnapshot,
+    probe_timeout: Duration,
     deadline: Instant,
 ) {
     let assignments = match load_public_registry_until(state, snapshot, deadline) {
@@ -4803,7 +4804,7 @@ fn reconcile_public_workloads(
         (deadline.saturating_duration_since(Instant::now()) / 4).min(DISCOVERY_TIMEOUT);
     let proof_deadline = deadline.checked_sub(publication_budget).unwrap_or(deadline);
     let launch_deadline = proof_deadline
-        .checked_sub(PROBE_TIMEOUT)
+        .checked_sub(probe_timeout)
         .unwrap_or(proof_deadline);
     'reconcile: while examined < declarations.len()
         && state.check_running_until(launch_deadline).is_ok()
@@ -4876,7 +4877,7 @@ fn reconcile_public_workloads(
             let job_backend = desired.clone();
             let connector = state.probe_connector_override.clone();
             let cancelled = Arc::clone(&state.shutdown_requested);
-            let probe_deadline = proof_deadline.min(Instant::now() + PROBE_TIMEOUT);
+            let probe_deadline = proof_deadline.min(Instant::now() + probe_timeout);
             let Some(background_permit) = state.reconciliation_probes.acquire(probe_deadline)
             else {
                 continue;
@@ -6341,6 +6342,15 @@ mod tests {
             response: &'static [u8],
             worker_count: usize,
         ) -> Self {
+            Self::start_with_workers_and_delay(certificate, response, worker_count, Duration::ZERO)
+        }
+
+        fn start_with_workers_and_delay(
+            certificate: &TestCertificate,
+            response: &'static [u8],
+            worker_count: usize,
+            first_handshake_delay: Duration,
+        ) -> Self {
             assert!(worker_count > 0);
             let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
             listener.set_nonblocking(true).unwrap();
@@ -6358,7 +6368,11 @@ mod tests {
                         while !shutdown_for_worker.load(Ordering::Acquire) {
                             match listener.accept() {
                                 Ok((stream, _)) => {
-                                    accepted_for_worker.fetch_add(1, Ordering::AcqRel);
+                                    let first =
+                                        accepted_for_worker.fetch_add(1, Ordering::AcqRel) == 0;
+                                    if first {
+                                        thread::sleep(first_handshake_delay);
+                                    }
                                     stream.set_nonblocking(false).unwrap();
                                     stream
                                         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -7288,10 +7302,11 @@ mod tests {
             "*.example.test",
             Duration::from_secs(59 * 24 * 60 * 60),
         );
-        let backend = TestTlsBackend::start_with_workers(
+        let backend = TestTlsBackend::start_with_workers_and_delay(
             &initial,
             b"cache",
             super::MAX_RECONCILIATION_PROBES,
+            super::PROBE_TIMEOUT + Duration::from_millis(100),
         );
         let directory = tempdir().unwrap();
         let registry = write_logical_registry(directory.path(), &[("web", backend.port())]);
@@ -7332,7 +7347,12 @@ mod tests {
                 active.last_tls_check = Instant::now() - TLS_REVALIDATION_INTERVAL;
             }
             take_derived_io_counts();
-            super::reconcile_workloads_until(&state, Instant::now() + Duration::from_secs(60));
+            super::reconcile_public_workloads(
+                &state,
+                &state.public_snapshot().unwrap(),
+                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(60),
+            );
             let counts = take_derived_io_counts();
             eprintln!("cache_publication phase={phase} counts={counts:?}");
             assert_eq!(

@@ -107,7 +107,9 @@ The route-cache scale fixture uses bounded concurrent Rustls server workers and
 a compact wildcard certificate, avoiding macOS native-server handshake
 contention. Ingress probes still use production native TLS certificate and
 hostname verification for every declaration, with exact cache I/O assertions
-for all 1,000 routes. Rustls is a test-only dependency.
+for all 1,000 routes. A five-second test-only probe budget and a deliberately slow
+first handshake keep cache coalescing independent of TLS performance. Production
+probes retain their 200 ms limit. Rustls is a test-only dependency.
 
 The publication-deadline test uses the production reconciliation pass budget
 and enough silent probes to exceed that budget. This keeps the starvation
