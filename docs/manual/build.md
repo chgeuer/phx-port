@@ -98,16 +98,27 @@ exercised on Linux/macOS x64/ARM64 rather than cross-compiled.
 Pull requests and pushes to `master` run the matrix. A change is not
 cross-platform merely because it compiles on one runner.
 
-Network fixtures preserve cross-platform behavior: the backpressure test sets
-TCP buffer sizes before connecting, so the negotiated receive window cannot
-absorb the entire test payload. The route-cache scale test uses bounded
-concurrent TLS workers and a compact wildcard certificate, but still verifies
-every declared hostname and asserts cache I/O counts for all 1,000 routes.
+The backpressure fixture requests small TCP buffers before connecting, then
+sizes its payload from the actual socket buffers: macOS can enlarge loopback
+buffers despite explicit size requests. Its sender runs concurrently so a
+payload larger than the available buffering cannot deadlock before the drain.
+
+The route-cache scale fixture uses bounded concurrent Rustls server workers and
+a compact wildcard certificate, avoiding macOS native-server handshake
+contention. Ingress probes still use production native TLS certificate and
+hostname verification for every declaration, with exact cache I/O assertions
+for all 1,000 routes. Rustls is a test-only dependency.
 
 The publication-deadline test uses the production reconciliation pass budget
 and enough silent probes to exceed that budget. This keeps the starvation
 regression active without requiring certificate verification and cache
 persistence to complete within an artificial 300 ms window.
+
+Control-client framing, response limits, and slow-response deadline tests run on
+both Linux and macOS. The client polls nonblocking I/O against one absolute
+deadline instead of changing socket timeouts after a peer may have closed;
+macOS rejects those timeout changes even when response bytes remain buffered.
+Accept-queue and `SOCK_SEQPACKET` control fixtures remain Linux-specific.
 
 ## Release
 

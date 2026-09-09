@@ -20,6 +20,10 @@ use crate::{
     worker_pool::BoundedWorkerPool,
 };
 use native_tls::TlsConnector;
+#[cfg(unix)]
+use nix::errno::Errno;
+#[cfg(unix)]
+use nix::poll::{PollFd, PollFlags, poll};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -38,6 +42,8 @@ use tokio::task::JoinSet;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+#[cfg(unix)]
+use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
@@ -2244,14 +2250,11 @@ pub fn query_control(command: &str) -> Result<String, String> {
     #[cfg(unix)]
     {
         let deadline = control_deadline()?;
-        let mut stream = ControlConnection {
-            stream: crate::unix_socket::connect_stream_until(
-                &client_control_socket_path()?,
-                deadline,
-            )
-            .map_err(|error| format!("TLS proxy daemon is not reachable: {error}"))?,
-            deadline,
-        };
+        let stream =
+            crate::unix_socket::connect_stream_until(&client_control_socket_path()?, deadline)
+                .map_err(|error| format!("TLS proxy daemon is not reachable: {error}"))?;
+        let mut stream = ControlConnection::new(stream, deadline)
+            .map_err(|error| format!("cannot configure daemon connection: {error}"))?;
         stream
             .write_all(format!("{command}\n").as_bytes())
             .map_err(|error| format!("cannot send daemon command: {error}"))?;
@@ -2298,6 +2301,11 @@ struct ControlConnection {
 
 #[cfg(unix)]
 impl ControlConnection {
+    fn new(stream: UnixStream, deadline: Instant) -> io::Result<Self> {
+        stream.set_nonblocking(true)?;
+        Ok(Self { stream, deadline })
+    }
+
     fn remaining(&self) -> io::Result<Duration> {
         self.deadline
             .checked_duration_since(Instant::now())
@@ -2314,25 +2322,44 @@ impl ControlConnection {
         self.remaining()?;
         self.stream.shutdown(how)
     }
+
+    fn io<T>(
+        &self,
+        interest: PollFlags,
+        mut operation: impl FnMut(&UnixStream) -> io::Result<T>,
+    ) -> io::Result<T> {
+        loop {
+            self.remaining()?;
+            match operation(&self.stream) {
+                Ok(result) => {
+                    self.remaining()?;
+                    return Ok(result);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            let timeout_ms = self.remaining()?.as_millis().clamp(1, u16::MAX as u128) as u16;
+            let mut fds = [PollFd::new(self.stream.as_fd(), interest)];
+            match poll(&mut fds, timeout_ms) {
+                Ok(_) | Err(Errno::EINTR) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
 impl Read for ControlConnection {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        let read = self.stream.read(buffer)?;
-        self.remaining()?;
-        Ok(read)
+        self.io(PollFlags::POLLIN, |mut stream| stream.read(buffer))
     }
 }
 
 #[cfg(unix)]
 impl Write for ControlConnection {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        let written = self.stream.write(buffer)?;
-        self.remaining()?;
-        Ok(written)
+        self.io(PollFlags::POLLOUT, |mut stream| stream.write(buffer))
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -6166,6 +6193,28 @@ mod tests {
         assert!(!development.authorizes(outsider, ControlAccess::ReadOnly));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn control_client_reads_buffered_response_after_peer_closes() {
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let stream = crate::unix_socket::connect_stream_until(&path, deadline).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        peer.write_all(b"running\n").unwrap();
+        drop(peer);
+
+        let mut connection = super::ControlConnection::new(stream, deadline).unwrap();
+        let mut response = String::new();
+        connection.read_to_string(&mut response).unwrap();
+        assert_eq!(response, "running\n");
+    }
+
     #[derive(Clone)]
     struct TestCertificate {
         certificate_pem: String,
@@ -6229,6 +6278,21 @@ mod tests {
             Self::connector_for(&[self])
         }
 
+        fn server_config(&self) -> Arc<rustls::ServerConfig> {
+            use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+            // Keep fixture-side TLS independent of the native verifier used by ingress probes.
+            let certificate =
+                CertificateDer::from_pem_slice(self.certificate_pem.as_bytes()).unwrap();
+            let key = PrivateKeyDer::from_pem_slice(self.private_key_pem.as_bytes()).unwrap();
+            Arc::new(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(vec![certificate], key)
+                    .unwrap(),
+            )
+        }
+
         fn connector_for(certificates: &[&Self]) -> TlsConnector {
             let mut builder = TlsConnector::builder();
             builder.disable_built_in_roots(true);
@@ -6254,7 +6318,7 @@ mod tests {
 
     struct TestTlsBackend {
         address: SocketAddr,
-        acceptor: Arc<RwLock<TlsAcceptor>>,
+        tls_config: Arc<RwLock<Arc<rustls::ServerConfig>>>,
         accepted: Arc<AtomicUsize>,
         shutdown: Arc<AtomicBool>,
         workers: Vec<thread::JoinHandle<()>>,
@@ -6274,18 +6338,13 @@ mod tests {
             let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
-            let identity = Identity::from_pkcs8(
-                certificate.certificate_pem.as_bytes(),
-                certificate.private_key_pem.as_bytes(),
-            )
-            .unwrap();
-            let acceptor = Arc::new(RwLock::new(TlsAcceptor::new(identity).unwrap()));
+            let tls_config = Arc::new(RwLock::new(certificate.server_config()));
             let accepted = Arc::new(AtomicUsize::new(0));
             let shutdown = Arc::new(AtomicBool::new(false));
             let workers = (0..worker_count)
                 .map(|_| {
                     let listener = Arc::clone(&listener);
-                    let acceptor_for_worker = Arc::clone(&acceptor);
+                    let config_for_worker = Arc::clone(&tls_config);
                     let accepted_for_worker = Arc::clone(&accepted);
                     let shutdown_for_worker = Arc::clone(&shutdown);
                     thread::spawn(move || {
@@ -6300,13 +6359,13 @@ mod tests {
                                     stream
                                         .set_write_timeout(Some(Duration::from_secs(2)))
                                         .unwrap();
-                                    let acceptor = acceptor_for_worker.read().unwrap().clone();
-                                    if let Ok(mut tls) = acceptor.accept(stream) {
-                                        let mut request = [0_u8; 64];
-                                        if tls.read(&mut request).is_ok_and(|read| read > 0) {
-                                            tls.write_all(response).unwrap();
-                                            tls.flush().unwrap();
-                                        }
+                                    let config = config_for_worker.read().unwrap().clone();
+                                    let connection = rustls::ServerConnection::new(config).unwrap();
+                                    let mut tls = rustls::StreamOwned::new(connection, stream);
+                                    let mut request = [0_u8; 64];
+                                    if tls.read(&mut request).is_ok_and(|read| read > 0) {
+                                        tls.write_all(response).unwrap();
+                                        tls.flush().unwrap();
                                     }
                                 }
                                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -6320,7 +6379,7 @@ mod tests {
                 .collect();
             Self {
                 address,
-                acceptor,
+                tls_config,
                 accepted,
                 shutdown,
                 workers,
@@ -6336,12 +6395,7 @@ mod tests {
         }
 
         fn replace_certificate(&self, certificate: &TestCertificate) {
-            let identity = Identity::from_pkcs8(
-                certificate.certificate_pem.as_bytes(),
-                certificate.private_key_pem.as_bytes(),
-            )
-            .unwrap();
-            *self.acceptor.write().unwrap() = TlsAcceptor::new(identity).unwrap();
+            *self.tls_config.write().unwrap() = certificate.server_config();
         }
     }
 

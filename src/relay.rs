@@ -316,12 +316,12 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_backpressure_preserves_all_forwarded_bytes() {
-        const PAYLOAD_SIZE: usize = 256 * 1024;
+        const MIN_PAYLOAD_SIZE: usize = 256 * 1024;
 
         tokio::time::timeout(Duration::from_secs(10), async {
             let (mut public_peer, accepted) = tcp_pair().await;
             let buffer_size = u32::try_from(RELAY_BUFFER_SIZE).unwrap();
-            // Negotiate a small receive window in the SYN, before either socket is connected.
+            // Request small buffers before negotiating the receive window.
             let workload_socket = TcpSocket::new_v4().unwrap();
             workload_socket.set_recv_buffer_size(buffer_size).unwrap();
             workload_socket
@@ -336,6 +336,15 @@ mod tests {
             );
             let upstream = upstream.unwrap();
             let mut workload_peer = workload_peer.unwrap().0;
+            let send_buffer = socket2::SockRef::from(&upstream)
+                .send_buffer_size()
+                .unwrap();
+            let receive_buffer = socket2::SockRef::from(&workload_peer)
+                .recv_buffer_size()
+                .unwrap();
+            // macOS can enlarge loopback buffers despite the explicit size requests.
+            let payload_size =
+                MIN_PAYLOAD_SIZE.max(2 * (send_buffer + receive_buffer + RELAY_BUFFER_SIZE));
             let bytes = Arc::new(AtomicU64::new(0));
             let copied_bytes = Arc::clone(&bytes);
             let (progress, mut receiver) = tokio::sync::mpsc::channel(1);
@@ -343,10 +352,13 @@ mod tests {
                 super::copy_direction(accepted, upstream, progress, &copied_bytes).await
             });
 
-            let payload: Vec<_> = (0_u8..=250).cycle().take(PAYLOAD_SIZE).collect();
-            let expected_bytes = u64::try_from(PAYLOAD_SIZE).unwrap();
-            public_peer.write_all(&payload).await.unwrap();
-            public_peer.shutdown().await.unwrap();
+            let payload: Vec<_> = (0_u8..=250).cycle().take(payload_size).collect();
+            let expected_bytes = u64::try_from(payload_size).unwrap();
+            let outgoing = payload.clone();
+            let sender = tokio::spawn(async move {
+                public_peer.write_all(&outgoing).await.unwrap();
+                public_peer.shutdown().await.unwrap();
+            });
             receiver.recv().await.unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(
@@ -358,12 +370,13 @@ mod tests {
 
             let mut received = Vec::new();
             workload_peer.read_to_end(&mut received).await.unwrap();
+            sender.await.unwrap();
             copy.await.unwrap().unwrap();
             assert_eq!(received, payload);
             assert_eq!(bytes.load(Ordering::Relaxed), expected_bytes);
             eprintln!(
-                "loopback backpressure: {before_drain}/{PAYLOAD_SIZE} bytes written before drain; \
-                 all {PAYLOAD_SIZE} bytes delivered and counted after drain"
+                "loopback backpressure: {before_drain}/{payload_size} bytes written before drain; \
+                 all {payload_size} bytes delivered and counted after drain"
             );
         })
         .await

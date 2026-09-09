@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::fs;
@@ -65,6 +65,7 @@ impl ControlEndpoint {
         self.spawn(&["daemon", "--listen", &address.to_string()])
     }
 
+    #[cfg(target_os = "linux")]
     fn fill_queue(&self) -> Vec<Socket> {
         let mut queued = Vec::new();
         for _ in 0..8 {
@@ -164,6 +165,7 @@ fn read_request(stream: &mut UnixStream, expected: &str) {
     assert_eq!(request, expected.as_bytes());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn control_queries_time_out_when_accept_queue_is_full() {
     let endpoint = ControlEndpoint::new(Type::STREAM);
@@ -173,6 +175,7 @@ fn control_queries_time_out_when_accept_queue_is_full() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn duplicate_startup_times_out_without_unlinking_a_full_control_socket() {
     let endpoint = ControlEndpoint::new(Type::STREAM);
@@ -183,6 +186,7 @@ fn duplicate_startup_times_out_without_unlinking_a_full_control_socket() {
     assert_unavailable(result, "timed out");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn duplicate_startup_preserves_endpoint_on_operational_connect_error() {
     let endpoint = ControlEndpoint::new(Type::from(nix::libc::SOCK_SEQPACKET));
@@ -253,6 +257,7 @@ fn control_response_trickle_cannot_extend_the_absolute_deadline() {
     assert_unavailable(result, "cannot read daemon response");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn control_connect_and_response_share_one_deadline() {
     let endpoint = ControlEndpoint::new(Type::STREAM);
