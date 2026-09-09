@@ -9860,14 +9860,19 @@ mod tests {
     }
 
     #[test]
-    fn development_discovery_rejects_conflicts_with_less_than_full_probe_budget() {
+    fn development_discovery_rejects_conflicting_trusted_certificates() {
         const HOSTNAME: &str = "discovery-conflict.example.test";
         let directory = tempdir().unwrap();
         let certificate = TestCertificate::for_hostname(HOSTNAME);
         let wrong_name = TestCertificate::for_hostname("other.example.test");
         let first = TestTlsBackend::start(&certificate, b"");
         let second = TestTlsBackend::start(&certificate, b"");
-        let wrong = TestTlsBackend::start(&wrong_name, b"");
+        let wrong = TestTlsBackend::start_with_workers_and_delay(
+            &wrong_name,
+            b"",
+            1,
+            super::PROBE_TIMEOUT + Duration::from_millis(100),
+        );
         let state = ProxyState::new_with_profile_and_connector(
             directory.path().join("ports.toml"),
             HostingProfile::Development,
@@ -9882,7 +9887,7 @@ mod tests {
             })
             .collect();
         let started = Instant::now();
-        let budget = Duration::from_millis(150);
+        let budget = Duration::from_secs(5);
         let result =
             super::discover_backend_until(HOSTNAME, &state, candidates.clone(), started + budget);
         let elapsed = started.elapsed();
@@ -9900,6 +9905,50 @@ mod tests {
         );
         assert!(elapsed < budget);
         assert_eq!(state.conflicts.read().unwrap()[HOSTNAME], candidates[..2]);
+        assert!(state.routes.read().unwrap().is_empty());
+        assert_eq!(state.successful_discoveries.load(Ordering::Acquire), 0);
+        assert_eq!(*state.probes.in_use.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn development_discovery_starts_probes_with_less_than_full_probe_budget() {
+        let directory = tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let state = ProxyState::new_with_profile_and_connector(
+            directory.path().join("ports.toml"),
+            HostingProfile::Development,
+            TlsConnector::new().unwrap(),
+        );
+        let setup_deadline = Instant::now() + Duration::from_secs(5);
+        let ready = state.submit_probe(setup_deadline, || Ok(())).unwrap();
+        super::receive_probe_until(ready, &state, setup_deadline).unwrap();
+
+        let budget = Duration::from_millis(150);
+        assert!(budget < super::PROBE_TIMEOUT);
+        let result = super::discover_backend_until(
+            "short-budget.example.test",
+            &state,
+            vec![Backend {
+                project: "/silent".to_string(),
+                role: "https".to_string(),
+                port: listener.local_addr().unwrap().port(),
+            }],
+            Instant::now() + budget,
+        );
+        let accepted = listener.accept();
+        let workers = state.probe_workers.lock().unwrap().take().unwrap();
+        assert_eq!(
+            workers
+                .join_until(Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+            0
+        );
+        assert!(result.is_err());
+        assert!(
+            accepted.is_ok(),
+            "discovery must start a probe with less than a full probe budget: {accepted:?}"
+        );
         assert!(state.routes.read().unwrap().is_empty());
         assert_eq!(state.successful_discoveries.load(Ordering::Acquire), 0);
         assert_eq!(*state.probes.in_use.lock().unwrap(), 0);

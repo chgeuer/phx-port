@@ -111,6 +111,11 @@ for all 1,000 routes. A five-second test-only probe budget and a deliberately sl
 first handshake keep cache coalescing independent of TLS performance. Production
 probes retain their 200 ms limit. Rustls is a test-only dependency.
 
+Development conflict detection separates certificate verification from
+short-budget scheduling. The real-certificate test permits a slow handshake;
+a silent-workload test retains a 150 ms deadline and checks that discovery
+actually starts a probe, with worker startup outside that deadline.
+
 The publication-deadline test uses the production reconciliation pass budget
 and enough silent probes to exceed that budget. This keeps the starvation
 regression active without requiring certificate verification and cache
