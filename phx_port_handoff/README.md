@@ -185,8 +185,16 @@ The default `mix format --check-formatted` inputs include the shipped
 `priv/installer/igniter.exs`. Installer tests verify that those inputs reject
 an intentionally unformatted installer in a private fixture directory.
 
-On Linux, run the installer, startup, and transport tests as an unprivileged
-user with an external OS-process watchdog:
+Run the installer, startup, transport, and scheduler tests as an unprivileged
+user with an external OS-process watchdog. On macOS, first make GNU `timeout`
+available; the scheduler tests also invoke it internally:
+
+```bash
+brew install coreutils
+export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+```
+
+Then run the checks on Linux or macOS:
 
 ```bash
 cd phx_port_handoff
