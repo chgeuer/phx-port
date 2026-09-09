@@ -1293,6 +1293,13 @@ fn clear_config_reload_failure(state: &ProxyState) {
 }
 
 fn reload_public_profile(state: &ProxyState) -> ConfigReloadOutcome {
+    reload_public_profile_with_cache_timeout(state, DISCOVERY_TIMEOUT)
+}
+
+fn reload_public_profile_with_cache_timeout(
+    state: &ProxyState,
+    cache_timeout: Duration,
+) -> ConfigReloadOutcome {
     let current = state.hosting_profile();
     let Some(current_snapshot) = current.public_snapshot() else {
         return ConfigReloadOutcome::NotPublic;
@@ -1316,7 +1323,7 @@ fn reload_public_profile(state: &ProxyState) -> ConfigReloadOutcome {
         .public_snapshot()
         .expect("a public config reload returns a public snapshot");
 
-    let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+    let deadline = Instant::now() + cache_timeout;
     let _transaction = match state.cache_transaction_until(deadline) {
         Ok(transaction) => transaction,
         Err(_) => {
@@ -6471,6 +6478,16 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn silent_reconciliation_backlog_size() -> usize {
+        let batches = usize::try_from(
+            super::RECONCILIATION_PASS_TIMEOUT.as_millis() / super::PROBE_TIMEOUT.as_millis(),
+        )
+        .unwrap()
+            + 1;
+        super::MAX_RECONCILIATION_PROBES * batches
+    }
+
+    #[cfg(unix)]
     fn silent_public_workloads(count: usize) -> (TempDir, TcpListener, ProxyState) {
         let directory = tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6905,20 +6922,31 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bounded_reconciliation_resumes_after_the_previous_batch() {
-        let (_directory, _listener, state) =
-            silent_public_workloads(super::MAX_RECONCILIATION_PROBES + 1);
+        let backlog = silent_reconciliation_backlog_size() + 1;
+        let (_directory, _listener, state) = silent_public_workloads(backlog);
         let snapshot = state.public_snapshot().unwrap();
-        let last = snapshot.routes.keys().last().unwrap();
-        super::reconcile_workloads_until(&state, Instant::now() + Duration::from_millis(300));
-        assert_eq!(
-            state.reconciliation_cursor.load(Ordering::Relaxed),
-            super::MAX_RECONCILIATION_PROBES
-        );
-        assert!(!state.negative.lock().unwrap().contains_key(last));
-        super::reconcile_workloads_until(&state, Instant::now() + Duration::from_millis(300));
+        let deadline = Instant::now() + super::RECONCILIATION_PASS_TIMEOUT;
+        // Include setup latency in the shared pass budget.
+        thread::sleep(Duration::from_millis(50));
+        super::reconcile_workloads_until(&state, deadline);
+        let examined = state.reconciliation_cursor.load(Ordering::Relaxed);
         assert!(
-            state.negative.lock().unwrap().contains_key(last),
-            "later declarations were starved"
+            (1..backlog).contains(&examined),
+            "the bounded pass must leave a partially examined backlog"
+        );
+        let first = snapshot.routes.keys().next().unwrap();
+        let next = snapshot.routes.keys().nth(examined).unwrap();
+        assert!(state.negative.lock().unwrap().contains_key(first));
+        assert!(!state.negative.lock().unwrap().contains_key(next));
+        state.negative.lock().unwrap().clear();
+        reconcile_workloads(&state);
+        assert!(
+            !state.negative.lock().unwrap().contains_key(first),
+            "the next pass restarted from the first declaration"
+        );
+        assert!(
+            state.negative.lock().unwrap().contains_key(next),
+            "the next pass did not resume at its saved cursor"
         );
     }
 
@@ -7571,10 +7599,7 @@ mod tests {
         let backend = TestTlsBackend::start(&certificate, b"ready");
         let pass_timeout = super::RECONCILIATION_PASS_TIMEOUT;
         // Bound collection by the pass deadline, not by running out of silent workloads.
-        let silent_batches =
-            usize::try_from(pass_timeout.as_millis() / super::PROBE_TIMEOUT.as_millis()).unwrap()
-                + 1;
-        let silent_count = super::MAX_RECONCILIATION_PROBES * silent_batches;
+        let silent_count = silent_reconciliation_backlog_size();
         let (directory, silent, mut state) = silent_public_workloads(silent_count);
         let registry = write_logical_registry(
             directory.path(),
@@ -10119,6 +10144,7 @@ mod tests {
     #[test]
     fn reload_pruning_is_ordered_after_pending_cache_writes() {
         const HOSTNAME: &str = "www.example.com";
+        const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
         let directory = tempdir().unwrap();
         let registry = write_logical_registry(directory.path(), &[("web", 4401)]);
         let ingress_config = directory.path().join("ingress.toml");
@@ -10141,7 +10167,7 @@ mod tests {
             fingerprint: fingerprint.into(),
             not_after_unix_seconds: u64::MAX,
         };
-        install_active_route(
+        super::install_active_route_until(
             &state,
             HOSTNAME,
             ProbeMatch {
@@ -10149,6 +10175,7 @@ mod tests {
                 certificate: proof("AA:BB"),
             },
             Some(1),
+            Instant::now() + OPERATION_TIMEOUT,
         )
         .unwrap();
         let lock = fs::OpenOptions::new()
@@ -10171,7 +10198,7 @@ mod tests {
         let writer_state = Arc::clone(&state);
         let writer_backend = backend.clone();
         let writer = thread::spawn(move || {
-            install_active_route(
+            super::install_active_route_until(
                 &writer_state,
                 HOSTNAME,
                 ProbeMatch {
@@ -10179,17 +10206,22 @@ mod tests {
                     certificate: proof("CC:DD"),
                 },
                 Some(1),
+                Instant::now() + OPERATION_TIMEOUT,
             )
         });
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + OPERATION_TIMEOUT;
         while state.route_cache_transaction.try_lock().is_ok() {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(1));
         }
         let reload_state = Arc::clone(&state);
-        let reloader = thread::spawn(move || reload_public_profile(&reload_state));
+        let reloader = thread::spawn(move || {
+            super::reload_public_profile_with_cache_timeout(&reload_state, OPERATION_TIMEOUT)
+        });
         let routing_readable =
             state.routes.try_read().is_ok() && state.hosting_profile.try_read().is_ok();
+        // Ordering must survive slow disk I/O independently of the discovery timeout.
+        thread::sleep(super::DISCOVERY_TIMEOUT + Duration::from_millis(50));
         fs2::FileExt::unlock(&lock).unwrap();
         writer.join().unwrap().unwrap();
         assert_eq!(
@@ -10204,18 +10236,18 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            install_active_route(
-                &state,
-                HOSTNAME,
-                ProbeMatch {
-                    backend,
-                    certificate: proof("EE:FF"),
-                },
-                Some(1)
-            )
-            .is_err()
-        );
+        let error = super::install_active_route_until(
+            &state,
+            HOSTNAME,
+            ProbeMatch {
+                backend,
+                certificate: proof("EE:FF"),
+            },
+            Some(1),
+            Instant::now() + OPERATION_TIMEOUT,
+        )
+        .unwrap_err();
+        assert!(error.contains("generation changed"), "{error}");
         assert!(
             route_cache::load(cache, HOSTNAME, route_cache::Storage::SeparateState)
                 .unwrap()

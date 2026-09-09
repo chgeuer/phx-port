@@ -68,14 +68,24 @@ impl Server {
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let cert = directory.path().join("cert.pem");
         let key = directory.path().join("key.pem");
+        let configuration = directory.path().join("openssl.cnf");
+        fs::write(
+            &configuration,
+            "[req]\ndistinguished_name = dn\nprompt = no\n[dn]\nCN = localhost\n",
+        )
+        .unwrap();
+        let generator_errors = directory.path().join("openssl.stderr");
+        // Runner defaults can add duplicate extensions before the explicit -addext options.
         let mut generator = BoundedChild(
             Command::new("openssl")
+                .args(["req", "-config"])
+                .arg(&configuration)
                 .args([
-                    "req",
                     "-x509",
                     "-newkey",
                     "rsa:2048",
                     "-nodes",
+                    "-sha256",
                     "-days",
                     "1",
                     "-subj",
@@ -91,13 +101,14 @@ impl Server {
                 .arg(&cert)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(File::create(&generator_errors).unwrap())
                 .spawn()
                 .expect("openssl is required to generate isolated TLS fixtures"),
         );
         assert!(
             generator.wait().success(),
-            "fixture certificate generation failed"
+            "fixture certificate generation failed: {}",
+            fs::read_to_string(&generator_errors).unwrap()
         );
 
         let mut roots = RootCertStore::empty();

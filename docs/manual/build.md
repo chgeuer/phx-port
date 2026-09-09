@@ -114,6 +114,13 @@ and enough silent probes to exceed that budget. This keeps the starvation
 regression active without requiring certificate verification and cache
 persistence to complete within an artificial 300 ms window.
 
+The cursor regression checks progress and resumption rather than assuming a
+fixed probe count fits a short wall-clock window. Cache/reload ordering uses
+generous test-only operation budgets; its lock-contention rejection still
+exercises the production timeout. Rust sample admission fixtures use an isolated,
+minimal OpenSSL request configuration so runner defaults cannot add duplicate
+certificate extensions.
+
 Control-client framing, response limits, and slow-response deadline tests run on
 both Linux and macOS. The client polls nonblocking I/O against one absolute
 deadline instead of changing socket timeouts after a peer may have closed;
