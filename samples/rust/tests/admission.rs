@@ -204,11 +204,38 @@ impl Server {
         let socket_type = SockType::Stream;
         let fd = socket(AddressFamily::Unix, socket_type, SockFlag::empty(), None).unwrap();
         fcntl(&fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).unwrap();
-        connect(fd.as_raw_fd(), &UnixAddr::new(&self.endpoint).unwrap()).unwrap();
         let control = UnixStream::from(fd);
         control.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
         control.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
+        connect(control.as_raw_fd(), &UnixAddr::new(&self.endpoint).unwrap()).unwrap();
         control
+    }
+
+    fn wait_for_control_capacity(&self) -> UnixStream {
+        let deadline = Instant::now() + IO_TIMEOUT;
+        loop {
+            let mut control = self.control();
+            match hello(&mut control) {
+                Ok(()) => return control,
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::UnexpectedEof
+                        ),
+                        "unexpected PHXP readiness failure: {error}"
+                    );
+                    assert!(
+                        Instant::now() < deadline,
+                        "PHXP capacity was not restored: {error}; {}",
+                        self.stderr()
+                    );
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn adopt(&self, id: u8) -> (TcpStream, SocketAddr) {
@@ -216,8 +243,7 @@ impl Server {
         let public_address = listener.local_addr().unwrap();
         let client = self.tcp(public_address);
         let (accepted, _) = listener.accept().unwrap();
-        let mut control = self.control();
-        hello(&mut control).unwrap();
+        let mut control = self.wait_for_control_capacity();
         let packet = encode(&Message::Handoff(Handoff {
             connection_id: [id; 16],
             peeked_length: 0,
@@ -385,18 +411,7 @@ fn slow_phxp_negotiations_cannot_exceed_the_control_worker_limit() {
     }
 
     drop(first);
-    let deadline = Instant::now() + IO_TIMEOUT;
-    loop {
-        let mut replacement = server.control();
-        if hello(&mut replacement).is_ok() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "finished negotiation retained its worker slot"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
+    let _replacement = server.wait_for_control_capacity();
 }
 
 #[test]
@@ -462,6 +477,27 @@ fn failed_direct_and_adopted_tls_handshakes_release_capacity_and_report_failures
     assert!(
         !stderr.contains("localhost"),
         "ordinary failure logs must not expose SNI"
+    );
+}
+
+#[test]
+fn adoption_waits_for_readiness_probe_capacity_to_be_released() {
+    let server = Server::start(1, 1);
+    let mut probe = server.tcp(server.http);
+    request(&mut probe).unwrap();
+
+    let (client, _) = thread::scope(|scope| {
+        scope.spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            drop(probe);
+        });
+        server.adopt(7)
+    });
+    let mut adopted = server.tls_stream(client);
+    assert!(
+        request(&mut adopted)
+            .unwrap()
+            .contains("listener=phxp-handoff-https\n")
     );
 }
 

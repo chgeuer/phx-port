@@ -129,6 +129,11 @@ minimal OpenSSL request configuration so runner defaults cannot add duplicate
 certificate extensions. Connection-drop checks require immediate ID and permit
 release, but await TCP EOF with a bounded async read.
 
+An HTTP readiness probe can briefly retain the last admission permit after its
+socket closes. PHXP fixture setup therefore waits for HELLO/READY before sending
+descriptors, retrying only expected pre-delivery closes within a fixed deadline.
+Explicit overload assertions still require immediate rejection.
+
 Control-client framing, response limits, and slow-response deadline tests run on
 both Linux and macOS. The client polls nonblocking I/O against one absolute
 deadline instead of changing socket timeouts after a peer may have closed;
