@@ -6257,12 +6257,21 @@ mod tests {
         acceptor: Arc<RwLock<TlsAcceptor>>,
         accepted: Arc<AtomicUsize>,
         shutdown: Arc<AtomicBool>,
-        worker: Option<thread::JoinHandle<()>>,
+        workers: Vec<thread::JoinHandle<()>>,
     }
 
     impl TestTlsBackend {
         fn start(certificate: &TestCertificate, response: &'static [u8]) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            Self::start_with_workers(certificate, response, 1)
+        }
+
+        fn start_with_workers(
+            certificate: &TestCertificate,
+            response: &'static [u8],
+            worker_count: usize,
+        ) -> Self {
+            assert!(worker_count > 0);
+            let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
             let identity = Identity::from_pkcs8(
@@ -6273,43 +6282,48 @@ mod tests {
             let acceptor = Arc::new(RwLock::new(TlsAcceptor::new(identity).unwrap()));
             let accepted = Arc::new(AtomicUsize::new(0));
             let shutdown = Arc::new(AtomicBool::new(false));
-            let acceptor_for_worker = Arc::clone(&acceptor);
-            let accepted_for_worker = Arc::clone(&accepted);
-            let shutdown_for_worker = Arc::clone(&shutdown);
-            let worker = thread::spawn(move || {
-                while !shutdown_for_worker.load(Ordering::Acquire) {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            accepted_for_worker.fetch_add(1, Ordering::AcqRel);
-                            stream.set_nonblocking(false).unwrap();
-                            stream
-                                .set_read_timeout(Some(Duration::from_secs(2)))
-                                .unwrap();
-                            stream
-                                .set_write_timeout(Some(Duration::from_secs(2)))
-                                .unwrap();
-                            let acceptor = acceptor_for_worker.read().unwrap().clone();
-                            if let Ok(mut tls) = acceptor.accept(stream) {
-                                let mut request = [0_u8; 64];
-                                if tls.read(&mut request).is_ok_and(|read| read > 0) {
-                                    tls.write_all(response).unwrap();
-                                    tls.flush().unwrap();
+            let workers = (0..worker_count)
+                .map(|_| {
+                    let listener = Arc::clone(&listener);
+                    let acceptor_for_worker = Arc::clone(&acceptor);
+                    let accepted_for_worker = Arc::clone(&accepted);
+                    let shutdown_for_worker = Arc::clone(&shutdown);
+                    thread::spawn(move || {
+                        while !shutdown_for_worker.load(Ordering::Acquire) {
+                            match listener.accept() {
+                                Ok((stream, _)) => {
+                                    accepted_for_worker.fetch_add(1, Ordering::AcqRel);
+                                    stream.set_nonblocking(false).unwrap();
+                                    stream
+                                        .set_read_timeout(Some(Duration::from_secs(2)))
+                                        .unwrap();
+                                    stream
+                                        .set_write_timeout(Some(Duration::from_secs(2)))
+                                        .unwrap();
+                                    let acceptor = acceptor_for_worker.read().unwrap().clone();
+                                    if let Ok(mut tls) = acceptor.accept(stream) {
+                                        let mut request = [0_u8; 64];
+                                        if tls.read(&mut request).is_ok_and(|read| read > 0) {
+                                            tls.write_all(response).unwrap();
+                                            tls.flush().unwrap();
+                                        }
+                                    }
                                 }
+                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                    thread::sleep(Duration::from_millis(10));
+                                }
+                                Err(error) => panic!("test TLS backend accept failed: {error}"),
                             }
                         }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(error) => panic!("test TLS backend accept failed: {error}"),
-                    }
-                }
-            });
+                    })
+                })
+                .collect();
             Self {
                 address,
                 acceptor,
                 accepted,
                 shutdown,
-                worker: Some(worker),
+                workers,
             }
         }
 
@@ -6334,10 +6348,39 @@ mod tests {
     impl Drop for TestTlsBackend {
         fn drop(&mut self) {
             self.shutdown.store(true, Ordering::Release);
-            if let Some(worker) = self.worker.take() {
+            for worker in self.workers.drain(..) {
                 worker.join().unwrap();
             }
         }
+    }
+
+    #[test]
+    fn tls_backend_fixture_does_not_serialize_independent_probes() {
+        const HOSTNAME: &str = "concurrent-probe.example.test";
+        let certificate = TestCertificate::for_hostname(HOSTNAME);
+        let backend = TestTlsBackend::start_with_workers(&certificate, b"", 2);
+        let silent = TcpStream::connect(backend.address).unwrap();
+        let accepted_deadline = Instant::now() + Duration::from_secs(1);
+        while backend.accepted() == 0 {
+            assert!(
+                Instant::now() < accepted_deadline,
+                "silent peer was not accepted"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let proof = super::probe_backend_until(
+            HOSTNAME,
+            &Backend {
+                project: "web".to_string(),
+                role: "https".to_string(),
+                port: backend.port(),
+            },
+            Some(&certificate.connector()),
+            Instant::now() + Duration::from_secs(1),
+        );
+        drop(silent);
+        assert!(proof.unwrap().not_after_unix_seconds > current_unix_seconds());
+        assert_eq!(backend.accepted(), 2);
     }
 
     #[cfg(unix)]
@@ -7154,16 +7197,20 @@ mod tests {
         let hostnames = (0..MAX_ROUTE_DECLARATIONS)
             .map(|index| format!("route-{index:04}.example.test"))
             .collect::<Vec<_>>();
-        let names = hostnames.iter().map(String::as_str).collect::<Vec<_>>();
-        let initial = TestCertificate::for_hostnames_valid_for(
-            &names,
+        // Keep real hostname verification without benchmarking thousand-SAN certificates.
+        let initial = TestCertificate::for_hostname_valid_for(
+            "*.example.test",
             Duration::from_secs(60 * 24 * 60 * 60),
         );
-        let rotated = TestCertificate::for_hostnames_valid_for(
-            &names,
+        let rotated = TestCertificate::for_hostname_valid_for(
+            "*.example.test",
             Duration::from_secs(59 * 24 * 60 * 60),
         );
-        let backend = TestTlsBackend::start(&initial, b"cache");
+        let backend = TestTlsBackend::start_with_workers(
+            &initial,
+            b"cache",
+            super::MAX_RECONCILIATION_PROBES,
+        );
         let directory = tempdir().unwrap();
         let registry = write_logical_registry(directory.path(), &[("web", backend.port())]);
         let assignments_before = fs::read(&registry).unwrap();
@@ -7468,8 +7515,13 @@ mod tests {
     fn reconciled_cache_pass_publishes_proofs_before_its_deadline() {
         let certificate = TestCertificate::for_hostname("a-ready.example.com");
         let backend = TestTlsBackend::start(&certificate, b"ready");
-        let (directory, silent, mut state) =
-            silent_public_workloads(super::MAX_RECONCILIATION_PROBES + 1);
+        let pass_timeout = super::RECONCILIATION_PASS_TIMEOUT;
+        // Bound collection by the pass deadline, not by running out of silent workloads.
+        let silent_batches =
+            usize::try_from(pass_timeout.as_millis() / super::PROBE_TIMEOUT.as_millis()).unwrap()
+                + 1;
+        let silent_count = super::MAX_RECONCILIATION_PROBES * silent_batches;
+        let (directory, silent, mut state) = silent_public_workloads(silent_count);
         let registry = write_logical_registry(
             directory.path(),
             &[
@@ -7493,7 +7545,17 @@ mod tests {
             runtime_root: directory.path().join("runtime"),
         });
         state.probe_connector_override = Some(certificate.connector());
-        super::reconcile_workloads_until(&state, Instant::now() + Duration::from_millis(300));
+        let deadline = Instant::now() + pass_timeout;
+        super::reconcile_workloads_until(&state, deadline);
+        assert!(
+            Instant::now() < deadline,
+            "reconciliation exceeded its pass deadline"
+        );
+        let examined = state.reconciliation_cursor.load(Ordering::Relaxed);
+        assert!(
+            (1..=silent_count).contains(&examined),
+            "silent workload backlog did not exhaust the pass"
+        );
         assert_eq!(state.routes.read().unwrap().len(), 1);
         assert!(
             state

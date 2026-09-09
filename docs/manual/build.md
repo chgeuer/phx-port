@@ -98,6 +98,17 @@ exercised on Linux/macOS x64/ARM64 rather than cross-compiled.
 Pull requests and pushes to `master` run the matrix. A change is not
 cross-platform merely because it compiles on one runner.
 
+Network fixtures preserve cross-platform behavior: the backpressure test sets
+TCP buffer sizes before connecting, so the negotiated receive window cannot
+absorb the entire test payload. The route-cache scale test uses bounded
+concurrent TLS workers and a compact wildcard certificate, but still verifies
+every declared hostname and asserts cache I/O counts for all 1,000 routes.
+
+The publication-deadline test uses the production reconciliation pass budget
+and enough silent probes to exceed that budget. This keeps the starvation
+regression active without requiring certificate verification and cache
+persistence to complete within an artificial 300 ms window.
+
 ## Release
 
 Push a version tag:

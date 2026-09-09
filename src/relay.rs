@@ -138,7 +138,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -320,13 +320,22 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(10), async {
             let (mut public_peer, accepted) = tcp_pair().await;
-            let (upstream, mut workload_peer) = tcp_pair().await;
-            socket2::SockRef::from(&upstream)
-                .set_send_buffer_size(RELAY_BUFFER_SIZE)
+            let buffer_size = u32::try_from(RELAY_BUFFER_SIZE).unwrap();
+            // Negotiate a small receive window in the SYN, before either socket is connected.
+            let workload_socket = TcpSocket::new_v4().unwrap();
+            workload_socket.set_recv_buffer_size(buffer_size).unwrap();
+            workload_socket
+                .bind("127.0.0.1:0".parse().unwrap())
                 .unwrap();
-            socket2::SockRef::from(&workload_peer)
-                .set_recv_buffer_size(RELAY_BUFFER_SIZE)
-                .unwrap();
+            let listener = workload_socket.listen(1).unwrap();
+            let upstream_socket = TcpSocket::new_v4().unwrap();
+            upstream_socket.set_send_buffer_size(buffer_size).unwrap();
+            let (upstream, workload_peer) = tokio::join!(
+                upstream_socket.connect(listener.local_addr().unwrap()),
+                listener.accept()
+            );
+            let upstream = upstream.unwrap();
+            let mut workload_peer = workload_peer.unwrap().0;
             let bytes = Arc::new(AtomicU64::new(0));
             let copied_bytes = Arc::clone(&bytes);
             let (progress, mut receiver) = tokio::sync::mpsc::channel(1);
