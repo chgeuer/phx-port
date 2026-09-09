@@ -663,7 +663,14 @@ mod tests {
             assert_eq!(admission.available_permits(), 1);
             assert!(ids.lock().unwrap().is_empty());
             client.set_nonblocking(true).unwrap();
-            assert_eq!(std::io::Read::read(&mut &client, &mut [0]).unwrap(), 0);
+            let mut client = tokio::net::TcpStream::from_std(client).unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), client.read(&mut [0]))
+                    .await
+                    .expect("dropped adoption did not close the TCP peer")
+                    .unwrap(),
+                0
+            );
         }
     }
 

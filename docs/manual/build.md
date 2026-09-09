@@ -119,7 +119,8 @@ fixed probe count fits a short wall-clock window. Cache/reload ordering uses
 generous test-only operation budgets; its lock-contention rejection still
 exercises the production timeout. Rust sample admission fixtures use an isolated,
 minimal OpenSSL request configuration so runner defaults cannot add duplicate
-certificate extensions.
+certificate extensions. Connection-drop checks require immediate ID and permit
+release, but await TCP EOF with a bounded async read.
 
 Control-client framing, response limits, and slow-response deadline tests run on
 both Linux and macOS. The client polls nonblocking I/O against one absolute
