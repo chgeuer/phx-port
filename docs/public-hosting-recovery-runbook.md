@@ -10,6 +10,7 @@ It does not replace the qualification and canary gates.
 |---|---|---|
 | `/etc/phx-port/ingress.toml` | Root-owned Route Declarations, listeners, and policy | Yes, with owner/mode |
 | `/var/lib/phx-port/ports.toml` | Service-owned stable logical Workload/role assignments | Yes, with owner/mode |
+| `/var/lib/phx-port/route-claims.toml` | Durable automatic-policy exact/wildcard Ownership Claims and saturation markers | Yes when using `certificate_discovery`, with owner/mode |
 | `/var/lib/phx-port/routes.toml` | Disposable certificate-verified route cache | No |
 | `*.lock` | Host-local synchronization | No |
 | `/run/phx-port` | Runtime, control, and Workload-owned PHXP endpoints | No |
@@ -18,6 +19,15 @@ On macOS, substitute the paths from
 `packaging/launchd/dev.phx-port.ingress.plist`. Certificates, private keys, and
 DNS credentials remain Workload-owned and follow each Workload's backup
 policy; they never enter an ingress backup.
+
+The default public `declared` policy still uses exact operator declarations.
+The explicit `certificate_discovery` policy uses registration-scoped Ownership
+Claims instead. An exact owner remains authoritative while its HTTPS
+registration exists, even if stopped or expired; wildcard fallback is
+forbidden until registration removal. Positive activation must be verified
+again after every ingress restart. Claims are **not** disposable derived state:
+losing them loses knowledge of unavailable owners. Restore them before starting
+ingress; missing state is only a first-use bootstrap, never a recovery method.
 
 ## Consistent backup
 
@@ -40,9 +50,28 @@ sudo sha256sum "$backup/ingress.toml" "$backup/ports.toml" |
   sudo tee "$backup/SHA256SUMS" >/dev/null
 ```
 
-On macOS, quiesce first-time Workload allocation, copy both files with
+For automatic discovery, quiesce ingress discovery **and** registry changes
+throughout the complete backup, or take a coordinated filesystem snapshot.
+In addition to the preceding files, require:
+
+```bash
+sudo flock -s /var/lib/phx-port/route-claims.toml.lock \
+  cp --preserve=mode,ownership,timestamps \
+    /var/lib/phx-port/route-claims.toml "$backup/route-claims.toml"
+sudo stat -c '%n uid=%u gid=%g mode=%a size=%s' "$backup/route-claims.toml" |
+  sudo tee -a "$backup/metadata.txt" >/dev/null
+sudo sha256sum "$backup/route-claims.toml" |
+  sudo tee -a "$backup/SHA256SUMS" >/dev/null
+```
+
+Do not omit a missing claim file or reconstruct it from reachable Workloads:
+that could release a stopped exact owner into a wildcard. Follow controlled
+maintenance procedures for socket-activated ingress when quiescing it.
+
+On macOS, quiesce first-time Workload allocation (and discovery for the
+automatic policy), copy the authoritative files with
 `cp -p`, and record `stat -f '%N uid=%u gid=%g mode=%Lp size=%z'` plus
-`shasum -a 256`. Resume allocation only after both files and metadata are
+`shasum -a 256`. Resume allocation/discovery only after all files and metadata are
 durable.
 
 Do not copy a live `routes.toml`, lock file, control socket, handoff socket, or
@@ -61,12 +90,14 @@ Keep DNS and the public firewall withdrawn while restoring.
    service group, and `phx-port-admin` group.
 2. Install the ingress intent as UID 0, not group/other writable.
 3. Install the Port Registry as the service identity with mode `0600`, under a
-   service-owned mode `0700` state directory.
+   service-owned mode `0700` state directory. Under `certificate_discovery`,
+   restore `route-claims.toml` alongside it with the same private ownership and
+   mode before starting ingress.
 4. Create the runtime root as service-owned, `phx-port-admin`-grouped mode
    `0750`, and the handoff directory as service-owned mode `0700`.
 5. Leave `routes.toml`, its lock, control sockets, and PHXP endpoints absent.
 6. Start each Workload with the restored `PHX_PORT_CONFIG`, its exact
-   `PHX_PORT_WORKLOAD_ID`, and its declared role. Existing assignments must be
+   `PHX_PORT_WORKLOAD_ID`, and its declared role (`https` for discovery). Existing assignments must be
    returned idempotently.
 7. Run the complete
    [host preflight](public-hosting-preflight-runbook.md) in the target service
@@ -76,7 +107,7 @@ Keep DNS and the public firewall withdrawn while restoring.
 8. Start ingress and wait for local certificate verification to rebuild
    disposable route state.
 9. Require `proxy check --live` and `proxy check --ready`, then exercise one
-   exact declared hostname and confirm its handoff-success counter before
+   authorized hostname and confirm its handoff-success counter before
    restoring public traffic. Relay success is not PHXP evidence.
 
 Linux installation example:
@@ -88,6 +119,9 @@ sudo install -o root -g phx-port -m 0640 \
 sudo install -d -o phx-port -g phx-port -m 0700 /var/lib/phx-port
 sudo install -o phx-port -g phx-port -m 0600 \
   "$backup/ports.toml" /var/lib/phx-port/ports.toml
+# Required when restoring certificate_discovery:
+# sudo install -o phx-port -g phx-port -m 0600 \
+#   "$backup/route-claims.toml" /var/lib/phx-port/route-claims.toml
 sudo install -d -o phx-port -g phx-port-admin -m 0750 /run/phx-port
 sudo -n -u phx-port -g phx-port -- install -d -o phx-port -g phx-port -m 0700 \
   /run/phx-port/handoff
@@ -106,8 +140,13 @@ sudo rm -f /var/lib/phx-port/routes.toml \
   /var/lib/phx-port/routes.toml.lock
 ```
 
-Never reconstruct `ports.toml` from `routes.toml`. The Route Declarations and
-stable Port Registry are authority; every Verified Route must be proven again.
+Never reconstruct `ports.toml` or `route-claims.toml` from `routes.toml`.
+Declarations or durable claims, together with the stable Port Registry, define
+authority; every Verified Route must be proven again. Malformed claim state
+fails closed instead of being automatically discarded. Preserve claims across
+policy reloads and binary rollback. A binary predating automatic discovery
+cannot consume that Routing Policy; use a compatible rollback binary or an
+explicit, validated migration to the strict declaration policy.
 
 ## Controlled restart and drain
 
@@ -133,8 +172,11 @@ irreversible descriptor-delivery boundary.
 
 Public reconciliation uses at most 24 of the 32 shared certificate-worker
 slots, reserving eight for foreground route selection, and one-second passes,
-resuming at the next declaration rather than starving later
-names. Probe socket I/O has an absolute deadline and observes shutdown.
+resuming at the next declaration or automatic catalogue/claim rather than
+starving later names. Automatic discovery is limited to 32 registered HTTPS
+Workloads and 1,024 durable owner-pattern claims. It never evicts claims;
+candidate overflow or persisted claim-exhaustion markers explicitly block
+automatic routing. Probe socket I/O has an absolute deadline and observes shutdown.
 PHXP endpoint connects are nonblocking with a one-second deadline on both
 Linux and macOS; a full Unix accept queue can cause pre-delivery relay fallback,
 not an indefinite wait holding admission.

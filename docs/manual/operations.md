@@ -29,9 +29,16 @@ Interpretation:
 
 - **live false:** the daemon or authenticated control endpoint is unavailable.
 - **ready false:** ingress is alive but cannot safely serve all required Route
-  Declarations, or it is draining.
+  Declarations, automatic discovery is pending/blocked, or it is draining.
+  Check `routing_policy` and `readiness_reason`.
 - **degraded optional route:** inspect it, but it does not make readiness false.
 - **draining true:** no new connections are admitted.
+
+Under `certificate_discovery`, readiness requires completed reconciliation,
+valid registry/ownership state, at least one verified route, and no ownership
+conflicts. Individual unavailable owners remain visible as degraded without
+preventing unrelated healthy traffic. A known exact owner never falls through
+to a wildcard while its HTTPS registration remains.
 
 On Linux:
 
@@ -62,7 +69,7 @@ Alert on:
 | Condition | Metric or signal |
 |---|---|
 | Ingress unavailable | health command fails or `phx_port_build_info` disappears |
-| Required route unavailable | `phx_port_ready != 1` |
+| Required route unavailable or automatic discovery not ready | `phx_port_ready != 1`; inspect `readiness_reason` |
 | Drain in progress | `phx_port_draining == 1` |
 | Invalid registry snapshot | `phx_port_registry_valid != 1` |
 | Capacity pressure | admission in-use approaches its matching limit |
@@ -75,6 +82,12 @@ Choose alert windows from actual traffic. Do not page on a single intentional
 overload rejection or planned drain.
 
 ## Add or change a route
+
+The steps below are for the default `declared` policy. With explicit
+`certificate_discovery`, register the Workload's logical `https` role and start
+its trusted default-certificate listener instead; do not add host declarations.
+Inspect learned claims and readiness. Stopping a Workload does not release its
+names; remove its HTTPS registration only when deliberately releasing ownership.
 
 1. Start the Workload with the shared registry, exact logical ID, and role.
 2. Confirm its loopback TLS listener presents a system-trusted certificate for
@@ -126,7 +139,9 @@ phx-port proxy check --ready
 
 Expect a bounded `result=rotated` event after the replacement certificate
 verifies. An expired or untrusted certificate deactivates the route; a required
-route then makes readiness false.
+declared route then makes readiness false. Automatic-policy ownership survives
+deactivation, and a known exact hostname continues to fail closed rather than
+falling through to another Workload's wildcard.
 
 Do not copy certificate keys into ingress storage and do not disable hostname
 verification to recover readiness.
@@ -157,7 +172,12 @@ phx-port proxy check --ready
 ## Backup
 
 Back up the root-owned intent and stable Port Registry with metadata and
-checksums. Do not back up route cache, lock files, or runtime sockets.
+checksums. Under public `certificate_discovery`, **also back up durable
+`route-claims.toml`**. It preserves unavailable exact owners across restart
+and must never be treated as disposable route cache. Quiesce discovery and
+registry changes, or use a coordinated filesystem snapshot, for a consistent
+automatic-policy backup. Do not back up positive route cache, lock files, or
+runtime sockets.
 
 Linux:
 
@@ -171,6 +191,17 @@ sudo cp --preserve=mode,ownership,timestamps \
   /etc/phx-port/ingress.toml "$backup/ingress.toml"
 sudo sha256sum "$backup/ingress.toml" "$backup/ports.toml" |
   sudo tee "$backup/SHA256SUMS" >/dev/null
+```
+
+For `certificate_discovery`, this additional copy and checksum are mandatory
+before resuming discovery/registration changes:
+
+```bash
+sudo flock -s /var/lib/phx-port/route-claims.toml.lock \
+  cp --preserve=mode,ownership,timestamps \
+    /var/lib/phx-port/route-claims.toml "$backup/route-claims.toml"
+sudo sha256sum "$backup/route-claims.toml" |
+  sudo tee -a "$backup/SHA256SUMS" >/dev/null
 ```
 
 Use the complete [recovery runbook](../public-hosting-recovery-runbook.md) for
@@ -269,11 +300,14 @@ public canary has not yet been completed.
 | Symptom | First checks | Do not |
 |---|---|---|
 | `ready=false` | Status degraded routes, Workload listener, SAN/chain/expiry, registry identity | Disable certificate verification |
-| Unknown SNI rejected | Confirm an exact declaration and successful reload | Enable production discovery |
+| Unknown SNI rejected | Check selected policy: declaration/reload, or default-certificate SAN proof and claims | Silently change the Routing Policy |
+| Automatic exact name fails while wildcard works | Check its reserved HTTPS registration, listener, certificate, and degraded reason | Delete the claim or expect outage fallback to wildcard |
+| Automatic ownership conflict/capacity | Inspect bounded claims and marked Workload IDs; remove registrations only when releasing ownership | Evict claims or choose an arbitrary incumbent |
 | PHXP success drops | Check Workload endpoint and identity; confirm relay succeeds | Delete the whole runtime root |
 | Relay capacity rejects | Compare relay in-use/limit, backend health, FD and ephemeral-port pressure | Raise limits without host evidence |
 | Reload rejected | Validate the staged config and inspect bounded reload event | Restart repeatedly with invalid intent |
 | Registry invalid | Restore authoritative `ports.toml` backup | Reconstruct it from `routes.toml` |
+| Ownership state unavailable | Restore authoritative `route-claims.toml` and private modes before restart | Delete it to rediscover only currently reachable owners |
 | Control denied | Check profile environment, group membership, socket owner/mode | Make the socket world-writable |
 | Restart hangs | Inspect relay/PHXP counters and shutdown event; wait for bounded deadline | Kill indiscriminately before recording evidence |
 

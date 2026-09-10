@@ -1097,11 +1097,17 @@ fn main() {
                         Some(path) => {
                             let paths = production_paths::ProductionPaths::from_environment()
                                 .unwrap_or_else(exit_registry_error);
-                            let profile = ingress_config::HostingProfile::load_for_inspection(PathBuf::from(path))
-                                .unwrap_or_else(exit_registry_error);
-                            let snapshot = profile.public_snapshot().expect("explicit public config");
-                            if snapshot.routing_policy == ingress_config::RoutingPolicy::CertificateDiscovery {
-                                route_claims::print(&paths.ownership_claims()).unwrap_or_else(exit_registry_error);
+                            let profile = ingress_config::HostingProfile::load_for_inspection(
+                                PathBuf::from(path),
+                            )
+                            .unwrap_or_else(exit_registry_error);
+                            let snapshot =
+                                profile.public_snapshot().expect("explicit public config");
+                            if snapshot.routing_policy
+                                == ingress_config::RoutingPolicy::CertificateDiscovery
+                            {
+                                route_claims::print(&paths.ownership_claims())
+                                    .unwrap_or_else(exit_registry_error);
                                 return;
                             }
                             (paths.route_cache, snapshot.routing_policy.route_storage())
@@ -1159,7 +1165,8 @@ fn main() {
                 if snapshot.routing_policy == ingress_config::RoutingPolicy::Declared {
                     paths.validate().unwrap_or_else(exit_registry_error);
                 } else {
-                    paths.validate_for_policy_until(snapshot.routing_policy, None)
+                    paths
+                        .validate_for_policy_until(snapshot.routing_policy, None)
                         .unwrap_or_else(exit_registry_error);
                 }
                 #[cfg(unix)]
@@ -1175,7 +1182,10 @@ fn main() {
                 );
                 println!("Routing policy: {}", snapshot.routing_policy.label());
                 if snapshot.routing_policy == ingress_config::RoutingPolicy::CertificateDiscovery {
-                    println!("Durable ownership claims: {}", paths.ownership_claims().display());
+                    println!(
+                        "Durable ownership claims: {}",
+                        paths.ownership_claims().display()
+                    );
                 }
             }
             Some("config")

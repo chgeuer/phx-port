@@ -8,11 +8,10 @@ use tempfile::tempdir_in;
 use toml_edit::DocumentMut;
 
 fn tempdir() -> std::io::Result<tempfile::TempDir> {
-    #[cfg(unix)]
-    let root = Path::new("/tmp").canonicalize()?;
-    #[cfg(not(unix))]
-    let root = std::env::temp_dir().canonicalize()?;
-    tempdir_in(root)
+    let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    tempdir_in(root.canonicalize()?)
 }
 
 #[cfg(unix)]

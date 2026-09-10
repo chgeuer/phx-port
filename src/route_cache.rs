@@ -440,7 +440,9 @@ fn validate_document(document: &DocumentMut, storage: Storage) -> Result<(), Str
 
 fn validate_route_hostname(hostname: &str, storage: Storage) -> Result<(), String> {
     let normalized = match storage {
-        Storage::CombinedRegistry | Storage::SeparateDiscoveryState => route_pattern::normalize(hostname),
+        Storage::CombinedRegistry | Storage::SeparateDiscoveryState => {
+            route_pattern::normalize(hostname)
+        }
         Storage::SeparateState => tls_client_hello::normalize_hostname(hostname),
     }
     .map_err(|_| format!("derived route hostname {hostname:?} is invalid"))?;
@@ -568,8 +570,14 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_cache_patterns_are_canonical_and_development_only() {
+    fn wildcard_cache_patterns_require_a_discovery_storage_policy() {
         let directory = tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
         let path = directory.path().join("ports.toml");
         for invalid in ["*.EXAMPLE.test", "*.*.example.test", "w*.example.test"] {
             assert!(
@@ -597,6 +605,23 @@ mod tests {
             .is_err()
         );
         assert!(!path.exists());
+        store(
+            &path,
+            Storage::SeparateDiscoveryState,
+            "*.example.test",
+            "web",
+            "https",
+            "AA",
+        )
+        .unwrap();
+        assert_eq!(
+            load(&path, "*.example.test", Storage::SeparateDiscoveryState)
+                .unwrap()
+                .unwrap()
+                .project,
+            "web"
+        );
+        assert!(super::validate(&path, Storage::SeparateState).is_err());
     }
 
     #[test]

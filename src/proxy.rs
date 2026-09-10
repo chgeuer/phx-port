@@ -7,8 +7,8 @@ use crate::{
     },
     config_path, handoff,
     ingress_config::{
-        DEFAULT_RELAY_IDLE_TIMEOUT, HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot,
-        RouteDeclaration, RoutingPolicy,
+        DEFAULT_RELAY_IDLE_TIMEOUT, HostingProfile, PublicIngressSnapshot, RouteDeclaration,
+        RoutingPolicy,
     },
     ingress_limits::{
         CERTIFICATE_PROBE_WORKERS, DaemonConfig, ROUTE_SELECTION_WORKERS, TOKIO_RUNTIME_WORKERS,
@@ -147,14 +147,6 @@ impl IngressShutdown {
             .transition
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
-            let discovery = state.certificate_discovery.read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let earliest = routes.iter()
-                .filter(|(pattern, active)| discovery.active(pattern, active, snapshot.generation, current_unix_seconds()))
-                .map(|(_, active)| active.certificate.not_after_unix_seconds).min().unwrap_or(0);
-            metric!("phx_port_discovery_certificate_not_after_min_seconds {earliest}");
-        }
         self.drain_window.get_or_init(|| {
             let started_at = Instant::now();
             let deadline = started_at
@@ -355,6 +347,7 @@ struct SelectedRoute {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RouteFailure {
     MissingRegistration,
+    BackendUnavailable,
     RegistryInvalid,
     VerificationFailed,
     CertificateExpired,
@@ -365,6 +358,7 @@ impl RouteFailure {
     fn label(self) -> &'static str {
         match self {
             Self::MissingRegistration => "missing_registration",
+            Self::BackendUnavailable => "backend_unavailable",
             Self::RegistryInvalid => "registry_invalid",
             Self::VerificationFailed => "verification_failed",
             Self::CertificateExpired => "certificate_expired",
@@ -829,7 +823,6 @@ impl ProxyState {
                         route_deadline_remaining(deadline)?.min(Duration::from_millis(5)),
                     );
                 }
-                Err(_) => {}
             }
         }
     }
@@ -897,29 +890,6 @@ impl ProxyState {
             .hosting_profile
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
-            let discovery = state.certificate_discovery.read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(error) = discovery.error {
-                lines.push(format!("blocked\tcertificate_discovery\t{}", error.label()));
-            }
-            for (pattern, owners) in &discovery.claims.routes {
-                if active_hostnames.contains(pattern) {
-                    continue;
-                }
-                let reason = if owners.len() > 1 {
-                    "ownership_conflict"
-                } else if let Some(error) = discovery.error {
-                    error.label()
-                } else if expired_hostnames.contains(pattern) {
-                    "certificate_expired"
-                } else {
-                    failures.get(pattern).copied().map(RouteFailure::label).unwrap_or("awaiting_verification")
-                };
-                lines.push(format!("inactive\t{pattern}\t{}\thttps\tclaim\t{reason}",
-                    owners.iter().cloned().collect::<Vec<_>>().join(",")));
-            }
-                }
         self.route_cache_for_profile(&profile)
     }
 
@@ -1393,13 +1363,34 @@ fn reload_public_profile_with_cache_timeout(
         return ConfigReloadOutcome::Superseded(snapshot.generation);
     }
     if replacement_snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
-        let valid_claims = state.production_paths.as_ref().ok_or_else(|| {
-            "certificate_discovery requires production paths".to_string()
-        }).and_then(|paths| route_claims::load_until(
-            &paths.ownership_claims(), Some(state.access_deadline(deadline)),
-        ));
+        let initialized = state
+            .certificate_discovery
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .initialized;
+        let valid_claims = state
+            .production_paths
+            .as_ref()
+            .ok_or_else(|| "certificate_discovery requires production paths".to_string())
+            .and_then(|paths| {
+                if initialized {
+                    route_claims::load_existing_until(
+                        &paths.ownership_claims(),
+                        Some(state.access_deadline(deadline)),
+                    )
+                } else {
+                    route_claims::load_until(
+                        &paths.ownership_claims(),
+                        Some(state.access_deadline(deadline)),
+                    )
+                }
+            });
         if valid_claims.is_err() {
-            record_config_reload_failure(state, replacement_snapshot.generation, ConfigReloadError::StateUnavailable);
+            record_config_reload_failure(
+                state,
+                replacement_snapshot.generation,
+                ConfigReloadError::StateUnavailable,
+            );
             return ConfigReloadOutcome::Rejected(replacement_snapshot.generation);
         }
     }
@@ -1466,8 +1457,15 @@ fn reload_public_profile_with_cache_timeout(
     *profile = replacement;
     drop(routes);
     drop(profile);
-    *state.certificate_discovery.write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = certificate_discovery::State::default();
+    {
+        let mut discovery = state
+            .certificate_discovery
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let initialized = discovery.initialized;
+        *discovery = certificate_discovery::State::default();
+        discovery.initialized = initialized;
+    }
 
     state
         .route_failures
@@ -1684,7 +1682,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     let (control_path, control_thread) =
         match start_control_server(Arc::clone(&state), shutdown.clone()) {
             Ok(control) => control,
-            Err(error) if report_rejection => {
+            Err(error) => {
                 route_workers.close();
                 let _ = route_workers.join();
                 return Err(error);
@@ -2202,9 +2200,9 @@ fn current_active_route(
     let hostname =
         tls_client_hello::normalize_hostname(hostname).map_err(|error| error.to_string())?;
     let profile = state.public_snapshot();
-    let automatic = profile.as_ref().filter(|snapshot| {
-        snapshot.routing_policy == RoutingPolicy::CertificateDiscovery
-    });
+    let automatic = profile
+        .as_ref()
+        .filter(|snapshot| snapshot.routing_policy == RoutingPolicy::CertificateDiscovery);
     let wildcard = if profile.is_none() {
         route_pattern::matching_wildcard(&hostname)
     } else {
@@ -2238,12 +2236,20 @@ fn current_active_route(
         let Some(selected) = selected else {
             return Ok(None);
         };
-        if let Some(snapshot) = automatic
-            && !state.certificate_discovery.read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .owns(&selected.pattern, &selected.active.backend, snapshot.generation)
-        {
-            return Ok(None);
+        if let Some(snapshot) = automatic {
+            let discovery = state
+                .certificate_discovery
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !discovery.selects(
+                &hostname,
+                &selected.pattern,
+                &selected.active.backend,
+                snapshot.generation,
+            ) || (selected.pattern != hostname && !discovery.reconciled)
+            {
+                return Ok(None);
+            }
         }
         if selected.pattern != hostname
             && state
@@ -3248,7 +3254,12 @@ fn degraded_route_statuses(
         return Vec::new();
     };
     if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
-        return certificate_discovery::degraded_statuses(state, &snapshot, routes, now_unix_seconds);
+        return certificate_discovery::degraded_statuses(
+            state,
+            &snapshot,
+            routes,
+            now_unix_seconds,
+        );
     }
     let (active_hostnames, expired_hostnames) = routes.iter().fold(
         (BTreeSet::new(), BTreeSet::new()),
@@ -3318,7 +3329,12 @@ fn declared_certificate_statuses(
         return (0, Vec::new());
     };
     if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
-        return certificate_discovery::certificate_statuses(state, &snapshot, routes, now_unix_seconds);
+        return certificate_discovery::certificate_statuses(
+            state,
+            &snapshot,
+            routes,
+            now_unix_seconds,
+        );
     }
     let mut count = 0;
     let statuses = snapshot
@@ -3392,7 +3408,11 @@ fn render_json_control_status(state: &ProxyState, shutdown: &IngressShutdown) ->
         ready: route_summary.ready && !shutdown.is_requested(),
         hosting_profile: route_summary.hosting_profile,
         routing_policy: route_summary.routing_policy,
-        readiness_reason: if shutdown.is_requested() { "draining" } else { route_summary.readiness_reason },
+        readiness_reason: if shutdown.is_requested() {
+            "draining"
+        } else {
+            route_summary.readiness_reason
+        },
         generation: route_summary.config_generation,
         listeners,
         listeners_omitted: 0,
@@ -3585,7 +3605,12 @@ fn render_control_health(state: &ProxyState, shutdown: &IngressShutdown) -> Stri
     };
     let mut health = serde_json::to_value(health).expect("JSON-safe health status");
     health["routing_policy"] = summary.routing_policy.into();
-    health["readiness_reason"] = if draining { "draining" } else { summary.readiness_reason }.into();
+    health["readiness_reason"] = if draining {
+        "draining"
+    } else {
+        summary.readiness_reason
+    }
+    .into();
     let mut rendered = serde_json::to_string(&health).expect("JSON-safe health status");
     rendered.push('\n');
     rendered
@@ -3623,13 +3648,23 @@ fn render_prometheus_metrics(state: &ProxyState, shutdown: &IngressShutdown) -> 
     metric!("phx_port_config_generation {}", summary.config_generation);
     metric!(
         "phx_port_routing_policy_info{{hosting_profile=\"{}\",routing_policy=\"{}\"}} 1",
-        summary.hosting_profile, summary.routing_policy
+        summary.hosting_profile,
+        summary.routing_policy
     );
-    metric!("phx_port_readiness_reason{{reason=\"{}\"}} 1",
-        if shutdown.is_requested() { "draining" } else { summary.readiness_reason });
+    metric!(
+        "phx_port_readiness_reason{{reason=\"{}\"}} 1",
+        if shutdown.is_requested() {
+            "draining"
+        } else {
+            summary.readiness_reason
+        }
+    );
     if let Some(complete) = summary.discovery_reconciled {
         metric!("phx_port_discovery_reconciled {}", usize::from(complete));
-        metric!("phx_port_discovery_workloads {}", summary.discovery_workloads);
+        metric!(
+            "phx_port_discovery_workloads {}",
+            summary.discovery_workloads
+        );
     }
     for (route_state, value) in [
         ("declared", summary.declared_routes),
@@ -3827,6 +3862,21 @@ fn render_prometheus_metrics(state: &ProxyState, shutdown: &IngressShutdown) -> 
             .routes
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+            let discovery = state
+                .certificate_discovery
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let earliest = routes
+                .iter()
+                .filter(|(pattern, active)| {
+                    discovery.active(pattern, active, snapshot.generation, current_unix_seconds())
+                })
+                .map(|(_, active)| active.certificate.not_after_unix_seconds)
+                .min()
+                .unwrap_or(0);
+            metric!("phx_port_discovery_certificate_not_after_min_seconds {earliest}");
+        }
         let failures = state
             .route_failures
             .read()
@@ -3902,9 +3952,15 @@ fn render_control_response(
                 route_summary.routing_policy,
                 route_summary.claimed_routes,
                 route_summary.discovery_workloads,
-                route_summary.discovery_reconciled.map(|complete| complete.to_string())
+                route_summary
+                    .discovery_reconciled
+                    .map(|complete| complete.to_string())
                     .unwrap_or_else(|| "not_applicable".into()),
-                if draining { "draining" } else { route_summary.readiness_reason },
+                if draining {
+                    "draining"
+                } else {
+                    route_summary.readiness_reason
+                },
             );
             let listeners = state
                 .listeners
@@ -4029,15 +4085,19 @@ fn render_control_response(
             if let Ok(routes) = state.routes.read() {
                 for (hostname, route) in routes.iter() {
                     if let Some(snapshot) = public_snapshot.as_ref() {
-                        let owned = if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
-                            state.certificate_discovery.read()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .owns(hostname, &route.backend, snapshot.generation)
-                        } else {
-                            snapshot.routes.get(hostname).is_some_and(|declaration| {
-                                declaration.workload == route.backend.project && declaration.role == route.backend.role
-                            })
-                        };
+                        let owned =
+                            if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+                                state
+                                    .certificate_discovery
+                                    .read()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .owns(hostname, &route.backend, snapshot.generation)
+                            } else {
+                                snapshot.routes.get(hostname).is_some_and(|declaration| {
+                                    declaration.workload == route.backend.project
+                                        && declaration.role == route.backend.role
+                                })
+                            };
                         if route.declaration_generation != Some(snapshot.generation) || !owned {
                             continue;
                         }
@@ -4076,6 +4136,37 @@ fn render_control_response(
                     .route_failures
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+                    let discovery = state
+                        .certificate_discovery
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(error) = discovery.error {
+                        lines.push(format!("blocked\tcertificate_discovery\t{}", error.label()));
+                    }
+                    for (pattern, owners) in &discovery.claims.routes {
+                        if active_hostnames.contains(pattern) {
+                            continue;
+                        }
+                        let reason = if owners.len() > 1 {
+                            "ownership_conflict"
+                        } else if let Some(error) = discovery.error {
+                            error.label()
+                        } else if expired_hostnames.contains(pattern) {
+                            "certificate_expired"
+                        } else {
+                            failures
+                                .get(pattern)
+                                .copied()
+                                .map(RouteFailure::label)
+                                .unwrap_or("awaiting_verification")
+                        };
+                        lines.push(format!(
+                            "inactive\t{pattern}\t{}\thttps\tclaim\t{reason}",
+                            owners.iter().cloned().collect::<Vec<_>>().join(",")
+                        ));
+                    }
+                }
                 for (hostname, declaration) in &snapshot.routes {
                     if active_hostnames.contains(hostname) {
                         continue;
@@ -4102,10 +4193,14 @@ fn render_control_response(
             }
             lines.sort();
             let mut bytes = 0;
-            let kept = lines.iter().take(MAX_ROUTE_DIAGNOSTICS).take_while(|line| {
-                bytes += line.len() + 1;
-                bytes <= CONTROL_RESPONSE_LIMIT as usize - 64
-            }).count();
+            let kept = lines
+                .iter()
+                .take(MAX_ROUTE_DIAGNOSTICS)
+                .take_while(|line| {
+                    bytes += line.len() + 1;
+                    bytes <= CONTROL_RESPONSE_LIMIT as usize - 64
+                })
+                .count();
             let omitted = lines.len().saturating_sub(kept);
             lines.truncate(kept);
             if omitted > 0 {
@@ -4724,7 +4819,10 @@ fn load_public_registry_until(
     let undeclared = if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
         0
     } else {
-        assignments.keys().filter(|assignment| !declared_assignments.contains(*assignment)).count()
+        assignments
+            .keys()
+            .filter(|assignment| !declared_assignments.contains(*assignment))
+            .count()
     };
     state
         .undeclared_registrations
@@ -5274,11 +5372,25 @@ fn apply_reconciled_probe(
                     );
                 }
             }
+            if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+                drop(routes);
+                set_route_failure(state, hostname, RouteFailure::BackendUnavailable);
+            }
         }
-        Ok(ReconciledProbe::Certificate(Err(_))) => {
+        Ok(ReconciledProbe::Certificate(Err(error))) => {
             routes.remove(hostname);
             drop(routes);
-            set_route_failure(state, hostname, RouteFailure::VerificationFailed);
+            set_route_failure(
+                state,
+                hostname,
+                if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery
+                    && error.starts_with("TCP connection failed")
+                {
+                    RouteFailure::BackendUnavailable
+                } else {
+                    RouteFailure::VerificationFailed
+                },
+            );
             if observed.is_none() {
                 cache_negative(state, hostname);
             } else {
@@ -5698,11 +5810,16 @@ fn prepare_active_route(
             if snapshot.generation == generation =>
         {
             if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
-                if !state.certificate_discovery.read()
+                if !state
+                    .certificate_discovery
+                    .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .owns(hostname, &matched.backend, generation)
                 {
-                    return Err("durable ownership claim changed while certificate proof was pending".into());
+                    return Err(
+                        "durable ownership claim changed while certificate proof was pending"
+                            .into(),
+                    );
                 }
             } else {
                 let declaration = snapshot.routes.get(hostname).ok_or_else(|| {
@@ -6014,11 +6131,19 @@ fn probe_candidates_until(
     state: &ProxyState,
     deadline: Instant,
 ) -> Vec<ProbeMatch> {
-    let mut matches = probe_all_candidates_until(hostname, candidates, state, deadline);
-    if matches.iter().any(|matched| matched.certificate.wildcard.is_none()) {
+    let mut matches = probe_all_candidates_until(hostname, candidates, state, deadline).matches;
+    if matches
+        .iter()
+        .any(|matched| matched.certificate.wildcard.is_none())
+    {
         matches.retain(|matched| matched.certificate.wildcard.is_none());
     }
     prefer_https_per_project(matches)
+}
+
+struct CandidateProbeResults {
+    matches: Vec<ProbeMatch>,
+    complete: bool,
 }
 
 fn probe_all_candidates_until(
@@ -6026,9 +6151,11 @@ fn probe_all_candidates_until(
     candidates: Vec<Backend>,
     state: &ProxyState,
     deadline: Instant,
-) -> Vec<ProbeMatch> {
+) -> CandidateProbeResults {
     let (sender, receiver) = mpsc::channel();
     let report_rejection = state.public_snapshot().is_none();
+    let expected = candidates.len();
+    let completed = Arc::new(AtomicUsize::new(0));
 
     for backend in candidates {
         if state.check_running_until(deadline).is_err() {
@@ -6038,6 +6165,7 @@ fn probe_all_candidates_until(
         let hostname = hostname.to_string();
         let connector = state.probe_connector_override.clone();
         let cancelled = Arc::clone(&state.shutdown_requested);
+        let completed = Arc::clone(&completed);
         if let Err(error) = state.submit_probe(deadline, move || {
             match probe_backend_until_cancellable(
                 &hostname,
@@ -6052,13 +6180,15 @@ fn probe_all_candidates_until(
                         certificate,
                     });
                 }
-                Err(error) => {
+                Err(error) if report_rejection => {
                     eprintln!(
                         "Probe rejected {hostname} at 127.0.0.1:{} ({} {}): {error}",
                         backend.port, backend.project, backend.role
                     );
                 }
+                Err(_) => {}
             }
+            completed.fetch_add(1, Ordering::Release);
             Ok(())
         }) {
             eprintln!("Cannot start bounded certificate probe: {error}");
@@ -6069,7 +6199,10 @@ fn probe_all_candidates_until(
 
     let mut matches = collect_probe_matches(receiver, deadline);
     matches.sort_by(|left, right| left.backend.cmp(&right.backend));
-    matches
+    CandidateProbeResults {
+        matches,
+        complete: completed.load(Ordering::Acquire) == expected,
+    }
 }
 
 fn collect_probe_matches(
@@ -6739,13 +6872,18 @@ mod tests {
             first_handshake_delay: Duration,
         ) -> Self {
             Self::start_at_with_workers_and_delay(
-                certificate, response, worker_count, first_handshake_delay,
+                certificate,
+                response,
+                worker_count,
+                first_handshake_delay,
                 SocketAddr::from(([127, 0, 0, 1], 0)),
             )
         }
 
         pub(super) fn start_at(
-            certificate: &TestCertificate, response: &'static [u8], address: SocketAddr,
+            certificate: &TestCertificate,
+            response: &'static [u8],
+            address: SocketAddr,
         ) -> Self {
             Self::start_at_with_workers_and_delay(certificate, response, 1, Duration::ZERO, address)
         }
@@ -6758,7 +6896,8 @@ mod tests {
             address: SocketAddr,
         ) -> Self {
             assert!(worker_count > 0);
-            let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            let socket =
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
             socket.set_reuse_address(true).unwrap();
             socket.bind(&address.into()).unwrap();
             socket.listen(128).unwrap();

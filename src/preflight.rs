@@ -239,7 +239,9 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
                     paths.validate_intent_separation(&snapshot.ingress_config)?;
                 }
                 paths.validate_for_policy_until(
-                    snapshot.as_ref().map_or(RoutingPolicy::Declared, |snapshot| snapshot.routing_policy),
+                    snapshot
+                        .as_ref()
+                        .map_or(RoutingPolicy::Declared, |snapshot| snapshot.routing_policy),
                     Some(registry_deadline()),
                 )
             })();
@@ -444,13 +446,22 @@ fn check_registrations(
     };
 
     if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
-        let count = assignments.keys().filter(|(_, role)| role == "https").count();
+        let count = assignments
+            .keys()
+            .filter(|(_, role)| role == "https")
+            .count();
         if count > crate::route_claims::MAX_DISCOVERY_WORKLOADS {
             report.fail("registrations", "certificate_discovery Workload capacity exceeded; partial candidate sets are forbidden");
         } else if count == 0 {
-            report.warn("registrations", "no logical HTTPS Workloads registered; discovery readiness will remain false");
+            report.warn(
+                "registrations",
+                "no logical HTTPS Workloads registered; discovery readiness will remain false",
+            );
         } else {
-            report.pass("registrations", format!("{count} logical HTTPS Workload(s) eligible for certificate discovery"));
+            report.pass(
+                "registrations",
+                format!("{count} logical HTTPS Workload(s) eligible for certificate discovery"),
+            );
         }
         return Vec::new();
     }

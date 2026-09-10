@@ -1,5 +1,16 @@
 # Public Hosting Hardening Design
 
+## Routing-policy extension
+
+The base design below specifies the default public `declared` Routing Policy.
+Public `routing_policy = "certificate_discovery"` is a later explicit opt-in,
+not a relaxation of existing declarations or the shared-identity trust
+boundary. It adds certificate-driven exact/wildcard Ownership Claims with
+registration-scoped persistence, exact precedence, and fail-closed conflicts.
+The [public-server manual](manual/public-server.md#opt-in-certificate-driven-production-routing)
+and [CONTEXT vocabulary](../CONTEXT.md) define the implemented extension.
+Its automated tests do not replace public-host qualification or canary gates.
+
 ## Status
 
 Accepted on 2026-09-02. The

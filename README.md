@@ -172,8 +172,8 @@ phx-port daemon --listen 0.0.0.0:443 --listen '[::]:443'
 Development is the default Hosting Profile and retains dynamic certificate
 discovery, including verified one-label wildcard DNS SAN routes. Public mode
 is selected only by `--ingress-config PATH` or `PHX_PORT_INGRESS_CONFIG`.
-Public configuration accepts from one through 1,000
-exact Route Declarations:
+Public configuration defaults to `routing_policy = "declared"` and accepts
+from one through 1,000 exact Route Declarations:
 
 ```toml
 [ingress]
@@ -196,6 +196,66 @@ role = "https"
 required = false
 relay_idle_timeout_seconds = 0 # disable for an intentionally quiet long-lived protocol
 ```
+
+For **explicit production certificate-driven discovery**, use this alternative,
+with no `[ingress.hosts]` table:
+
+```toml
+[ingress]
+mode = "public"
+routing_policy = "certificate_discovery"
+listen = ["0.0.0.0:443", "[::]:443"]
+```
+
+This keeps the public Hosting Profile, dedicated service identity, logical
+Workload Port Registry, and admission limits. It changes hostname authority:
+registered logical `https` Workloads announce their default certificate's DNS
+SANs, then prove them through system-trusted TLS. No per-host mapping is needed.
+An exact DNS SAN outranks a matching wildcard SAN regardless of startup order;
+two owners at the same specificity fail closed. `*.example.com` matches
+`foo.example.com` and `bar.example.com`, but not `example.com`,
+`deep.foo.example.com`, suffix lookalikes, or a literal wildcard client SNI.
+Wildcard activation also verifies that the trusted handshake's returned leaf
+contains that very wildcard SAN, not merely an exact representative name.
+
+Learned **Ownership Claims** are durable and registration-scoped. A known exact
+owner that stops, becomes unreachable, or loses a valid certificate continues
+to reserve its hostname, including after ingress restart: it **cannot fall
+through to a wildcard**. Returning with the same registration and valid TLS
+restores activation; removing the owning HTTPS registration releases the claim.
+Wildcard ownership and same-specificity conflicts are likewise retained until
+their registrations are removed. Positive cache entries never activate traffic
+without new verification on process restart.
+
+Automatic discovery permits at most 32 registered HTTPS Workloads and 1,024
+owner-pattern claims. Claims are never LRU-evicted. Exhaustion blocks automatic
+routing explicitly; a durable saturation marker prevents forgotten ownership
+from exposing an exact hostname to a wildcard after restart. Remove the marked
+HTTPS registrations to release that otherwise unrecorded authority.
+Readiness requires completed reconciliation, a valid registry, verified routes,
+and no ownership conflicts. Unavailable individual owners are diagnosed but
+do not stop other healthy routes serving. Status reports the actual public
+routing policy and bounded claim/failure details; dynamic metrics never label
+hostnames or Workload IDs.
+
+Eager announcement requires a usable **no-SNI default certificate**. Bounded
+cold-SNI discovery can find additional certificates, but a warm wildcard does
+not enumerate hidden SNI-only certificate catalogs. Put dedicated exact names
+in their Workload's default certificate for automatic specificity arbitration.
+Production discovery considers `https`, not the development `main` fallback.
+It trusts certificates within one shared Ingress Trust Domain, not isolated
+tenants, and does not change TLS termination or give ingress private keys.
+Routing is per TLS connection's initial SNI, not encrypted HTTP `Host` or
+`:authority`. Workloads must enforce their own hostname policy; when HTTP/2
+connection coalescing would cross exact/wildcard owners, reject misdirected
+requests with HTTP 421 or prevent that coalescing at the TLS/HTTP endpoints.
+See the [public-server manual](docs/manual/public-server.md) for lifecycle,
+readiness, and recovery details.
+
+**Existing public deployments remain exact declaration-only by default.**
+Discovery must be explicitly selected, rejects mixed declarations/discovery,
+and still rejects names for which no unambiguous certificate-proven owner
+exists.
 
 `[ingress.metrics]` is optional and accepts one numeric loopback socket
 address with a nonzero port. It serves only `GET /metrics`, limits request
@@ -224,7 +284,7 @@ at most one `event=source_diagnostic` per second containing its kernel peer IP
 and normalized SNI. Expired settings are inert; normal events and metrics
 contain no source address.
 
-Public relay inactivity defaults to 1,800 seconds per Route Declaration.
+Public relay inactivity defaults to 1,800 seconds, including discovered routes.
 `relay_idle_timeout_seconds` may extend that bidirectional inactivity window;
 zero explicitly disables it for the declaration. Progress in either direction
 resets the deadline, including each successful partial write under
@@ -240,11 +300,13 @@ state, and runtime endpoints in separate ownership domains:
 |---|---|---|
 | Route Declarations and policy | `/etc/phx-port/ingress.toml` | root-owned regular file, not group/other writable |
 | Stable Workload/role assignments | `/var/lib/phx-port/ports.toml` | service-owned `0600`; parent and sibling lock are private |
+| Durable automatic Ownership Claims | `/var/lib/phx-port/route-claims.toml` | service-owned `0600`; private lock; back up, never treat as cache |
 | Disposable verified-route state | `/var/lib/phx-port/routes.toml` | service-owned `0600`; separate private lock |
 | Runtime endpoints | `/run/phx-port/` | service-owned, `phx-port-admin`-grouped `0750` root; `0700` handoff directory; `0750` control directory |
 
 `PHX_PORT_CONFIG` explicitly overrides the public Port Registry; derived route
-state remains the sibling `routes.toml`. `PHX_PORT_RUNTIME_DIR` explicitly
+state remains the sibling `routes.toml`, and automatic claims the sibling
+`route-claims.toml`. `PHX_PORT_RUNTIME_DIR` explicitly
 overrides the runtime root. Public overrides must be absolute. These variables
 do not activate public mode by themselves, and development keeps its existing
 per-user combined registry and runtime paths.
@@ -258,7 +320,7 @@ ownership, private modes, single-link regular files, bounded content, and no
 symlinks. Runtime, handoff, and control directories receive the same no-
 symlink ownership/mode checks.
 
-Public ingress reads one validated Port Registry snapshot populated by
+Under the default `declared` policy, public ingress reads one validated Port Registry snapshot populated by
 `PHX_PORT_WORKLOAD_ID`, rejects malformed assignments and ports shared by
 different Workload/role keys, and resolves only each declaration's exact
 assignment. Undeclared registry entries remain inactive and are reported only
@@ -284,11 +346,12 @@ directory remains service-owned mode `0700`; same-UID peer authentication and
 the irreversible post-delivery no-relay boundary are unchanged on Linux and
 macOS.
 
-Verified public routes are persisted only to disposable `routes.toml`, never to
-the stable Port Registry, and are revalidated against the same declaration and
-certificate before every process activates them. Corrupt disposable state is
-discarded and rebuilt from declarations, registrations, and certificate
-proofs.
+Verified public activations are persisted only to disposable `routes.toml`,
+never to the stable Port Registry, and are revalidated against their
+declaration or durable claim and certificate before every process activates
+them. Corrupt disposable state can be rebuilt. Durable `route-claims.toml`
+cannot: damaged claim state fails closed and requires restoration. Preserve
+it when clearing positive caches or rolling back a policy change.
 The daemon reloads a structurally valid changed declaration snapshot as one
 generation; an invalid reload keeps the preceding generation active, and a
 late certificate result cannot cross generations. A missing required route
@@ -328,7 +391,10 @@ Preflight validates the explicit public config, rootless identity, secure
 state/runtime paths, bounded sandbox writes, local control group, current
 `RLIMIT_NOFILE` and task budget, named or direct listener acquisition, every
 declared Workload/role registration, and exact-hostname system-trust TLS for
-each loopback Workload. It acquires and immediately releases listeners without
+each declared loopback Workload. Automatic-policy preflight validates the
+registry and durable state but reports runtime discovery/TLS readiness as a
+warning, not a successful empty declaration scan; require the running daemon's
+`proxy check --ready`. It acquires and immediately releases listeners without
 calling `accept`; it never starts the control socket or data plane. Required
 route failures and host misconfiguration produce a nonzero status. Optional
 route failures are warnings. Production is never inferred: `--file` or
@@ -345,7 +411,8 @@ The retained source is the permission-preserving rollback snapshot. The split
 `ports.toml` keeps the preceding logical-assignment schema, so the preceding
 binary can use it directly if its `PHX_PORT_CONFIG` is pointed there. Back up
 the root-owned ingress file and stable `ports.toml` with their ownership and
-modes; do not back up disposable `routes.toml`, locks, or runtime sockets.
+modes. Also back up `route-claims.toml` when using automatic discovery; do not
+back up disposable `routes.toml`, locks, or runtime sockets.
 
 The Tokio ingress has explicit startup capacity options:
 
@@ -449,9 +516,11 @@ endpoint and retains its own certificate and private key.
 
 Successful development discoveries remain cached in the per-user registry.
 Public verified-route state is stored only in the separate disposable
-`routes.toml`. **Public mode remains exact Route Declaration-only: a wildcard
-certificate can prove a declared hostname, but never authorizes undeclared
-names or a wildcard route.** Both can be inspected alongside live daemon health:
+`routes.toml`. **The default public `declared` policy remains exact Route
+Declaration-only:** a wildcard certificate can prove a declaration but cannot
+extend it. The explicit public `certificate_discovery` policy instead retains
+durable exact/wildcard Ownership Claims in `route-claims.toml`. Both policies
+can be inspected alongside live daemon health:
 
 ```bash
 phx-port proxy status

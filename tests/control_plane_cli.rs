@@ -4,14 +4,17 @@ use serde_json::Value;
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::{TempDir, tempdir_in};
 
 fn tempdir() -> std::io::Result<TempDir> {
-    tempdir_in(Path::new("/tmp").canonicalize()?)
+    let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    tempdir_in(root.canonicalize()?)
 }
 
 struct Daemon {

@@ -137,16 +137,24 @@ impl ProductionPaths {
         if state_directory == self.runtime_root {
             return Err("production state directory and runtime root must be distinct".to_string());
         }
-        let assignments = port_registry::read_logical_assignments_until(&self.port_registry, deadline)?;
+        let assignments =
+            port_registry::read_logical_assignments_until(&self.port_registry, deadline)?;
         if policy == RoutingPolicy::CertificateDiscovery {
-            if assignments.keys().filter(|(_, role)| role == "https").count()
+            if assignments
+                .keys()
+                .filter(|(_, role)| role == "https")
+                .count()
                 > route_claims::MAX_DISCOVERY_WORKLOADS
             {
-                return Err(format!("certificate_discovery supports at most {} registered HTTPS Workloads",
-                    route_claims::MAX_DISCOVERY_WORKLOADS));
+                return Err(format!(
+                    "certificate_discovery supports at most {} registered HTTPS Workloads",
+                    route_claims::MAX_DISCOVERY_WORKLOADS
+                ));
             }
             if self.ownership_claims() == self.port_registry {
-                return Err("ownership claims and the Port Registry must use distinct files".into());
+                return Err(
+                    "ownership claims and the Port Registry must use distinct files".into(),
+                );
             }
             route_claims::load_until(&self.ownership_claims(), deadline)?;
         }
@@ -157,11 +165,7 @@ impl ProductionPaths {
                 route_cache::prepare_for_storage(&self.route_cache, policy.route_storage())?;
             }
         } else {
-            route_cache::validate_until(
-                &self.route_cache,
-                policy.route_storage(),
-                deadline,
-            )?;
+            route_cache::validate_until(&self.route_cache, policy.route_storage(), deadline)?;
         }
         validate_runtime_root(&self.runtime_root)?;
         validate_optional_handoff_directory(&self.runtime_root.join("handoff"))
@@ -1016,11 +1020,10 @@ mod tests {
     use tempfile::{TempDir, tempdir_in};
 
     fn tempdir() -> std::io::Result<TempDir> {
-        #[cfg(unix)]
-        let root = Path::new("/tmp").canonicalize()?;
-        #[cfg(not(unix))]
-        let root = std::env::temp_dir().canonicalize()?;
-        tempdir_in(root)
+        let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        tempdir_in(root.canonicalize()?)
     }
 
     #[cfg(unix)]

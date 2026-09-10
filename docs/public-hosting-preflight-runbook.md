@@ -19,7 +19,7 @@ accept loop.
 |---|---|
 | Execution identity | The process effective UID is not 0. |
 | Ingress configuration | An explicitly supplied file declares `mode = "public"` and its exact listener set matches the command. |
-| Production paths | Intent, Port Registry, disposable route state, runtime root, and optional handoff directory pass the same no-follow ownership, type, mode, link-count, size, and schema checks used at startup. |
+| Production paths | Intent, Port Registry, disposable route state, automatic-policy durable claims, runtime root, and optional handoff directory pass the same no-follow ownership, type, mode, link-count, size, and schema checks used at startup. |
 | Sandbox access | The service identity creates, writes, and removes one bounded probe in the state directory and runtime root. |
 | Control authorization | A non-loopback production runtime root is grouped to `phx-port-admin`; the control directory is created or validated as mode `0750`, and any existing control socket has the exact service owner, runtime group, socket type, and mode `0660`. |
 | Capacity | The supplied limits fit their relationships, the current soft `RLIMIT_NOFILE` with 30% reserve, and the supplied or detected task ceiling. The check never raises a limit or changes a configured ceiling. |
@@ -27,6 +27,17 @@ accept loop.
 | System trust roots | The platform TLS verifier initializes with hostname verification enabled. |
 | Registrations | Every required Route Declaration resolves to one logical Workload/role port; absent optional registrations are warnings. |
 | Route certificates | Each registered loopback Workload completes system-trusted TLS verification for its exact declared hostname; optional failures are warnings. |
+
+The registration and route-certificate rows describe the default `declared`
+Routing Policy. With explicit public `certificate_discovery`, preflight
+validates the protected logical registry, the 32-HTTPS-Workload candidate bound,
+and existing durable claim state. It emits a **WARN** that automatic
+certificate/ownership verification and readiness require runtime
+reconciliation; no declarations is not reported as a successful TLS scan.
+Start the daemon, require `proxy check --ready`, and inspect policy,
+`readiness_reason`, claims, and degraded details in `proxy status --json`.
+An unavailable exact owner remains authoritative; do not delete claims to make
+preflight or readiness pass.
 
 Failure details are bounded to 16 Route Declarations and 256 characters per
 underlying probe error. The command still checks independent categories after

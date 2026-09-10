@@ -132,9 +132,13 @@ TCP failure, and registration removal apply to the whole pattern.
 `proxy routes` shows `*.dev.example.com`; `discover` shows a pattern label,
 not a clickable wildcard URL.
 
-**This is development-only. Public mode still requires exact operator Route
-Declarations and rejects unknown SNI, even when a Workload has a wildcard
-certificate.**
+**Public mode defaults to exact operator Route Declarations.** Production
+automatic exact/wildcard routing requires the explicit
+[`certificate_discovery` policy](public-server.md#opt-in-certificate-driven-production-routing),
+which uses logical HTTPS registrations and durable claims, rejects
+same-specificity incumbents on conflict, and never falls through an inactive
+exact ownership claim to a wildcard. Development's incumbent and lifecycle
+rules above are not the production automatic-policy contract.
 
 For an unprivileged high-port exercise:
 

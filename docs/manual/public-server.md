@@ -80,6 +80,9 @@ unprivileged step fails, inspect the path rather than retrying it as root.
 
 ### 3. Write ingress configuration
 
+The default public Routing Policy is `declared`; existing deployments remain
+exact declaration-only.
+
 `/etc/phx-port/ingress.toml`:
 
 ```toml
@@ -113,7 +116,8 @@ sudo install -o root -g phx-port -m 0640 ingress.toml \
 
 Rules:
 
-- Hostnames are exact, normalized SNI names; there are no wildcards.
+- Declarations are exact, normalized SNI names; wildcard declarations are not
+  accepted.
 - `required = true` means an unavailable or invalid route makes readiness
   false.
 - A relay idle timeout of `0` disables the timeout for that route.
@@ -121,10 +125,94 @@ Rules:
 - Changing the metrics listener requires restart; route declarations can
   reload.
 
+#### Opt-in certificate-driven production routing
+
+Instead of the declaration configuration above, choose:
+
+```toml
+[ingress]
+mode = "public"
+routing_policy = "certificate_discovery"
+listen = ["0.0.0.0:443", "[::]:443"]
+
+[ingress.metrics]
+listen = "127.0.0.1:9464"
+```
+
+Do not include `[ingress.hosts]`, even an empty table: mixing policies is
+rejected. There are no per-host mappings. This is still the public Hosting
+Profile, with the same dedicated service identity, protected logical registry,
+admission limits, and Workload-owned TLS termination. Use only within one
+shared Ingress Trust Domain; this is not multi-tenant isolation.
+
+Selection applies to the TLS connection's initial SNI, not encrypted HTTP
+`Host` or `:authority`. A browser may coalesce HTTP/2 requests onto a wildcard
+certificate's existing connection. Workloads must reject misdirected requests
+with HTTP 421 or prevent cross-owner coalescing at their TLS/HTTP endpoints;
+an opaque SNI ingress cannot route individual encrypted HTTP/2 streams.
+
+Each logical `https` registration announces exact and wildcard DNS SANs from
+its no-SNI default certificate. Those hints alone authorize nothing: a separate
+trusted TLS/private-key proof must verify the hostname, and a wildcard proof
+must return that same wildcard SAN in the verified leaf. An exact-only leaf
+for the representative hostname cannot prove wildcard ownership.
+
+- Dedicated exact SAN ownership wins over a wildcard, in either startup order
+  and when the exact Workload starts later.
+- `*.sub.example.com` covers any **one nonempty label** such as `foo` or `bar`,
+  never `sub.example.com`, `deep.foo.sub.example.com`, or a suffix lookalike.
+  Client SNI itself must be a concrete DNS hostname.
+- Two distinct owners of the same exact name or wildcard pattern fail closed,
+  including withdrawing a previously verified incumbent. Other healthy routes
+  continue serving.
+- Claims survive certificate expiry, backend failure, cache removal, and ingress
+  restart. An unavailable exact owner keeps its name: **no wildcard fallback**.
+  Restarting that service with the same registration and valid TLS restores its
+  route. Removing its logical `https` registration is the release signal.
+  Wildcard claims and conflicts use the same registration-scoped lifetime.
+- Eager discovery needs usable default-certificate SANs. Cold-SNI discovery can
+  learn additional certificates, but a warm wildcard does not search every
+  Workload's hidden SNI-only certificate catalog. Advertise dedicated exact
+  names in their owner's default certificate. The development `main` fallback
+  is not eligible in public automatic discovery.
+
+`route-claims.toml`, beside `ports.toml`, is durable authority, **not a cache**.
+Back it up with the registry and retain it across policy changes. A process
+never activates cached claims without trusted TLS verification. Damaged claims
+fail closed; restore them rather than deleting or rebuilding them from currently
+reachable services. Missing state is first-use bootstrap, so never start ingress
+after losing this file: restore the authoritative backup first.
+Accepted automatic-policy reloads retain claims but reverify positive
+activations; inspect readiness before restoring traffic.
+
+Bounds are 32 registered HTTPS Workloads and 1,024 owner-pattern claims.
+There is no claim LRU eviction. A registry over the candidate limit blocks
+automatic routing. Claim exhaustion records the offending Workload IDs durably
+and blocks automatic routing until those HTTPS registrations are removed;
+otherwise an unrecorded exact owner could disappear behind a wildcard.
+Positive cache, negative cache, conflict diagnostics, probes, and waiting
+clients retain their existing bounds. Unknown names still require unique trusted
+proof or are rejected; this is not a catch-all default backend.
+
+Readiness requires a completed reconciliation pass, valid registry, at least
+one verified route, and no ownership conflicts. `readiness_reason`, claim
+counts, and bounded degraded/workload details explain pending or blocked
+states. A stopped exact owner can be degraded while unrelated routes remain
+ready and usable. Conflicts make readiness false without disabling unrelated
+healthy traffic. Metrics label the selected public policy but never dynamic
+hostnames or Workload IDs. Automatic routes use the public 1,800-second relay
+idle timeout.
+
+`proxy preflight` validates host/configuration/registry/claim storage and warns
+that automatic TLS and ownership verification require runtime reconciliation.
+After starting ingress, require `proxy check --ready` and inspect
+`proxy status --json` and `proxy routes`; preflight alone is not proof of an
+automatic route.
+
 ### 4. Start each Workload
 
 Every Workload must use the shared stable registry, an explicit logical ID,
-and a declared role:
+and its TLS role (`https` for automatic discovery):
 
 ```bash
 sudo -u phx-port env \
@@ -138,8 +226,9 @@ sudo -u phx-port env \
   '
 ```
 
-The Workload must present a system-trusted certificate whose SAN contains its
-exact declared hostname. Keep its certificate, key, and DNS-01 credentials in
+The Workload must present a system-trusted certificate valid for its declared
+hostname, or announce and prove its exact/wildcard DNS SANs under automatic
+discovery. Keep its certificate, key, and DNS-01 credentials in
 Workload-owned storage. Never copy them into `/etc/phx-port`.
 
 Use the PHXP integration for the Workload's runtime when available. Otherwise

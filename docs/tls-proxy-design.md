@@ -6,10 +6,15 @@ Implemented. The daemon, eager and lazy certificate discovery, persistent
 derived routes, conflict handling, health reconciliation, control socket,
 systemd user-service management, and generic TLS relay are operational.
 
-Dynamic discovery, including wildcard DNS SAN routes, belongs to the
-development Hosting Profile. The public Hosting Profile remains exact
-operator Route Declaration-only with unknown-SNI rejection; a wildcard
-certificate can verify an exact declaration but cannot extend its authority.
+This document describes development discovery, including wildcard DNS SAN
+routes and its incumbent-preserving conflict policy. Public ingress defaults
+to exact operator Route Declarations: a wildcard certificate can verify an
+exact declaration but cannot extend its authority. The explicit public
+`routing_policy = "certificate_discovery"` extension uses logical HTTPS
+registrations, durable Ownership Claims, and fails closed on all
+same-specificity conflicts, including incumbents. See the
+[public-server manual](manual/public-server.md#opt-in-certificate-driven-production-routing)
+for that policy's authority, restart, readiness, and capacity contract.
 
 On Linux, a compatible workload can additionally receive the original client
 descriptor through the optional socket-handoff path described in
@@ -528,8 +533,9 @@ A wildcard SAN activates one pattern, not an enumeration of hostnames.
 `foo.dev.example.com` and `bar.dev.example.com`, but neither the suffix apex
 nor nested labels, suffix lookalikes, malformed wildcard patterns, or literal
 wildcard SNI. Incoming ClientHello normalization remains concrete-name-only.
-Verified exact routes take precedence over wildcard routes. This is a
-development routing policy, not public wildcard Route Declaration support.
+Verified exact routes take precedence over wildcard routes. Public wildcard
+Route Declarations remain unsupported; production wildcard discovery requires
+its separate explicit policy and durable ownership semantics.
 
 ## Lazy discovery for unknown SNI
 
@@ -984,7 +990,8 @@ protocols, and certificate hostname removal.
 - A verified development wildcard route forwards every matching one-label
   name, but cannot reveal which concrete names the application intends to
   serve. Application-level hostname policy and DNS remain Workload/operator
-  responsibilities. Public ingress still forwards only exact declarations.
+  responsibilities. Public ingress's default `declared` policy still forwards
+  only exact declarations; its explicit automatic policy uses durable claims.
 - DNS and certificate renewal remain external responsibilities.
 
 ## Decision summary

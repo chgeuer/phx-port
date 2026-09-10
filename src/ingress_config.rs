@@ -161,7 +161,13 @@ impl HostingProfile {
         for (key, _) in ingress {
             if !matches!(
                 key,
-                "mode" | "routing_policy" | "unknown_sni" | "listen" | "metrics" | "source_diagnostics" | "hosts"
+                "mode"
+                    | "routing_policy"
+                    | "unknown_sni"
+                    | "listen"
+                    | "metrics"
+                    | "source_diagnostics"
+                    | "hosts"
             ) {
                 return Err(format!(
                     "ingress config {} contains unknown [ingress] key {key:?}",
@@ -183,9 +189,11 @@ impl HostingProfile {
             Some(item) if item.as_str() == Some("certificate_discovery") => {
                 RoutingPolicy::CertificateDiscovery
             }
-            Some(_) => return Err(
-                "routing_policy must be \"declared\" or \"certificate_discovery\"".to_string(),
-            ),
+            Some(_) => {
+                return Err(
+                    "routing_policy must be \"declared\" or \"certificate_discovery\"".to_string(),
+                );
+            }
         };
         let listeners = match ingress.get("listen") {
             None => None,
@@ -713,6 +721,40 @@ mod tests {
             HostingProfile::load_with_env(None, None, IntentOwner::EffectiveUser).unwrap(),
             HostingProfile::Development
         );
+    }
+
+    #[test]
+    fn certificate_discovery_is_an_explicit_public_policy_without_declarations() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("public.toml");
+        fs::write(
+            &path,
+            "[ingress]\nmode = \"public\"\nrouting_policy = \"certificate_discovery\"\n",
+        )
+        .unwrap();
+        let profile = HostingProfile::load(Some(path)).unwrap();
+        let snapshot = profile.public_snapshot().unwrap();
+        assert_eq!(profile.name(), "public");
+        assert_eq!(
+            snapshot.routing_policy,
+            super::RoutingPolicy::CertificateDiscovery
+        );
+        assert!(snapshot.routes.is_empty());
+        assert_eq!(profile.routing_policy_name(), "certificate_discovery");
+    }
+
+    #[test]
+    fn certificate_discovery_rejects_mixed_and_unknown_routing_policies() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("public.toml");
+        for body in [
+            "[ingress]\nmode = \"public\"\nrouting_policy = \"certificate_discovery\"\n[ingress.hosts]\n",
+            "[ingress]\nmode = \"public\"\nrouting_policy = \"automatic\"\n",
+            "[ingress]\nmode = \"public\"\nrouting_policy = \"declared\"\n",
+        ] {
+            fs::write(&path, body).unwrap();
+            assert!(HostingProfile::load(Some(path.clone())).is_err());
+        }
     }
 
     #[test]

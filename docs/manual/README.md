@@ -19,9 +19,11 @@ service. The normal command is:
 PORT="$(phx-port)" exec your-server
 ```
 
-**Public mode is explicit.** It keys ports by logical Workload ID, routes only
-declared hostnames, validates each Workload certificate, uses machine-owned
-state, and runs as a dedicated service identity. It activates only through:
+**Public mode is explicit.** It keys ports by logical Workload ID, defaults to
+exact declared hostnames, validates each Workload certificate, uses machine-owned
+state, and runs as a dedicated service identity. Certificate-driven
+exact/wildcard discovery is a separate explicit public Routing Policy.
+Public mode activates only through:
 
 ```bash
 phx-port daemon --ingress-config /etc/phx-port/ingress.toml ...
@@ -40,10 +42,12 @@ Neither root execution, `/etc/phx-port`, `PHX_PORT_CONFIG`, nor
 ## Rules that prevent bad deployments
 
 - Workloads terminate TLS. `phx-port` never receives their private keys.
-- Public routes are exact SNI names. Unknown SNI is rejected.
+- Public routes default to exact declarations. Automatic certificate-driven
+  exact/wildcard discovery requires an explicit public Routing Policy; unknown
+  or ambiguous ownership is rejected.
 - Bind Workloads to loopback. Only ingress listens publicly.
-- Back up `ingress.toml` and `ports.toml`; do not back up `routes.toml` or
-  runtime sockets.
+- Back up `ingress.toml`, `ports.toml`, and automatic-policy `route-claims.toml`;
+  do not back up disposable `routes.toml` or runtime sockets.
 - A shared production service UID is one trust domain, not tenant isolation.
 - Keep TCP port 80 closed unless another service explicitly needs it.
 - Do not publish DNS or open TCP/443 until preflight passes and

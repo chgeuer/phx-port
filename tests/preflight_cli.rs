@@ -45,7 +45,10 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 const TEST_RSA_PRIVATE_KEY: &str = include_str!("fixtures/proxy-test-rsa-key.pem");
 
 fn tempdir() -> std::io::Result<TempDir> {
-    tempdir_in(Path::new("/tmp").canonicalize()?)
+    let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    tempdir_in(root.canonicalize()?)
 }
 
 fn reserve_address() -> SocketAddr {
@@ -791,6 +794,65 @@ fn preflight_proves_a_ready_host_without_accepting_public_connections() {
     let rebound = TcpListener::bind(host.ingress_address)
         .expect("preflight retained its non-serving listener");
     drop(rebound);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn preflight_certificate_discovery_requires_runtime_proof_and_durable_state() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let certificate = TestCertificate::for_hostname("*.preflight.example.test");
+    let backend = TlsBackend::start(&certificate);
+    let host = HostFixture::new(Some(backend.port), Some(&certificate.root_pem));
+    fs::write(
+        &host.ingress_config,
+        format!(
+            "[ingress]\nmode = \"public\"\nrouting_policy = \"certificate_discovery\"\nlisten = [\"{}\"]\n",
+            host.ingress_address
+        ),
+    )
+    .unwrap();
+
+    let output = host.command(&["--task-budget", "128"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "public certificate_discovery without per-host declarations",
+        "PASS production paths",
+        "PASS registrations",
+        "WARN route certificates",
+        "running daemon must verify SANs and durable ownership",
+    ] {
+        assert!(stdout.contains(expected), "{stdout}");
+    }
+    assert!(!stdout.contains("PASS route certificates"), "{stdout}");
+    assert_eq!(backend.handshakes.load(Ordering::Acquire), 0);
+
+    let mut check = Command::new(env!("CARGO_BIN_EXE_phx-port"));
+    host.configure(&mut check);
+    let output = check
+        .args(["proxy", "config", "check", "--file"])
+        .arg(&host.ingress_config)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "config check must remain root-owned intent only"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("owned by unexpected UID"), "{stderr}");
+
+    let claims = host.registry.with_file_name("route-claims.toml");
+    fs::write(&claims, "version = 999\n").unwrap();
+    fs::set_permissions(&claims, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = host.command(&["--task-budget", "128"]);
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("FAIL production paths"), "{stdout}");
+    assert_eq!(fs::read_to_string(&claims).unwrap(), "version = 999\n");
 }
 
 #[test]
