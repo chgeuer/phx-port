@@ -1,4 +1,4 @@
-use crate::{port_registry, tls_client_hello};
+use crate::{port_registry, route_pattern, tls_client_hello};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,13 +12,16 @@ const MAX_FINGERPRINT_LENGTH: usize = 512;
 pub enum Storage {
     CombinedRegistry,
     SeparateState,
+    SeparateDiscoveryState,
 }
 
 impl Storage {
     fn security(self) -> port_registry::RegistrySecurity {
         match self {
             Self::CombinedRegistry => port_registry::RegistrySecurity::Development,
-            Self::SeparateState => port_registry::RegistrySecurity::DerivedState,
+            Self::SeparateState | Self::SeparateDiscoveryState => {
+                port_registry::RegistrySecurity::DerivedState
+            }
         }
     }
 }
@@ -44,7 +47,11 @@ pub(crate) fn validate_until(
 }
 
 pub fn prepare(path: &Path) -> Result<(), String> {
-    match validate(path, Storage::SeparateState) {
+    prepare_for_storage(path, Storage::SeparateState)
+}
+
+pub fn prepare_for_storage(path: &Path, storage: Storage) -> Result<(), String> {
+    match validate(path, storage) {
         Ok(()) => Ok(()),
         Err(validation_error) => {
             let empty = DocumentMut::new();
@@ -78,6 +85,24 @@ pub(crate) fn load_until(
 ) -> Result<Option<CachedRoute>, String> {
     let document = read_for_use(path, storage, deadline)?;
     cached_route(&document, hostname)
+}
+
+pub(crate) fn load_matching_until(
+    path: &Path,
+    hostname: &str,
+    storage: Storage,
+    deadline: Option<port_registry::AccessDeadline<'_>>,
+) -> Result<Option<CachedRoute>, String> {
+    let document = read_for_use(path, storage, deadline)?;
+    if let Some(route) = cached_route(&document, hostname)? {
+        return Ok(Some(route));
+    }
+    if storage != Storage::SeparateState
+        && let Some(pattern) = route_pattern::matching_wildcard(hostname)
+    {
+        return cached_route(&document, &pattern);
+    }
+    Ok(None)
 }
 
 fn cached_route(document: &DocumentMut, hostname: &str) -> Result<Option<CachedRoute>, String> {
@@ -116,7 +141,7 @@ fn read_for_use(
     let document = port_registry::read_until(path, storage.security(), deadline)?;
     match validate_document(&document, storage) {
         Ok(()) => Ok(document),
-        Err(error) if storage == Storage::SeparateState => Err(error),
+        Err(error) if storage != Storage::CombinedRegistry => Err(error),
         Err(_) => port_registry::update_until(path, storage.security(), deadline, |current| {
             if discard_invalid_combined_routes(current, storage) {
                 eprintln!("event=route_state_rebuild result=discarded_invalid_development_cache");
@@ -170,13 +195,16 @@ pub(crate) fn store_batch_until(
         ));
     }
     for (hostname, route) in updates {
-        if storage == Storage::SeparateState {
+        if storage != Storage::CombinedRegistry {
             validate_route_fields(
                 hostname,
                 &route.project,
                 &route.role,
                 &route.certificate_fingerprint,
+                storage,
             )?;
+        } else {
+            validate_route_hostname(hostname, storage)?;
         }
     }
     let verified_at = SystemTime::now()
@@ -366,7 +394,7 @@ fn validate_document(document: &DocumentMut, storage: Storage) -> Result<(), Str
         let route = item
             .as_table()
             .ok_or_else(|| format!("derived route {hostname:?} must be a table"))?;
-        if storage == Storage::SeparateState {
+        if storage != Storage::CombinedRegistry {
             for (key, _) in route {
                 if !matches!(
                     key,
@@ -401,9 +429,25 @@ fn validate_document(document: &DocumentMut, storage: Storage) -> Result<(), Str
                 "derived route {hostname:?} requires an integer last_verified_unix"
             ));
         }
-        if storage == Storage::SeparateState {
-            validate_route_fields(hostname, project, role, fingerprint)?;
+        if storage != Storage::CombinedRegistry {
+            validate_route_fields(hostname, project, role, fingerprint, storage)?;
+        } else {
+            validate_route_hostname(hostname, storage)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_route_hostname(hostname: &str, storage: Storage) -> Result<(), String> {
+    let normalized = match storage {
+        Storage::CombinedRegistry | Storage::SeparateDiscoveryState => route_pattern::normalize(hostname),
+        Storage::SeparateState => tls_client_hello::normalize_hostname(hostname),
+    }
+    .map_err(|_| format!("derived route hostname {hostname:?} is invalid"))?;
+    if normalized != hostname {
+        return Err(format!(
+            "derived route hostname {hostname:?} must be normalized as {normalized:?}"
+        ));
     }
     Ok(())
 }
@@ -413,14 +457,9 @@ fn validate_route_fields(
     project: &str,
     role: &str,
     certificate_fingerprint: &str,
+    storage: Storage,
 ) -> Result<(), String> {
-    let normalized = tls_client_hello::normalize_hostname(hostname)
-        .map_err(|_| format!("derived route hostname {hostname:?} is invalid"))?;
-    if normalized != hostname {
-        return Err(format!(
-            "derived route hostname {hostname:?} must be normalized as {normalized:?}"
-        ));
-    }
+    validate_route_hostname(hostname, storage)?;
     port_registry::validate_workload_id(project)
         .map_err(|error| format!("derived route Workload {project:?} is invalid: {error}"))?;
     port_registry::validate_role(role)
@@ -447,16 +486,14 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
     use tempfile::{TempDir, tempdir_in};
     use toml_edit::value;
 
     fn tempdir() -> std::io::Result<TempDir> {
-        #[cfg(unix)]
-        let root = Path::new("/tmp").canonicalize()?;
-        #[cfg(not(unix))]
-        let root = std::env::temp_dir().canonicalize()?;
-        tempdir_in(root)
+        let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        tempdir_in(root.canonicalize()?)
     }
 
     #[test]
@@ -487,6 +524,79 @@ mod tests {
             read_config(&path)["ports"]["/project"]["https"].as_integer(),
             Some(4401)
         );
+    }
+
+    #[test]
+    fn development_wildcard_cache_matches_one_label_after_exact_lookup() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ports.toml");
+        store(
+            &path,
+            Storage::CombinedRegistry,
+            "*.example.test",
+            "/wildcard",
+            "https",
+            "AA",
+        )
+        .unwrap();
+        store(
+            &path,
+            Storage::CombinedRegistry,
+            "foo.example.test",
+            "/exact",
+            "https",
+            "BB",
+        )
+        .unwrap();
+        for (hostname, expected) in [
+            ("foo.example.test", Some("/exact")),
+            ("bar.example.test", Some("/wildcard")),
+            ("example.test", None),
+            ("deep.foo.example.test", None),
+            ("badexample.test", None),
+        ] {
+            let route =
+                super::load_matching_until(&path, hostname, Storage::CombinedRegistry, None)
+                    .unwrap();
+            assert_eq!(
+                route.as_ref().map(|route| route.project.as_str()),
+                expected,
+                "{hostname}"
+            );
+        }
+        assert_eq!(read_config(&path)[TABLE].as_table().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn wildcard_cache_patterns_are_canonical_and_development_only() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ports.toml");
+        for invalid in ["*.EXAMPLE.test", "*.*.example.test", "w*.example.test"] {
+            assert!(
+                store(
+                    &path,
+                    Storage::CombinedRegistry,
+                    invalid,
+                    "/wildcard",
+                    "https",
+                    "AA"
+                )
+                .is_err()
+            );
+        }
+        assert!(!path.exists());
+        assert!(
+            store(
+                &path,
+                Storage::SeparateState,
+                "*.example.test",
+                "web",
+                "https",
+                "AA"
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
     }
 
     #[test]

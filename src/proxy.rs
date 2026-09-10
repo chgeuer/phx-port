@@ -8,7 +8,7 @@ use crate::{
     config_path, handoff,
     ingress_config::{
         DEFAULT_RELAY_IDLE_TIMEOUT, HostingProfile, MAX_ROUTE_DECLARATIONS, PublicIngressSnapshot,
-        RouteDeclaration,
+        RouteDeclaration, RoutingPolicy,
     },
     ingress_limits::{
         CERTIFICATE_PROBE_WORKERS, DaemonConfig, ROUTE_SELECTION_WORKERS, TOKIO_RUNTIME_WORKERS,
@@ -16,7 +16,7 @@ use crate::{
     },
     is_port_open, observability, port_registry, privilege,
     production_paths::{IntentOwner, ProductionPaths},
-    relay, route_cache, tls_client_hello,
+    relay, route_cache, route_claims, route_pattern, tls_client_hello,
     worker_pool::BoundedWorkerPool,
 };
 use native_tls::TlsConnector;
@@ -79,6 +79,9 @@ const CONTROL_RESPONSE_LIMIT: u64 = 64 * 1024;
 const CONTROL_SCHEMA_VERSION: u32 = 1;
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+#[path = "certificate_discovery.rs"]
+mod certificate_discovery;
 
 #[derive(Clone)]
 struct IngressShutdown {
@@ -144,6 +147,14 @@ impl IngressShutdown {
             .transition
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+            let discovery = state.certificate_discovery.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let earliest = routes.iter()
+                .filter(|(pattern, active)| discovery.active(pattern, active, snapshot.generation, current_unix_seconds()))
+                .map(|(_, active)| active.certificate.not_after_unix_seconds).min().unwrap_or(0);
+            metric!("phx_port_discovery_certificate_not_after_min_seconds {earliest}");
+        }
         self.drain_window.get_or_init(|| {
             let started_at = Instant::now();
             let deadline = started_at
@@ -239,6 +250,8 @@ struct Backend {
 struct CertificateProof {
     fingerprint: String,
     not_after_unix_seconds: u64,
+    wildcard: Option<String>,
+    dns_san: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -291,6 +304,10 @@ impl CertificateProof {
     fn expiry_state_at(&self, now_unix_seconds: u64) -> CertificateExpiryState {
         CertificateExpiryState::at(self.not_after_unix_seconds, now_unix_seconds)
     }
+
+    fn route_pattern<'a>(&'a self, hostname: &'a str) -> &'a str {
+        self.wildcard.as_deref().unwrap_or(hostname)
+    }
 }
 
 struct ProbeMatch {
@@ -327,6 +344,12 @@ impl ActiveRoute {
     fn certificate_is_valid_at(&self, now_unix_seconds: u64) -> bool {
         self.certificate.expiry_state_at(now_unix_seconds) != CertificateExpiryState::Expired
     }
+}
+
+#[derive(Clone, Debug)]
+struct SelectedRoute {
+    pattern: String,
+    active: ActiveRoute,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -648,6 +671,8 @@ struct ProxyState {
     flights: Mutex<HashMap<String, Arc<DiscoveryFlight>>>,
     negative: Mutex<HashMap<String, Instant>>,
     workloads: Mutex<Vec<Backend>>,
+    eager_workloads: Mutex<Vec<Backend>>,
+    certificate_discovery: RwLock<certificate_discovery::State>,
     waiting_clients: AtomicUsize,
     queued_route_selections: Arc<AtomicUsize>,
     queued_connections: Arc<AtomicUsize>,
@@ -724,6 +749,8 @@ impl ProxyState {
             flights: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
             workloads: Mutex::new(Vec::new()),
+            eager_workloads: Mutex::new(Vec::new()),
+            certificate_discovery: RwLock::new(certificate_discovery::State::default()),
             waiting_clients: AtomicUsize::new(0),
             queued_route_selections: Arc::new(AtomicUsize::new(0)),
             queued_connections: Arc::new(AtomicUsize::new(0)),
@@ -802,6 +829,7 @@ impl ProxyState {
                         route_deadline_remaining(deadline)?.min(Duration::from_millis(5)),
                     );
                 }
+                Err(_) => {}
             }
         }
     }
@@ -869,6 +897,29 @@ impl ProxyState {
             .hosting_profile
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+            let discovery = state.certificate_discovery.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(error) = discovery.error {
+                lines.push(format!("blocked\tcertificate_discovery\t{}", error.label()));
+            }
+            for (pattern, owners) in &discovery.claims.routes {
+                if active_hostnames.contains(pattern) {
+                    continue;
+                }
+                let reason = if owners.len() > 1 {
+                    "ownership_conflict"
+                } else if let Some(error) = discovery.error {
+                    error.label()
+                } else if expired_hostnames.contains(pattern) {
+                    "certificate_expired"
+                } else {
+                    failures.get(pattern).copied().map(RouteFailure::label).unwrap_or("awaiting_verification")
+                };
+                lines.push(format!("inactive\t{pattern}\t{}\thttps\tclaim\t{reason}",
+                    owners.iter().cloned().collect::<Vec<_>>().join(",")));
+            }
+                }
         self.route_cache_for_profile(&profile)
     }
 
@@ -877,8 +928,8 @@ impl ProxyState {
         profile: &HostingProfile,
     ) -> Option<(&Path, route_cache::Storage)> {
         match (&self.production_paths, profile) {
-            (Some(paths), HostingProfile::Public(_)) => {
-                Some((&paths.route_cache, route_cache::Storage::SeparateState))
+            (Some(paths), HostingProfile::Public(snapshot)) => {
+                Some((&paths.route_cache, snapshot.routing_policy.route_storage()))
             }
             (None, HostingProfile::Public(_)) => None,
             (_, HostingProfile::Development) => {
@@ -1239,7 +1290,7 @@ struct HandoffJob {
     hostname: String,
     peeked_length: usize,
     backend: Backend,
-    cached_route: Option<ActiveRoute>,
+    cached_route: Option<SelectedRoute>,
     relay_idle_timeout: Option<Duration>,
 }
 
@@ -1248,7 +1299,7 @@ struct RelayJob {
     admission: PreRoutingAdmission,
     hostname: String,
     backend: Backend,
-    cached_route: Option<ActiveRoute>,
+    cached_route: Option<SelectedRoute>,
     idle_timeout: Option<Duration>,
 }
 
@@ -1341,6 +1392,17 @@ fn reload_public_profile_with_cache_timeout(
     {
         return ConfigReloadOutcome::Superseded(snapshot.generation);
     }
+    if replacement_snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+        let valid_claims = state.production_paths.as_ref().ok_or_else(|| {
+            "certificate_discovery requires production paths".to_string()
+        }).and_then(|paths| route_claims::load_until(
+            &paths.ownership_claims(), Some(state.access_deadline(deadline)),
+        ));
+        if valid_claims.is_err() {
+            record_config_reload_failure(state, replacement_snapshot.generation, ConfigReloadError::StateUnavailable);
+            return ConfigReloadOutcome::Rejected(replacement_snapshot.generation);
+        }
+    }
     // Serialize cache mutations with publication, but never hold a routing/profile
     // lock while waiting on disk. A failed prune leaves the old generation intact.
     if let Some((path, storage)) = state.route_cache_for_profile(&installed) {
@@ -1404,6 +1466,8 @@ fn reload_public_profile_with_cache_timeout(
     *profile = replacement;
     drop(routes);
     drop(profile);
+    *state.certificate_discovery.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = certificate_discovery::State::default();
 
     state
         .route_failures
@@ -1435,8 +1499,9 @@ fn reload_public_profile_with_cache_timeout(
         status.accepted_reloads = status.accepted_reloads.saturating_add(1);
     }
     eprintln!(
-        "event=ingress_config_reload result=accepted generation={} declared_routes={}",
+        "event=ingress_config_reload result=accepted generation={} routing_policy={} declared_routes={}",
         replacement_snapshot.generation,
+        replacement_snapshot.routing_policy.label(),
         replacement_snapshot.routes.len()
     );
     ConfigReloadOutcome::Accepted(replacement_snapshot.generation)
@@ -1464,7 +1529,7 @@ fn set_route_failure(state: &ProxyState, hostname: &str, failure: RouteFailure) 
         .route_failures
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if failures.contains_key(hostname) || failures.len() < MAX_ROUTE_DECLARATIONS {
+    if failures.contains_key(hostname) || failures.len() < MAX_VERIFIED_ROUTES {
         failures.insert(hostname.to_string(), failure);
     }
 }
@@ -1619,7 +1684,7 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
     let (control_path, control_thread) =
         match start_control_server(Arc::clone(&state), shutdown.clone()) {
             Ok(control) => control,
-            Err(error) => {
+            Err(error) if report_rejection => {
                 route_workers.close();
                 let _ = route_workers.join();
                 return Err(error);
@@ -2078,9 +2143,9 @@ async fn prepare_tokio_handoff(
 async fn select_tokio_route(
     hostname: &str,
     ingress: &TokioIngress,
-) -> Result<(Backend, Option<ActiveRoute>), String> {
+) -> Result<(Backend, Option<SelectedRoute>), String> {
     if let Some(route) = current_active_route(&ingress.state, hostname)? {
-        return Ok((route.backend.clone(), Some(route)));
+        return Ok((route.active.backend.clone(), Some(route)));
     }
 
     let deadline = Instant::now()
@@ -2130,24 +2195,70 @@ async fn select_tokio_route(
     }
 }
 
-fn current_active_route(state: &ProxyState, hostname: &str) -> Result<Option<ActiveRoute>, String> {
+fn current_active_route(
+    state: &ProxyState,
+    hostname: &str,
+) -> Result<Option<SelectedRoute>, String> {
+    let hostname =
+        tls_client_hello::normalize_hostname(hostname).map_err(|error| error.to_string())?;
+    let profile = state.public_snapshot();
+    let automatic = profile.as_ref().filter(|snapshot| {
+        snapshot.routing_policy == RoutingPolicy::CertificateDiscovery
+    });
+    let wildcard = if profile.is_none() {
+        route_pattern::matching_wildcard(&hostname)
+    } else {
+        None
+    };
     loop {
-        let active = state
+        let claim = if let Some(snapshot) = automatic {
+            match certificate_discovery::selected_pattern(state, snapshot, &hostname)? {
+                Some(pattern) => Some(pattern),
+                None => return Ok(None),
+            }
+        } else {
+            None
+        };
+        let routes = state
             .routes
             .read()
-            .map_err(|_| "route table lock poisoned".to_string())?
-            .get(hostname)
-            .cloned();
-        let Some(active) = active else {
+            .map_err(|_| "route table lock poisoned".to_string())?;
+        let selected = routes
+            .get_key_value(claim.as_ref().unwrap_or(&hostname))
+            .or_else(|| {
+                wildcard
+                    .as_ref()
+                    .and_then(|pattern| routes.get_key_value(pattern))
+            })
+            .map(|(pattern, active)| SelectedRoute {
+                pattern: pattern.clone(),
+                active: active.clone(),
+            });
+        drop(routes);
+        let Some(selected) = selected else {
             return Ok(None);
         };
-        let now_unix_seconds = current_unix_seconds();
-        if active.certificate_is_valid_at(now_unix_seconds) {
-            return Ok(Some(active));
-        }
-        if deactivate_expired_route(state, hostname, now_unix_seconds) {
+        if let Some(snapshot) = automatic
+            && !state.certificate_discovery.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .owns(&selected.pattern, &selected.active.backend, snapshot.generation)
+        {
             return Ok(None);
         }
+        if selected.pattern != hostname
+            && state
+                .conflicts
+                .read()
+                .map_err(|_| "route conflict table lock poisoned".to_string())?
+                .contains_key(&hostname)
+        {
+            return Ok(None);
+        }
+        let now_unix_seconds = current_unix_seconds();
+        if selected.active.certificate_is_valid_at(now_unix_seconds) {
+            return Ok(Some(selected));
+        }
+        deactivate_expired_route(state, &selected.pattern, now_unix_seconds);
     }
 }
 
@@ -2204,7 +2315,7 @@ fn prepare_production_paths(
     };
     let paths = ProductionPaths::from_environment()?;
     paths.validate_intent_separation(&snapshot.ingress_config)?;
-    paths.prepare_for_startup()?;
+    paths.prepare_for_policy(snapshot.routing_policy)?;
     Ok(Some(paths))
 }
 
@@ -2885,10 +2996,15 @@ fn start_control_server(
 
 struct RouteSummary {
     hosting_profile: &'static str,
+    routing_policy: &'static str,
     config_generation: u64,
     declared_routes: usize,
     required_routes: usize,
     optional_routes: usize,
+    claimed_routes: usize,
+    discovery_workloads: usize,
+    discovery_reconciled: Option<bool>,
+    readiness_reason: &'static str,
     active_routes: usize,
     degraded_routes: usize,
     ready: bool,
@@ -2916,15 +3032,23 @@ fn route_summary_for_routes(
     let Some(snapshot) = profile.public_snapshot() else {
         return RouteSummary {
             hosting_profile: profile.name(),
+            routing_policy: profile.routing_policy_name(),
             config_generation: 0,
             declared_routes: 0,
             required_routes: 0,
             optional_routes: 0,
+            claimed_routes: 0,
+            discovery_workloads: 0,
+            discovery_reconciled: None,
+            readiness_reason: "ready",
             active_routes: routes.len(),
             degraded_routes: 0,
             ready: true,
         };
     };
+    if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+        return certificate_discovery::summary(state, &snapshot, routes, now_unix_seconds);
+    }
 
     let active_hostnames = routes
         .iter()
@@ -2953,10 +3077,21 @@ fn route_summary_for_routes(
 
     RouteSummary {
         hosting_profile: profile.name(),
+        routing_policy: profile.routing_policy_name(),
         config_generation: snapshot.generation,
         declared_routes: snapshot.routes.len(),
         required_routes,
         optional_routes: snapshot.routes.len().saturating_sub(required_routes),
+        claimed_routes: 0,
+        discovery_workloads: 0,
+        discovery_reconciled: None,
+        readiness_reason: if !state.registry_valid.load(Ordering::Acquire) {
+            "registry_invalid"
+        } else if active_required_routes != required_routes {
+            "required_routes_unavailable"
+        } else {
+            "ready"
+        },
         active_routes,
         degraded_routes: snapshot.routes.len().saturating_sub(active_routes),
         ready: active_required_routes == required_routes
@@ -2981,6 +3116,14 @@ struct DeclaredCertificateStatus {
     required: bool,
     not_after_unix_seconds: u64,
     expiry_state: &'static str,
+}
+
+#[derive(Serialize)]
+struct DiscoveryWorkloadStatus {
+    workload: String,
+    role: String,
+    port: u16,
+    reason: &'static str,
 }
 
 #[derive(Serialize)]
@@ -3070,12 +3213,18 @@ struct ControlJsonStatus {
     draining: bool,
     ready: bool,
     hosting_profile: &'static str,
+    routing_policy: &'static str,
+    readiness_reason: &'static str,
     generation: u64,
     listeners: Vec<String>,
     listeners_omitted: usize,
     declared_routes: usize,
     required_routes: usize,
     optional_routes: usize,
+    claimed_routes: usize,
+    discovery_workloads: usize,
+    discovery_reconciled: Option<bool>,
+    discovery_workload_failures: Vec<DiscoveryWorkloadStatus>,
     active_routes: usize,
     degraded_route_count: usize,
     degraded_routes: Vec<DegradedRouteStatus>,
@@ -3098,6 +3247,9 @@ fn degraded_route_statuses(
     let Some(snapshot) = profile.public_snapshot() else {
         return Vec::new();
     };
+    if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+        return certificate_discovery::degraded_statuses(state, &snapshot, routes, now_unix_seconds);
+    }
     let (active_hostnames, expired_hostnames) = routes.iter().fold(
         (BTreeSet::new(), BTreeSet::new()),
         |(mut active_hostnames, mut expired_hostnames), (hostname, active)| {
@@ -3157,6 +3309,7 @@ fn degraded_route_statuses(
 }
 
 fn declared_certificate_statuses(
+    state: &ProxyState,
     profile: &HostingProfile,
     routes: &HashMap<String, ActiveRoute>,
     now_unix_seconds: u64,
@@ -3164,6 +3317,9 @@ fn declared_certificate_statuses(
     let Some(snapshot) = profile.public_snapshot() else {
         return (0, Vec::new());
     };
+    if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+        return certificate_discovery::certificate_statuses(state, &snapshot, routes, now_unix_seconds);
+    }
     let mut count = 0;
     let statuses = snapshot
         .routes
@@ -3201,7 +3357,7 @@ fn render_json_control_status(state: &ProxyState, shutdown: &IngressShutdown) ->
     let route_summary = route_summary_for_routes(state, &profile, &routes, now);
     let degraded_routes = degraded_route_statuses(state, &profile, &routes, now);
     let (certificate_route_count, certificate_routes) =
-        declared_certificate_statuses(&profile, &routes, now);
+        declared_certificate_statuses(state, &profile, &routes, now);
     let admission = state.admission.snapshot();
     let mut listeners = state
         .listeners
@@ -3235,12 +3391,22 @@ fn render_json_control_status(state: &ProxyState, shutdown: &IngressShutdown) ->
         draining: shutdown.is_requested(),
         ready: route_summary.ready && !shutdown.is_requested(),
         hosting_profile: route_summary.hosting_profile,
+        routing_policy: route_summary.routing_policy,
+        readiness_reason: if shutdown.is_requested() { "draining" } else { route_summary.readiness_reason },
         generation: route_summary.config_generation,
         listeners,
         listeners_omitted: 0,
         declared_routes: route_summary.declared_routes,
         required_routes: route_summary.required_routes,
         optional_routes: route_summary.optional_routes,
+        claimed_routes: route_summary.claimed_routes,
+        discovery_workloads: route_summary.discovery_workloads,
+        discovery_reconciled: route_summary.discovery_reconciled,
+        discovery_workload_failures: if route_summary.discovery_reconciled.is_some() {
+            certificate_discovery::workload_failures(state)
+        } else {
+            Vec::new()
+        },
         active_routes: route_summary.active_routes,
         degraded_route_count: route_summary.degraded_routes,
         degraded_routes,
@@ -3409,14 +3575,17 @@ fn account_omitted_status_entry(
 }
 
 fn render_control_health(state: &ProxyState, shutdown: &IngressShutdown) -> String {
-    let ready = route_summary_for_profile(state, &state.hosting_profile()).ready;
+    let summary = route_summary_for_profile(state, &state.hosting_profile());
     let draining = shutdown.is_requested();
     let health = ControlHealth {
         schema_version: CONTROL_SCHEMA_VERSION,
         live: true,
-        ready: ready && !draining,
+        ready: summary.ready && !draining,
         draining,
     };
+    let mut health = serde_json::to_value(health).expect("JSON-safe health status");
+    health["routing_policy"] = summary.routing_policy.into();
+    health["readiness_reason"] = if draining { "draining" } else { summary.readiness_reason }.into();
     let mut rendered = serde_json::to_string(&health).expect("JSON-safe health status");
     rendered.push('\n');
     rendered
@@ -3452,10 +3621,21 @@ fn render_prometheus_metrics(state: &ProxyState, shutdown: &IngressShutdown) -> 
     );
     metric!("phx_port_draining {}", usize::from(shutdown.is_requested()));
     metric!("phx_port_config_generation {}", summary.config_generation);
+    metric!(
+        "phx_port_routing_policy_info{{hosting_profile=\"{}\",routing_policy=\"{}\"}} 1",
+        summary.hosting_profile, summary.routing_policy
+    );
+    metric!("phx_port_readiness_reason{{reason=\"{}\"}} 1",
+        if shutdown.is_requested() { "draining" } else { summary.readiness_reason });
+    if let Some(complete) = summary.discovery_reconciled {
+        metric!("phx_port_discovery_reconciled {}", usize::from(complete));
+        metric!("phx_port_discovery_workloads {}", summary.discovery_workloads);
+    }
     for (route_state, value) in [
         ("declared", summary.declared_routes),
         ("required", summary.required_routes),
         ("optional", summary.optional_routes),
+        ("claimed", summary.claimed_routes),
         ("active", summary.active_routes),
         ("degraded", summary.degraded_routes),
         ("conflict", conflicts.len()),
@@ -3717,6 +3897,15 @@ fn render_control_response(
             let route_summary = route_summary(state);
             let draining = shutdown.is_requested();
             let lifecycle = if draining { "draining" } else { "running" };
+            let lifecycle = format!(
+                "{lifecycle}\nrouting_policy={}\nclaimed_routes={}\ndiscovery_workloads={}\ndiscovery_reconciled={}\nreadiness_reason={}",
+                route_summary.routing_policy,
+                route_summary.claimed_routes,
+                route_summary.discovery_workloads,
+                route_summary.discovery_reconciled.map(|complete| complete.to_string())
+                    .unwrap_or_else(|| "not_applicable".into()),
+                if draining { "draining" } else { route_summary.readiness_reason },
+            );
             let listeners = state
                 .listeners
                 .read()
@@ -3840,13 +4029,16 @@ fn render_control_response(
             if let Ok(routes) = state.routes.read() {
                 for (hostname, route) in routes.iter() {
                     if let Some(snapshot) = public_snapshot.as_ref() {
-                        let Some(declaration) = snapshot.routes.get(hostname) else {
-                            continue;
+                        let owned = if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+                            state.certificate_discovery.read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .owns(hostname, &route.backend, snapshot.generation)
+                        } else {
+                            snapshot.routes.get(hostname).is_some_and(|declaration| {
+                                declaration.workload == route.backend.project && declaration.role == route.backend.role
+                            })
                         };
-                        if route.declaration_generation != Some(snapshot.generation)
-                            || declaration.workload != route.backend.project
-                            || declaration.role != route.backend.role
-                        {
+                        if route.declaration_generation != Some(snapshot.generation) || !owned {
                             continue;
                         }
                     }
@@ -3909,8 +4101,13 @@ fn render_control_response(
                 }
             }
             lines.sort();
-            let omitted = lines.len().saturating_sub(MAX_ROUTE_DIAGNOSTICS);
-            lines.truncate(MAX_ROUTE_DIAGNOSTICS);
+            let mut bytes = 0;
+            let kept = lines.iter().take(MAX_ROUTE_DIAGNOSTICS).take_while(|line| {
+                bytes += line.len() + 1;
+                bytes <= CONTROL_RESPONSE_LIMIT as usize - 64
+            }).count();
+            let omitted = lines.len().saturating_sub(kept);
+            lines.truncate(kept);
             if omitted > 0 {
                 lines.push(format!("truncated\t{omitted}"));
             }
@@ -3979,7 +4176,7 @@ fn handle_connection(
 
     let cached_route = current_active_route(&state, &hostname)?;
     let backend = if let Some(route) = cached_route.as_ref() {
-        route.backend.clone()
+        route.active.backend.clone()
     } else {
         resolve_backend(&hostname, &state)?
     };
@@ -4241,12 +4438,13 @@ where
                 .relay_backend_connect_failures
                 .fetch_add(1, Ordering::Relaxed);
             {
+                let cached = cached_route.as_ref().unwrap();
                 let mut routes = state
                     .routes
                     .write()
                     .map_err(|_| "route table lock poisoned".to_string())?;
-                if route_observation_matches(routes.get(&hostname), cached_route.as_ref()) {
-                    routes.remove(&hostname);
+                if route_observation_matches(routes.get(&cached.pattern), Some(&cached.active)) {
+                    routes.remove(&cached.pattern);
                 }
             }
             backend = select_tokio_route(&hostname, ingress).await?.0;
@@ -4320,7 +4518,13 @@ fn resolve_backend_until(
     deadline: Instant,
 ) -> Result<Backend, String> {
     state.check_running_until(deadline)?;
+    let normalized =
+        tls_client_hello::normalize_hostname(hostname).map_err(|error| error.to_string())?;
+    let hostname = normalized.as_str();
     if let Some(snapshot) = state.public_snapshot() {
+        if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+            return certificate_discovery::resolve(hostname, state, &snapshot, deadline);
+        }
         let declaration = snapshot
             .routes
             .get(hostname)
@@ -4349,7 +4553,7 @@ fn resolve_backend_until(
     let (route_cache_path, route_cache_storage) = state
         .route_cache()
         .expect("development mode has combined route storage");
-    let cached = route_cache::load_until(
+    let cached = route_cache::load_matching_until(
         route_cache_path,
         hostname,
         route_cache_storage,
@@ -4367,7 +4571,10 @@ fn resolve_backend_until(
             .map_err(|_| "negative route cache lock poisoned".to_string())?;
         let now = Instant::now();
         negative.retain(|_, expires_at| *expires_at > now);
-        if negative.contains_key(hostname) {
+        if negative.contains_key(hostname)
+            || route_pattern::matching_wildcard(hostname)
+                .is_some_and(|pattern| negative.contains_key(&pattern))
+        {
             return Err(format!(
                 "no unique trusted backend was found recently for {hostname}"
             ));
@@ -4514,10 +4721,11 @@ fn load_public_registry_until(
         .values()
         .map(|declaration| (declaration.workload.clone(), declaration.role.clone()))
         .collect::<BTreeSet<_>>();
-    let undeclared = assignments
-        .keys()
-        .filter(|assignment| !declared_assignments.contains(*assignment))
-        .count();
+    let undeclared = if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+        0
+    } else {
+        assignments.keys().filter(|assignment| !declared_assignments.contains(*assignment)).count()
+    };
     state
         .undeclared_registrations
         .store(undeclared, Ordering::Release);
@@ -4537,6 +4745,13 @@ fn discover_backend_until(
 ) -> Result<Backend, String> {
     let matches = probe_candidates_until(hostname, candidates, state, deadline);
     ensure_before_route_deadline(deadline)?;
+    let pattern = matches
+        .first()
+        .map_or(hostname, |matched| {
+            matched.certificate.route_pattern(hostname)
+        })
+        .to_string();
+    let hostname = pattern.as_str();
 
     if matches.len() != 1 {
         if matches.len() > 1 {
@@ -4659,14 +4874,33 @@ fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
         return;
     }
     if let Some(snapshot) = state.public_snapshot() {
-        reconcile_public_workloads(state, &snapshot, PROBE_TIMEOUT, deadline);
+        if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+            certificate_discovery::reconcile(state, &snapshot, deadline);
+        } else {
+            reconcile_public_workloads(state, &snapshot, PROBE_TIMEOUT, deadline);
+        }
         return;
     }
     let candidates = match candidate_backends_until(state, None, deadline) {
         Ok(candidates) => candidates,
         Err(_) => return,
     };
-    let added = observe_workloads(state, &candidates);
+    observe_workloads(state, &candidates);
+    let added = {
+        // Foreground candidate scans must not consume the background discovery pass.
+        let mut evaluated = state
+            .eager_workloads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        evaluated.retain(|backend| candidates.contains(backend));
+        let added = candidates
+            .iter()
+            .filter(|backend| !evaluated.contains(backend))
+            .cloned()
+            .collect::<Vec<_>>();
+        evaluated.extend(added.iter().cloned());
+        added
+    };
 
     for (index, backend) in added.iter().enumerate() {
         if state.check_running_until(deadline).is_err() {
@@ -4761,7 +4995,7 @@ fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
 fn defer_eager_workloads(state: &ProxyState, pending: &[Backend]) {
     // Keep unfinished Workloads eligible as additions on the next pass.
     state
-        .workloads
+        .eager_workloads
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|workload| !pending.contains(workload));
@@ -4790,7 +5024,11 @@ fn reconcile_public_workloads(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         negative.retain(|_, expires| *expires > now);
-        negative.keys().cloned().collect::<BTreeSet<_>>()
+        if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+            BTreeSet::new()
+        } else {
+            negative.keys().cloned().collect::<BTreeSet<_>>()
+        }
     };
     let declarations = snapshot.routes.iter().collect::<Vec<_>>();
     if declarations.is_empty() {
@@ -5102,6 +5340,10 @@ fn default_certificate_dns_names_until(
 fn dns_names_from_certificate(der: &[u8]) -> Result<Vec<String>, String> {
     let (_, certificate) = X509Certificate::from_der(der)
         .map_err(|error| format!("cannot parse default certificate: {error}"))?;
+    certificate_dns_names(&certificate)
+}
+
+fn certificate_dns_names(certificate: &X509Certificate<'_>) -> Result<Vec<String>, String> {
     let san = certificate
         .subject_alternative_name()
         .map_err(|error| format!("cannot parse certificate SANs: {error}"))?
@@ -5112,9 +5354,7 @@ fn dns_names_from_certificate(der: &[u8]) -> Result<Vec<String>, String> {
         .general_names
         .iter()
         .filter_map(|name| match name {
-            GeneralName::DNSName(name) if !name.starts_with("*.") => {
-                tls_client_hello::normalize_hostname(name).ok()
-            }
+            GeneralName::DNSName(name) => route_pattern::normalize(name).ok(),
             _ => None,
         })
         .collect();
@@ -5181,14 +5421,20 @@ fn revalidate_hostname_until(
     incumbent: &ActiveRoute,
     deadline: Instant,
 ) {
-    if let Ok(certificate) = probe_declared_backend_until(
+    let proof = probe_declared_backend_until(
         hostname,
         &incumbent.backend,
         state,
         deadline.min(Instant::now() + DISCOVERY_TIMEOUT),
-    ) {
-        clear_conflict(state, hostname);
-        let _ = install_active_route_until(
+    );
+    let include_incumbent = proof.is_ok();
+    if let Ok(certificate) = proof
+        && certificate.route_pattern(hostname) == hostname
+    {
+        if !hostname.starts_with("*.") {
+            clear_conflict(state, hostname);
+        }
+        if install_active_route_until(
             state,
             hostname,
             ProbeMatch {
@@ -5197,7 +5443,12 @@ fn revalidate_hostname_until(
             },
             None,
             deadline,
-        );
+        )
+        .is_ok()
+            && hostname.starts_with("*.")
+        {
+            refresh_wildcard_conflict_until(state, hostname, &incumbent.backend, deadline);
+        }
         return;
     }
 
@@ -5224,7 +5475,7 @@ fn revalidate_hostname_until(
         Err(_) => return,
     }
     .into_iter()
-    .filter(|backend| backend != &incumbent.backend)
+    .filter(|backend| include_incumbent || backend != &incumbent.backend)
     .collect();
     let mut matches = probe_candidates_until(
         hostname,
@@ -5244,20 +5495,78 @@ fn revalidate_hostname_until(
         1 => {
             clear_conflict(state, hostname);
             let replacement = matches.pop().unwrap();
+            let pattern = replacement.certificate.route_pattern(hostname).to_string();
             eprintln!(
                 "event=route result=moved hostname={hostname} from_port={} to_port={}",
                 incumbent.backend.port, replacement.backend.port
             );
-            let _ = install_active_route_until(state, hostname, replacement, None, deadline);
+            let result = if pattern == hostname {
+                install_active_routes_until(
+                    state,
+                    vec![PendingRoute {
+                        hostname: pattern.clone(),
+                        matched: replacement,
+                        declaration_generation: None,
+                        observed: Some(Some(incumbent.clone())),
+                    }],
+                    deadline,
+                )
+                .and_then(|mut results| results.pop().unwrap().map(|_| ()))
+            } else {
+                install_active_route_until(state, &pattern, replacement, None, deadline)
+            };
+            if result.is_ok() && pattern != hostname {
+                deactivate_route(state, hostname, true, "route_pattern_changed");
+            }
         }
         _ => {
+            let pattern = matches[0].certificate.route_pattern(hostname).to_string();
             record_conflict(
                 state,
-                hostname,
+                &pattern,
                 matches.into_iter().map(|matched| matched.backend).collect(),
             );
             deactivate_route(state, hostname, false, "conflict");
         }
+    }
+}
+
+fn refresh_wildcard_conflict_until(
+    state: &ProxyState,
+    pattern: &str,
+    incumbent: &Backend,
+    deadline: Instant,
+) {
+    let Some(contenders) = state
+        .conflicts
+        .read()
+        .ok()
+        .and_then(|conflicts| conflicts.get(pattern).cloned())
+    else {
+        return;
+    };
+    let Ok(candidates) = candidate_backends_until(state, None, deadline) else {
+        return;
+    };
+    let candidates = candidates
+        .into_iter()
+        .filter(|backend| backend != incumbent && contenders.contains(backend))
+        .collect();
+    let probe_deadline = deadline.min(Instant::now() + DISCOVERY_TIMEOUT);
+    let matches = probe_candidates_until(pattern, candidates, state, probe_deadline);
+    if state.check_running_until(probe_deadline).is_err() {
+        return;
+    }
+    if matches.is_empty() {
+        clear_conflict(state, pattern);
+    } else {
+        record_conflict(
+            state,
+            pattern,
+            std::iter::once(incumbent.clone())
+                .chain(matches.into_iter().map(|matched| matched.backend))
+                .collect(),
+        );
     }
 }
 
@@ -5372,6 +5681,12 @@ fn prepare_active_route(
 ) -> Result<PreparedRoute, String> {
     let hostname = pending.hostname.as_str();
     let matched = &pending.matched;
+    if route_pattern::normalize(hostname).map_err(|error| error.to_string())? != hostname {
+        return Err("route pattern must be normalized".to_string());
+    }
+    if hostname.starts_with("*.") && matched.certificate.wildcard.as_deref() != Some(hostname) {
+        return Err("wildcard route requires a verified wildcard DNS SAN".to_string());
+    }
     let declaration_generation = pending.declaration_generation;
     let now_unix_seconds = current_unix_seconds();
     let expiry_state = matched.certificate.expiry_state_at(now_unix_seconds);
@@ -5382,16 +5697,25 @@ fn prepare_active_route(
         (Some(generation), HostingProfile::Public(snapshot))
             if snapshot.generation == generation =>
         {
-            let declaration = snapshot.routes.get(hostname).ok_or_else(|| {
-                "Route Declaration changed while certificate proof was pending".to_string()
-            })?;
-            if declaration.hostname != hostname
-                || declaration.workload != matched.backend.project
-                || declaration.role != matched.backend.role
-            {
-                return Err(
-                    "Route Declaration changed while certificate proof was pending".to_string(),
-                );
+            if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+                if !state.certificate_discovery.read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .owns(hostname, &matched.backend, generation)
+                {
+                    return Err("durable ownership claim changed while certificate proof was pending".into());
+                }
+            } else {
+                let declaration = snapshot.routes.get(hostname).ok_or_else(|| {
+                    "Route Declaration changed while certificate proof was pending".to_string()
+                })?;
+                if declaration.hostname != hostname
+                    || declaration.workload != matched.backend.project
+                    || declaration.role != matched.backend.role
+                {
+                    return Err(
+                        "Route Declaration changed while certificate proof was pending".to_string(),
+                    );
+                }
             }
         }
         (Some(_), HostingProfile::Public(_)) => {
@@ -5413,6 +5737,20 @@ fn prepare_active_route(
         .is_some_and(|observed| !route_observation_matches(routes.get(hostname), observed.as_ref()))
     {
         return Err("route changed while certificate proof was pending".to_string());
+    }
+    if declaration_generation.is_none()
+        && hostname.starts_with("*.")
+        && pending.observed.is_none()
+        && let Some(incumbent) = routes.get(hostname)
+        && incumbent.backend != matched.backend
+        && incumbent.certificate_is_valid_at(now_unix_seconds)
+    {
+        record_conflict(
+            state,
+            hostname,
+            vec![incumbent.backend.clone(), matched.backend.clone()],
+        );
+        return Err("wildcard route already has a verified incumbent".to_string());
     }
     if !routes.contains_key(hostname) && routes.len() + reserved >= MAX_VERIFIED_ROUTES {
         let _ = state.route_capacity_rejections.fetch_update(
@@ -5676,7 +6014,21 @@ fn probe_candidates_until(
     state: &ProxyState,
     deadline: Instant,
 ) -> Vec<ProbeMatch> {
+    let mut matches = probe_all_candidates_until(hostname, candidates, state, deadline);
+    if matches.iter().any(|matched| matched.certificate.wildcard.is_none()) {
+        matches.retain(|matched| matched.certificate.wildcard.is_none());
+    }
+    prefer_https_per_project(matches)
+}
+
+fn probe_all_candidates_until(
+    hostname: &str,
+    candidates: Vec<Backend>,
+    state: &ProxyState,
+    deadline: Instant,
+) -> Vec<ProbeMatch> {
     let (sender, receiver) = mpsc::channel();
+    let report_rejection = state.public_snapshot().is_none();
 
     for backend in candidates {
         if state.check_running_until(deadline).is_err() {
@@ -5715,7 +6067,9 @@ fn probe_candidates_until(
     }
     drop(sender);
 
-    prefer_https_per_project(collect_probe_matches(receiver, deadline))
+    let mut matches = collect_probe_matches(receiver, deadline);
+    matches.sort_by(|left, right| left.backend.cmp(&right.backend));
+    matches
 }
 
 fn collect_probe_matches(
@@ -5798,6 +6152,11 @@ fn probe_backend_until_cancellable(
     if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
         return Err("ingress is shutting down".to_string());
     }
+    let pattern = route_pattern::normalize(hostname).map_err(|error| error.to_string())?;
+    // A one-character label fits even the longest legal wildcard SAN.
+    let probe_hostname = pattern
+        .strip_prefix("*.")
+        .map_or_else(|| pattern.clone(), |suffix| format!("a.{suffix}"));
     let remaining = route_deadline_remaining(deadline)?;
     let stream = connect_backend_with_timeout(backend, remaining.min(PROBE_TIMEOUT))
         .map_err(|error| format!("TCP connection failed: {error}"))?;
@@ -5809,7 +6168,7 @@ fn probe_backend_until_cancellable(
             TlsConnector::new().map_err(|error| format!("cannot create TLS connector: {error}"))?;
         &system_connector
     };
-    let tls = tls_connect_until(connector, hostname, stream, deadline, cancelled)?;
+    let tls = tls_connect_until(connector, &probe_hostname, stream, deadline, cancelled)?;
     ensure_before_route_deadline(deadline)?;
     let certificate = tls
         .peer_certificate()
@@ -5821,6 +6180,29 @@ fn probe_backend_until_cancellable(
     let digest = Sha256::digest(&der);
     let (_, certificate) = X509Certificate::from_der(&der)
         .map_err(|error| format!("cannot parse peer certificate: {error}"))?;
+    let names = if certificate
+        .subject_alternative_name()
+        .map_err(|error| format!("cannot parse certificate SANs: {error}"))?
+        .is_some()
+    {
+        certificate_dns_names(&certificate)?
+    } else {
+        Vec::new()
+    };
+    let dns_san = names.contains(&pattern)
+        || route_pattern::matching_wildcard(&pattern).is_some_and(|name| names.contains(&name));
+    let wildcard = if pattern.starts_with("*.") {
+        if !names.contains(&pattern) {
+            return Err(format!(
+                "verified peer certificate does not contain wildcard DNS SAN {pattern}"
+            ));
+        }
+        Some(pattern)
+    } else if names.contains(&pattern) {
+        None
+    } else {
+        route_pattern::matching_wildcard(&pattern).filter(|wildcard| names.contains(wildcard))
+    };
     let not_after_unix_seconds = u64::try_from(certificate.validity().not_after.timestamp())
         .map_err(|_| "peer certificate expiry precedes the Unix epoch".to_string())?;
     ensure_before_route_deadline(deadline)?;
@@ -5831,6 +6213,8 @@ fn probe_backend_until_cancellable(
             .collect::<Vec<_>>()
             .join(":"),
         not_after_unix_seconds,
+        wildcard,
+        dns_san,
     })
 }
 
@@ -6079,6 +6463,8 @@ mod tests {
             certificate: CertificateProof {
                 fingerprint: "AA:BB".to_string(),
                 not_after_unix_seconds: u64::MAX,
+                wildcard: None,
+                dns_san: true,
             },
             last_expiry_warning: None,
             declaration_generation: None,
@@ -6114,6 +6500,7 @@ mod tests {
             ingress_config: PathBuf::from("ingress.toml"),
             intent_owner: IntentOwner::EffectiveUser,
             generation: 1,
+            routing_policy: Default::default(),
             listeners: None,
             metrics: None,
             source_diagnostics: None,
@@ -6224,7 +6611,7 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct TestCertificate {
+    pub(super) struct TestCertificate {
         certificate_pem: String,
         private_key_pem: String,
     }
@@ -6247,15 +6634,15 @@ mod tests {
             Self::parameters_for_hostnames(vec![hostname.to_string()])
         }
 
-        fn for_hostname(hostname: &str) -> Self {
+        pub(super) fn for_hostname(hostname: &str) -> Self {
             Self::for_hostnames(&[hostname])
         }
 
-        fn for_hostname_valid_for(hostname: &str, valid_for: Duration) -> Self {
+        pub(super) fn for_hostname_valid_for(hostname: &str, valid_for: Duration) -> Self {
             Self::for_hostnames_valid_for(&[hostname], valid_for)
         }
 
-        fn for_hostnames(hostnames: &[&str]) -> Self {
+        pub(super) fn for_hostnames(hostnames: &[&str]) -> Self {
             Self::for_hostnames_valid_for(hostnames, Duration::from_secs(30 * 24 * 60 * 60))
         }
 
@@ -6282,11 +6669,11 @@ mod tests {
             }
         }
 
-        fn connector(&self) -> TlsConnector {
+        pub(super) fn connector(&self) -> TlsConnector {
             Self::connector_for(&[self])
         }
 
-        fn server_config(&self) -> Arc<rustls::ServerConfig> {
+        pub(super) fn server_config(&self) -> Arc<rustls::ServerConfig> {
             use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
             // Keep fixture-side TLS independent of the native verifier used by ingress probes.
@@ -6301,7 +6688,7 @@ mod tests {
             )
         }
 
-        fn connector_for(certificates: &[&Self]) -> TlsConnector {
+        pub(super) fn connector_for(certificates: &[&Self]) -> TlsConnector {
             let mut builder = TlsConnector::builder();
             builder.disable_built_in_roots(true);
             for certificate in certificates {
@@ -6312,7 +6699,7 @@ mod tests {
             builder.build().unwrap()
         }
 
-        fn unrelated_connector(hostname: &str) -> TlsConnector {
+        pub(super) fn unrelated_connector(hostname: &str) -> TlsConnector {
             let signing_key = KeyPair::generate().unwrap();
             let cert = Self::parameters_for_hostname(hostname)
                 .self_signed(&signing_key)
@@ -6324,16 +6711,16 @@ mod tests {
         }
     }
 
-    struct TestTlsBackend {
+    pub(super) struct TestTlsBackend {
         address: SocketAddr,
-        tls_config: Arc<RwLock<Arc<rustls::ServerConfig>>>,
+        pub(super) tls_config: Arc<RwLock<Arc<rustls::ServerConfig>>>,
         accepted: Arc<AtomicUsize>,
         shutdown: Arc<AtomicBool>,
         workers: Vec<thread::JoinHandle<()>>,
     }
 
     impl TestTlsBackend {
-        fn start(certificate: &TestCertificate, response: &'static [u8]) -> Self {
+        pub(super) fn start(certificate: &TestCertificate, response: &'static [u8]) -> Self {
             Self::start_with_workers(certificate, response, 1)
         }
 
@@ -6351,8 +6738,31 @@ mod tests {
             worker_count: usize,
             first_handshake_delay: Duration,
         ) -> Self {
+            Self::start_at_with_workers_and_delay(
+                certificate, response, worker_count, first_handshake_delay,
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+            )
+        }
+
+        pub(super) fn start_at(
+            certificate: &TestCertificate, response: &'static [u8], address: SocketAddr,
+        ) -> Self {
+            Self::start_at_with_workers_and_delay(certificate, response, 1, Duration::ZERO, address)
+        }
+
+        fn start_at_with_workers_and_delay(
+            certificate: &TestCertificate,
+            response: &'static [u8],
+            worker_count: usize,
+            first_handshake_delay: Duration,
+            address: SocketAddr,
+        ) -> Self {
             assert!(worker_count > 0);
-            let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+            let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            socket.set_reuse_address(true).unwrap();
+            socket.bind(&address.into()).unwrap();
+            socket.listen(128).unwrap();
+            let listener = Arc::new(TcpListener::from(socket));
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
             let tls_config = Arc::new(RwLock::new(certificate.server_config()));
@@ -6407,15 +6817,15 @@ mod tests {
             }
         }
 
-        fn port(&self) -> u16 {
+        pub(super) fn port(&self) -> u16 {
             self.address.port()
         }
 
-        fn accepted(&self) -> usize {
+        pub(super) fn accepted(&self) -> usize {
             self.accepted.load(Ordering::Acquire)
         }
 
-        fn replace_certificate(&self, certificate: &TestCertificate) {
+        pub(super) fn replace_certificate(&self, certificate: &TestCertificate) {
             *self.tls_config.write().unwrap() = certificate.server_config();
         }
     }
@@ -6459,7 +6869,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_logical_registry(directory: &Path, assignments: &[(&str, u16)]) -> PathBuf {
+    pub(super) fn write_logical_registry(directory: &Path, assignments: &[(&str, u16)]) -> PathBuf {
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
         let directory = directory.canonicalize().unwrap();
         let registry = directory.join("ports.toml");
@@ -6484,6 +6894,7 @@ mod tests {
             ingress_config: PathBuf::from("ingress.toml"),
             intent_owner: IntentOwner::EffectiveUser,
             generation: 1,
+            routing_policy: Default::default(),
             listeners: None,
             metrics: None,
             source_diagnostics: None,
@@ -7260,6 +7671,7 @@ mod tests {
             ingress_config: PathBuf::from("ingress.toml"),
             intent_owner: IntentOwner::EffectiveUser,
             generation: 1,
+            routing_policy: Default::default(),
             listeners: None,
             metrics: None,
             source_diagnostics: None,
@@ -7469,6 +7881,8 @@ mod tests {
                     Ok(super::ReconciledProbe::Certificate(Ok(CertificateProof {
                         fingerprint: fingerprint.into(),
                         not_after_unix_seconds: u64::MAX,
+                        wildcard: None,
+                        dns_san: true,
                     }))),
                 )
                 .expect("a successful reconciliation proof awaits publication")
@@ -7751,7 +8165,10 @@ mod tests {
             admission: state.admission.try_admit(source.ip()).unwrap(),
             hostname: "www.example.test".into(),
             peeked_length: 0,
-            cached_route: Some(active_route(backend.clone())),
+            cached_route: Some(super::SelectedRoute {
+                pattern: "www.example.com".into(),
+                active: active_route(backend.clone()),
+            }),
             backend,
             relay_idle_timeout: None,
         };
@@ -9721,6 +10138,8 @@ mod tests {
                 certificate: CertificateProof {
                     fingerprint: "AA:BB".to_string(),
                     not_after_unix_seconds: u64::MAX,
+                    wildcard: None,
+                    dns_san: true,
                 },
             })
             .unwrap();
@@ -10175,6 +10594,8 @@ mod tests {
                 certificate: CertificateProof {
                     fingerprint: "AA:BB".to_string(),
                     not_after_unix_seconds: u64::MAX,
+                    wildcard: None,
+                    dns_san: true,
                 },
             },
             Some(1),
@@ -10235,6 +10656,8 @@ mod tests {
         let proof = |fingerprint: &str| CertificateProof {
             fingerprint: fingerprint.into(),
             not_after_unix_seconds: u64::MAX,
+            wildcard: None,
+            dns_san: true,
         };
         super::install_active_route_until(
             &state,
@@ -10391,6 +10814,8 @@ mod tests {
                     certificate: CertificateProof {
                         fingerprint: "stale".to_string(),
                         not_after_unix_seconds: u64::MAX,
+                        wildcard: None,
+                        dns_san: true,
                     },
                 },
                 Some(1),
@@ -10438,6 +10863,8 @@ mod tests {
                 certificate: CertificateProof {
                     fingerprint: "AA:BB".to_string(),
                     not_after_unix_seconds: u64::MAX,
+                    wildcard: None,
+                    dns_san: true,
                 },
             },
             None,
@@ -10573,6 +11000,7 @@ mod tests {
             ingress_config: directory.path().join("ingress.toml"),
             intent_owner: IntentOwner::EffectiveUser,
             generation: 1,
+            routing_policy: Default::default(),
             listeners: None,
             metrics: None,
             source_diagnostics: None,
@@ -10897,18 +11325,853 @@ mod tests {
     }
 
     #[test]
-    fn eager_discovery_extracts_exact_dns_sans_but_not_wildcards() {
+    fn eager_discovery_extracts_canonical_exact_and_wildcard_dns_sans() {
         let certificate = rcgen::generate_simple_self_signed(vec![
             "www.example.com".to_string(),
             "api.example.com".to_string(),
             "*.example.com".to_string(),
+            "*.EXAMPLE.com.".to_string(),
+            "w*.example.com".to_string(),
+            "*.*.example.com".to_string(),
         ])
         .unwrap();
 
         assert_eq!(
             super::dns_names_from_certificate(certificate.cert.der()).unwrap(),
-            ["api.example.com", "www.example.com"]
+            ["*.example.com", "api.example.com", "www.example.com"]
         );
+    }
+
+    pub(super) mod wildcard_routing {
+        use super::*;
+        use crate::proxy;
+
+        const PATTERN: &str = "*.wildcard.example.test";
+        const FIRST: &str = "foo.wildcard.example.test";
+        const SECOND: &str = "unlisted-927.wildcard.example.test";
+
+        fn development_state(
+            directory: &Path,
+            assignments: &[(&str, &str, u16)],
+            connector: TlsConnector,
+        ) -> Arc<ProxyState> {
+            let registry = directory.join("ports.toml");
+            update_config(&registry, |document| {
+                document["ports"] = toml_edit::table();
+                for (project, role, port) in assignments {
+                    if !document["ports"].as_table().unwrap().contains_key(project) {
+                        document["ports"][project] = toml_edit::table();
+                    }
+                    document["ports"][project][role] = value(i64::from(*port));
+                }
+            });
+            Arc::new(ProxyState::new_with_profile_connector_and_runtime(
+                registry,
+                HostingProfile::Development,
+                connector,
+                directory.join("missing-handoff-runtime"),
+            ))
+        }
+
+        pub(in crate::proxy) fn request(
+            state: &Arc<ProxyState>,
+            connector: &TlsConnector,
+            hostname: &str,
+        ) -> Result<[u8; 8], String> {
+            let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = frontend.local_addr().unwrap();
+            let connector = connector.clone();
+            let hostname = hostname.to_string();
+            let client = thread::spawn(move || {
+                let stream = TcpStream::connect(address).map_err(|error| error.to_string())?;
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut tls = connector
+                    .connect(&hostname, stream)
+                    .map_err(|error| error.to_string())?;
+                tls.write_all(b"request")
+                    .map_err(|error| error.to_string())?;
+                let mut response = [0; 8];
+                tls.read_exact(&mut response)
+                    .map_err(|error| error.to_string())?;
+                Ok(response)
+            });
+            let (accepted, peer) = frontend.accept().unwrap();
+            accepted.set_nonblocking(true).unwrap();
+            let worker_state = Arc::clone(state);
+            let workers =
+                proxy::BoundedWorkerPool::start("wildcard-route-test", 1, 1, move |job| {
+                    handle_route_selection(job, &worker_state);
+                })
+                .unwrap();
+            let ingress = TokioIngress {
+                state: Arc::clone(state),
+                shutdown: running_shutdown(),
+                route_sender: workers.sender(),
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .enable_io()
+                .enable_time()
+                .build()
+                .unwrap();
+            let routed = runtime.block_on(async {
+                proxy::route_tokio_connection(
+                    TokioTcpStream::from_std(accepted).unwrap(),
+                    peer.ip(),
+                    Instant::now(),
+                    state.admission.try_admit(peer.ip()).unwrap(),
+                    ingress,
+                )
+                .await
+            });
+            let response = client.join().unwrap();
+            workers.join().unwrap();
+            routed?;
+            response
+        }
+
+        #[test]
+        fn eager_route_serves_arbitrary_labels_before_any_concrete_discovery() {
+            let directory = tempdir().unwrap();
+            let certificate = TestCertificate::for_hostname(PATTERN);
+            let workload = TestTlsBackend::start(&certificate, b"wildcard");
+            let state = development_state(
+                directory.path(),
+                &[("/wildcard", "https", workload.port())],
+                certificate.connector(),
+            );
+
+            reconcile_workloads(&state);
+
+            assert_eq!(state.routes.read().unwrap().len(), 1);
+            assert!(state.routes.read().unwrap().contains_key(PATTERN));
+            assert_eq!(state.successful_discoveries.load(Ordering::Acquire), 1);
+            let accepted = workload.accepted();
+            for hostname in [FIRST, SECOND] {
+                assert_eq!(
+                    request(&state, &certificate.connector(), hostname).unwrap(),
+                    *b"wildcard"
+                );
+            }
+            assert_eq!(
+                workload.accepted(),
+                accepted + 2,
+                "warm wildcard routes must not probe"
+            );
+            assert_eq!(state.successful_discoveries.load(Ordering::Acquire), 1);
+            assert_eq!(state.routes.read().unwrap().len(), 1);
+            let document = crate::read_config(&state.config);
+            let cached = document["discovered_routes"].as_table().unwrap();
+            assert_eq!(cached.len(), 1);
+            assert!(cached.contains_key(PATTERN));
+            let routes = render_control_response(&state, &running_shutdown(), "ROUTES");
+            assert!(
+                routes.contains(&format!("active\t{PATTERN}\t/wildcard\thttps\t")),
+                "{routes}"
+            );
+            let status = render_control_response(&state, &running_shutdown(), "STATUS");
+            assert!(status.contains("active_routes=1\n"), "{status}");
+            assert_eq!(state.admission.snapshot().global.in_use, 0);
+        }
+
+        #[test]
+        fn foreground_miss_does_not_suppress_eager_pattern_discovery() {
+            let directory = tempdir().unwrap();
+            let certificate = TestCertificate::for_hostname(PATTERN);
+            let workload = TestTlsBackend::start(&certificate, b"wildcard");
+            let state = development_state(
+                directory.path(),
+                &[("/wildcard", "https", workload.port())],
+                certificate.connector(),
+            );
+            assert!(request(&state, &certificate.connector(), "unrelated.example.test").is_err());
+            assert!(state.routes.read().unwrap().is_empty());
+
+            reconcile_workloads(&state);
+
+            assert!(state.routes.read().unwrap().contains_key(PATTERN));
+            assert_eq!(
+                request(&state, &certificate.connector(), FIRST).unwrap(),
+                *b"wildcard"
+            );
+        }
+
+        #[test]
+        fn rejects_apex_deep_suffix_and_client_wildcard_names() {
+            let directory = tempdir().unwrap();
+            let certificate = TestCertificate::for_hostname(PATTERN);
+            let workload = TestTlsBackend::start(&certificate, b"wildcard");
+            let state = development_state(
+                directory.path(),
+                &[("/wildcard", "https", workload.port())],
+                certificate.connector(),
+            );
+            reconcile_workloads(&state);
+
+            for hostname in [
+                "wildcard.example.test",
+                "deep.foo.wildcard.example.test",
+                "badwildcard.example.test",
+                "foo.wildcard.example.test.evil",
+                PATTERN,
+                "w*.wildcard.example.test",
+            ] {
+                assert!(
+                    current_active_route(&state, hostname).map_or(true, |route| route.is_none()),
+                    "{hostname}"
+                );
+                assert!(
+                    request(&state, &certificate.connector(), hostname).is_err(),
+                    "{hostname}"
+                );
+            }
+            assert_eq!(state.routes.read().unwrap().len(), 1);
+            assert_eq!(state.successful_discoveries.load(Ordering::Acquire), 1);
+        }
+
+        #[test]
+        fn exact_routes_win_in_both_eager_discovery_orders() {
+            for exact_first in [false, true] {
+                let directory = tempdir().unwrap();
+                let wildcard_certificate = TestCertificate::for_hostname(PATTERN);
+                let exact_certificate = TestCertificate::for_hostname(FIRST);
+                let wildcard = TestTlsBackend::start(&wildcard_certificate, b"wildcard");
+                let exact = TestTlsBackend::start(&exact_certificate, b"exact!!!");
+                let connector =
+                    TestCertificate::connector_for(&[&wildcard_certificate, &exact_certificate]);
+                let (wildcard_project, exact_project) = if exact_first {
+                    ("/z-wildcard", "/a-exact")
+                } else {
+                    ("/a-wildcard", "/z-exact")
+                };
+                let state = development_state(
+                    directory.path(),
+                    &[
+                        (wildcard_project, "https", wildcard.port()),
+                        (exact_project, "https", exact.port()),
+                    ],
+                    connector.clone(),
+                );
+                reconcile_workloads(&state);
+
+                assert_eq!(state.routes.read().unwrap().len(), 2);
+                assert!(state.conflicts.read().unwrap().is_empty());
+                assert_eq!(request(&state, &connector, FIRST).unwrap(), *b"exact!!!");
+                assert_eq!(request(&state, &connector, SECOND).unwrap(), *b"wildcard");
+            }
+        }
+
+        #[test]
+        fn lazy_exact_main_proof_wins_over_same_project_https_wildcard() {
+            let directory = tempdir().unwrap();
+            let wildcard_certificate = TestCertificate::for_hostname(PATTERN);
+            let exact_certificate = TestCertificate::for_hostname(FIRST);
+            let wildcard = TestTlsBackend::start(&wildcard_certificate, b"wildcard");
+            let exact = TestTlsBackend::start(&exact_certificate, b"exact!!!");
+            let connector =
+                TestCertificate::connector_for(&[&wildcard_certificate, &exact_certificate]);
+            let state = development_state(
+                directory.path(),
+                &[
+                    ("/project", "https", wildcard.port()),
+                    ("/project", "main", exact.port()),
+                ],
+                connector.clone(),
+            );
+            assert_eq!(request(&state, &connector, FIRST).unwrap(), *b"exact!!!");
+            assert_eq!(state.routes.read().unwrap()[FIRST].backend.role, "main");
+            assert_eq!(request(&state, &connector, SECOND).unwrap(), *b"wildcard");
+            assert_eq!(state.routes.read().unwrap()[PATTERN].backend.role, "https");
+            assert_eq!(state.routes.read().unwrap().len(), 2);
+        }
+
+        #[test]
+        fn exact_conflicts_do_not_fall_through_to_a_wildcard_route() {
+            let directory = tempdir().unwrap();
+            let wildcard_certificate = TestCertificate::for_hostname(PATTERN);
+            let exact_certificate = TestCertificate::for_hostname(FIRST);
+            let wildcard = TestTlsBackend::start(&wildcard_certificate, b"wildcard");
+            let first = TestTlsBackend::start(&exact_certificate, b"exact!!!");
+            let second = TestTlsBackend::start(&exact_certificate, b"second!!");
+            let connector =
+                TestCertificate::connector_for(&[&wildcard_certificate, &exact_certificate]);
+            let state = development_state(
+                directory.path(),
+                &[("/wildcard", "https", wildcard.port())],
+                connector.clone(),
+            );
+            reconcile_workloads(&state);
+            update_config(&state.config, |document| {
+                for (project, port) in [("/first", first.port()), ("/second", second.port())] {
+                    document["ports"][project] = toml_edit::table();
+                    document["ports"][project]["https"] = value(i64::from(port));
+                }
+            });
+            reconcile_workloads(&state);
+            assert_eq!(state.conflicts.read().unwrap()[FIRST].len(), 2);
+            assert!(request(&state, &connector, FIRST).is_err());
+            assert_eq!(request(&state, &connector, SECOND).unwrap(), *b"wildcard");
+        }
+
+        #[test]
+        fn lazy_main_discovery_and_persisted_reload_keep_one_verified_pattern() {
+            let directory = tempdir().unwrap();
+            let certificate = TestCertificate::for_hostname(PATTERN);
+            let workload = TestTlsBackend::start(&certificate, b"wildcard");
+            let state = development_state(
+                directory.path(),
+                &[("/wildcard", "main", workload.port())],
+                certificate.connector(),
+            );
+            reconcile_workloads(&state);
+            assert!(state.routes.read().unwrap().is_empty());
+            assert_eq!(
+                request(&state, &certificate.connector(), FIRST).unwrap(),
+                *b"wildcard"
+            );
+            assert_eq!(state.routes.read().unwrap().len(), 1);
+            assert!(state.routes.read().unwrap().contains_key(PATTERN));
+
+            let reloaded = Arc::new(ProxyState::new_with_profile_connector_and_runtime(
+                state.config.clone(),
+                HostingProfile::Development,
+                certificate.connector(),
+                directory.path().join("missing-handoff-runtime"),
+            ));
+            assert!(current_active_route(&reloaded, SECOND).unwrap().is_none());
+            let accepted = workload.accepted();
+            assert_eq!(
+                request(&reloaded, &certificate.connector(), SECOND).unwrap(),
+                *b"wildcard"
+            );
+            assert!(
+                workload.accepted() >= accepted + 3,
+                "cache reload must perform a TLS proof"
+            );
+            assert_eq!(reloaded.successful_discoveries.load(Ordering::Acquire), 1);
+            assert_eq!(reloaded.routes.read().unwrap().len(), 1);
+            assert!(reloaded.routes.read().unwrap().contains_key(PATTERN));
+
+            let untrusted = Arc::new(ProxyState::new_with_profile_connector_and_runtime(
+                state.config.clone(),
+                HostingProfile::Development,
+                TestCertificate::unrelated_connector(PATTERN),
+                directory.path().join("missing-handoff-runtime"),
+            ));
+            assert!(request(&untrusted, &certificate.connector(), FIRST).is_err());
+            assert!(untrusted.routes.read().unwrap().is_empty());
+        }
+
+        #[test]
+        fn duplicate_initial_owners_fail_closed_and_recover_without_an_arbitrary_winner() {
+            let directory = tempdir().unwrap();
+            let certificate = TestCertificate::for_hostname(PATTERN);
+            let first = TestTlsBackend::start(&certificate, b"wildcard");
+            let second = TestTlsBackend::start(&certificate, b"second!!");
+            let state = development_state(
+                directory.path(),
+                &[
+                    ("/z-first", "https", first.port()),
+                    ("/a-second", "https", second.port()),
+                ],
+                certificate.connector(),
+            );
+            reconcile_workloads(&state);
+            assert!(state.routes.read().unwrap().is_empty());
+            let contenders = state.conflicts.read().unwrap()[PATTERN].clone();
+            assert_eq!(
+                contenders
+                    .iter()
+                    .map(|backend| backend.project.as_str())
+                    .collect::<Vec<_>>(),
+                ["/a-second", "/z-first"]
+            );
+            assert!(state.negative.lock().unwrap().contains_key(PATTERN));
+            for hostname in [FIRST, SECOND] {
+                assert!(request(&state, &certificate.connector(), hostname).is_err());
+            }
+            assert!(state.routes.read().unwrap().is_empty());
+            assert!(
+                render_control_response(&state, &running_shutdown(), "ROUTES")
+                    .contains(&format!("conflict\t{PATTERN}\t"))
+            );
+
+            update_config(&state.config, |document| {
+                document["ports"]
+                    .as_table_mut()
+                    .unwrap()
+                    .remove("/a-second");
+            });
+            reconcile_workloads(&state);
+            assert_eq!(
+                request(&state, &certificate.connector(), SECOND).unwrap(),
+                *b"wildcard"
+            );
+            assert!(state.conflicts.read().unwrap().is_empty());
+            assert_eq!(
+                state.routes.read().unwrap()[PATTERN].backend.port,
+                first.port()
+            );
+        }
+
+        #[test]
+        fn late_duplicate_preserves_incumbent_and_revalidates_conflict_diagnostics() {
+            let directory = tempdir().unwrap();
+            let certificate = TestCertificate::for_hostname(PATTERN);
+            let first = TestTlsBackend::start(&certificate, b"wildcard");
+            let second = TestTlsBackend::start(&certificate, b"second!!");
+            let state = development_state(
+                directory.path(),
+                &[("/incumbent", "https", first.port())],
+                certificate.connector(),
+            );
+            reconcile_workloads(&state);
+            update_config(&state.config, |document| {
+                document["ports"]["/contender"] = toml_edit::table();
+                document["ports"]["/contender"]["https"] = value(i64::from(second.port()));
+            });
+            reconcile_workloads(&state);
+            assert_eq!(state.conflicts.read().unwrap()[PATTERN].len(), 2);
+            state
+                .routes
+                .write()
+                .unwrap()
+                .get_mut(PATTERN)
+                .unwrap()
+                .last_tls_check -= TLS_REVALIDATION_INTERVAL;
+            reconcile_routes(&state);
+            assert_eq!(state.conflicts.read().unwrap()[PATTERN].len(), 2);
+            assert_eq!(
+                request(&state, &certificate.connector(), FIRST).unwrap(),
+                *b"wildcard"
+            );
+
+            update_config(&state.config, |document| {
+                document["ports"]
+                    .as_table_mut()
+                    .unwrap()
+                    .remove("/contender");
+            });
+            state
+                .routes
+                .write()
+                .unwrap()
+                .get_mut(PATTERN)
+                .unwrap()
+                .last_tls_check -= TLS_REVALIDATION_INTERVAL;
+            reconcile_routes(&state);
+            assert!(state.conflicts.read().unwrap().is_empty());
+            assert_eq!(
+                state.routes.read().unwrap()[PATTERN].backend.port,
+                first.port()
+            );
+
+            update_config(&state.config, |document| {
+                document["ports"]["/contender"] = toml_edit::table();
+                document["ports"]["/contender"]["https"] = value(i64::from(second.port()));
+            });
+            reconcile_workloads(&state);
+            first.replace_certificate(&TestCertificate::for_hostname("removed.example.test"));
+            state
+                .routes
+                .write()
+                .unwrap()
+                .get_mut(PATTERN)
+                .unwrap()
+                .last_tls_check -= TLS_REVALIDATION_INTERVAL;
+            reconcile_routes(&state);
+            assert!(state.conflicts.read().unwrap().is_empty());
+            assert_eq!(
+                state.routes.read().unwrap()[PATTERN].backend.port,
+                second.port()
+            );
+            assert_eq!(
+                request(&state, &certificate.connector(), FIRST).unwrap(),
+                *b"second!!"
+            );
+        }
+
+        #[test]
+        fn untrusted_default_certificate_never_activates_a_pattern() {
+            let directory = tempdir().unwrap();
+            let certificate = TestCertificate::for_hostname(PATTERN);
+            let workload = TestTlsBackend::start(&certificate, b"wildcard");
+            let state = development_state(
+                directory.path(),
+                &[("/wildcard", "https", workload.port())],
+                TestCertificate::unrelated_connector(PATTERN),
+            );
+            reconcile_workloads(&state);
+            assert_eq!(state.workloads.lock().unwrap().len(), 1);
+            assert!(state.routes.read().unwrap().is_empty());
+            assert!(request(&state, &certificate.connector(), FIRST).is_err());
+            assert!(
+                route_cache::load(
+                    &state.config,
+                    PATTERN,
+                    route_cache::Storage::CombinedRegistry
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+
+        #[test]
+        fn expired_wildcard_certificate_never_activates_a_pattern() {
+            let directory = tempdir().unwrap();
+            let certificate = TestCertificate::for_hostname_valid_for(PATTERN, Duration::ZERO);
+            let workload = TestTlsBackend::start(&certificate, b"wildcard");
+            let state = development_state(
+                directory.path(),
+                &[("/wildcard", "https", workload.port())],
+                certificate.connector(),
+            );
+            reconcile_workloads(&state);
+            assert_eq!(state.workloads.lock().unwrap().len(), 1);
+            assert!(state.routes.read().unwrap().is_empty());
+            assert!(state.negative.lock().unwrap().contains_key(PATTERN));
+            assert!(request(&state, &certificate.connector(), FIRST).is_err());
+        }
+
+        #[test]
+        fn verified_sni_certificate_must_contain_the_claimed_wildcard_san() {
+            #[derive(Debug)]
+            struct CertificateSelection {
+                default: Arc<dyn rustls::server::ResolvesServerCert>,
+                named: Arc<dyn rustls::server::ResolvesServerCert>,
+            }
+            impl rustls::server::ResolvesServerCert for CertificateSelection {
+                fn resolve(
+                    &self,
+                    hello: rustls::server::ClientHello<'_>,
+                ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                    if hello.server_name().is_none() {
+                        self.default.resolve(hello)
+                    } else {
+                        self.named.resolve(hello)
+                    }
+                }
+            }
+            const REPRESENTATIVE: &str = "a.wildcard.example.test";
+            let directory = tempdir().unwrap();
+            let wildcard_certificate = TestCertificate::for_hostname(PATTERN);
+            let exact_certificate = TestCertificate::for_hostname(REPRESENTATIVE);
+            let workload = TestTlsBackend::start(&wildcard_certificate, b"exact!!!");
+            let resolver = CertificateSelection {
+                default: wildcard_certificate.server_config().cert_resolver.clone(),
+                named: exact_certificate.server_config().cert_resolver.clone(),
+            };
+            *workload.tls_config.write().unwrap() = Arc::new(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(resolver)),
+            );
+            let connector =
+                TestCertificate::connector_for(&[&wildcard_certificate, &exact_certificate]);
+            let state = development_state(
+                directory.path(),
+                &[("/wildcard", "https", workload.port())],
+                connector.clone(),
+            );
+            let backend = Backend {
+                project: "/wildcard".into(),
+                role: "https".into(),
+                port: workload.port(),
+            };
+            assert!(proxy::probe_backend(REPRESENTATIVE, &backend, Some(&connector)).is_ok());
+            let error = proxy::probe_backend(PATTERN, &backend, Some(&connector)).unwrap_err();
+            assert!(
+                error.contains("does not contain wildcard DNS SAN"),
+                "{error}"
+            );
+            reconcile_workloads(&state);
+            assert_eq!(state.workloads.lock().unwrap().len(), 1);
+            assert!(state.routes.read().unwrap().is_empty());
+            assert!(request(&state, &connector, FIRST).is_err());
+            assert!(
+                route_cache::load(
+                    &state.config,
+                    PATTERN,
+                    route_cache::Storage::CombinedRegistry
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+
+        #[test]
+        fn expiry_rotation_tcp_failure_restart_and_registration_removal_use_the_pattern() {
+            let directory = tempdir().unwrap();
+            let certificate = TestCertificate::for_hostname(PATTERN);
+            let renewed = TestCertificate::for_hostname_valid_for(
+                PATTERN,
+                Duration::from_secs(60 * 24 * 60 * 60),
+            );
+            let connector = TestCertificate::connector_for(&[&certificate, &renewed]);
+            let workload = TestTlsBackend::start(&certificate, b"wildcard");
+            let state = development_state(
+                directory.path(),
+                &[("/wildcard", "https", workload.port())],
+                connector.clone(),
+            );
+            reconcile_workloads(&state);
+            state
+                .routes
+                .write()
+                .unwrap()
+                .get_mut(PATTERN)
+                .unwrap()
+                .certificate
+                .not_after_unix_seconds = current_unix_seconds();
+            assert!(current_active_route(&state, FIRST).unwrap().is_none());
+            assert!(state.routes.read().unwrap().is_empty());
+            assert_eq!(request(&state, &connector, SECOND).unwrap(), *b"wildcard");
+
+            let old_fingerprint = state.routes.read().unwrap()[PATTERN]
+                .certificate
+                .fingerprint
+                .clone();
+            workload.replace_certificate(&renewed);
+            state
+                .routes
+                .write()
+                .unwrap()
+                .get_mut(PATTERN)
+                .unwrap()
+                .last_tls_check -= TLS_REVALIDATION_INTERVAL;
+            reconcile_routes(&state);
+            let new_fingerprint = state.routes.read().unwrap()[PATTERN]
+                .certificate
+                .fingerprint
+                .clone();
+            assert_ne!(old_fingerprint, new_fingerprint);
+            assert_eq!(
+                route_cache::load(
+                    &state.config,
+                    PATTERN,
+                    route_cache::Storage::CombinedRegistry
+                )
+                .unwrap()
+                .unwrap()
+                .certificate_fingerprint,
+                new_fingerprint
+            );
+
+            drop(workload);
+            reconcile_workloads(&state);
+            reconcile_routes(&state);
+            reconcile_routes(&state);
+            assert!(state.routes.read().unwrap().contains_key(PATTERN));
+            reconcile_routes(&state);
+            assert!(state.routes.read().unwrap().is_empty());
+            assert!(
+                route_cache::load(
+                    &state.config,
+                    PATTERN,
+                    route_cache::Storage::CombinedRegistry
+                )
+                .unwrap()
+                .is_some()
+            );
+
+            let restarted = TestTlsBackend::start(&renewed, b"renewed!");
+            update_config(&state.config, |document| {
+                document["ports"]["/wildcard"]["https"] = value(i64::from(restarted.port()));
+            });
+            reconcile_workloads(&state);
+            assert_eq!(
+                request(&state, &connector, "new.wildcard.example.test").unwrap(),
+                *b"renewed!"
+            );
+            assert_eq!(state.routes.read().unwrap().len(), 1);
+            assert_eq!(
+                state.routes.read().unwrap()[PATTERN].backend.port,
+                restarted.port()
+            );
+
+            update_config(&state.config, |document| {
+                document["ports"]
+                    .as_table_mut()
+                    .unwrap()
+                    .remove("/wildcard");
+            });
+            reconcile_routes(&state);
+            assert!(state.routes.read().unwrap().is_empty());
+            assert!(
+                route_cache::load(
+                    &state.config,
+                    PATTERN,
+                    route_cache::Storage::CombinedRegistry
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+
+        #[test]
+        fn removing_wildcard_san_revokes_the_pattern_and_allows_exact_recovery() {
+            let directory = tempdir().unwrap();
+            let wildcard = TestCertificate::for_hostname(PATTERN);
+            let exact = TestCertificate::for_hostname(FIRST);
+            let connector = TestCertificate::connector_for(&[&wildcard, &exact]);
+            let workload = TestTlsBackend::start(&wildcard, b"wildcard");
+            let state = development_state(
+                directory.path(),
+                &[("/wildcard", "https", workload.port())],
+                connector.clone(),
+            );
+            reconcile_workloads(&state);
+            workload.replace_certificate(&exact);
+            state
+                .routes
+                .write()
+                .unwrap()
+                .get_mut(PATTERN)
+                .unwrap()
+                .last_tls_check -= TLS_REVALIDATION_INTERVAL;
+            reconcile_routes(&state);
+            assert!(state.routes.read().unwrap().is_empty());
+            assert_eq!(request(&state, &connector, FIRST).unwrap(), *b"wildcard");
+            assert!(state.routes.read().unwrap().contains_key(FIRST));
+            assert!(!state.routes.read().unwrap().contains_key(PATTERN));
+            assert!(request(&state, &connector, SECOND).is_err());
+
+            workload.replace_certificate(&wildcard);
+            state
+                .routes
+                .write()
+                .unwrap()
+                .get_mut(FIRST)
+                .unwrap()
+                .last_tls_check -= TLS_REVALIDATION_INTERVAL;
+            reconcile_routes(&state);
+            assert_eq!(state.routes.read().unwrap().len(), 1);
+            assert!(state.routes.read().unwrap().contains_key(PATTERN));
+            assert!(
+                route_cache::load(&state.config, FIRST, route_cache::Storage::CombinedRegistry)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(request(&state, &connector, SECOND).unwrap(), *b"wildcard");
+        }
+
+        #[test]
+        fn failed_cached_relay_revalidates_the_pattern_before_retry() {
+            let directory = tempdir().unwrap();
+            let certificate = TestCertificate::for_hostname(PATTERN);
+            let workload = TestTlsBackend::start(&certificate, b"wildcard");
+            let state = development_state(
+                directory.path(),
+                &[("/wildcard", "https", workload.port())],
+                certificate.connector(),
+            );
+            reconcile_workloads(&state);
+            let selected = current_active_route(&state, FIRST).unwrap().unwrap();
+            let previous_check = selected.active.last_tls_check;
+            assert_eq!(selected.pattern, PATTERN);
+            let frontend = TcpListener::bind("127.0.0.1:0").unwrap();
+            let _peer = TcpStream::connect(frontend.local_addr().unwrap()).unwrap();
+            let (client, source) = frontend.accept().unwrap();
+            let job = RelayJob {
+                client,
+                admission: state.admission.try_admit(source.ip()).unwrap(),
+                hostname: FIRST.into(),
+                backend: selected.active.backend.clone(),
+                cached_route: Some(selected),
+                idle_timeout: None,
+            };
+            let worker_state = Arc::clone(&state);
+            let workers =
+                proxy::BoundedWorkerPool::start("wildcard-retry-test", 1, 1, move |job| {
+                    handle_route_selection(job, &worker_state);
+                })
+                .unwrap();
+            let ingress = TokioIngress {
+                state: Arc::clone(&state),
+                shutdown: running_shutdown(),
+                route_sender: workers.sender(),
+            };
+            let calls = AtomicUsize::new(0);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let established = proxy::establish_relay(job, &ingress, |backend| {
+                    let first = calls.fetch_add(1, Ordering::Relaxed) == 0;
+                    async move {
+                        if first {
+                            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+                        } else {
+                            proxy::connect_tokio_backend(&backend).await
+                        }
+                    }
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    established.upstream.peer_addr().unwrap().port(),
+                    workload.port()
+                );
+            });
+            drop(ingress);
+            workers.join().unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+            assert_eq!(state.successful_discoveries.load(Ordering::Acquire), 2);
+            assert!(state.routes.read().unwrap()[PATTERN].last_tls_check > previous_check);
+            assert_eq!(state.routes.read().unwrap().len(), 1);
+            assert_eq!(state.admission.snapshot().global.in_use, 0);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn public_wildcard_certificate_authorizes_only_exact_declarations() {
+            let directory = tempdir().unwrap();
+            let certificate = TestCertificate::for_hostname(PATTERN);
+            let workload = TestTlsBackend::start(&certificate, b"wildcard");
+            let registry = write_logical_registry(directory.path(), &[("web", workload.port())]);
+            let state = Arc::new(ProxyState::new_with_profile_connector_and_runtime(
+                registry,
+                public_profile(FIRST, "web"),
+                certificate.connector(),
+                directory.path().join("missing-handoff-runtime"),
+            ));
+            reconcile_workloads(&state);
+            assert_eq!(state.routes.read().unwrap().len(), 1);
+            assert!(state.routes.read().unwrap().contains_key(FIRST));
+            assert!(!state.routes.read().unwrap().contains_key(PATTERN));
+            assert_eq!(
+                request(&state, &certificate.connector(), FIRST).unwrap(),
+                *b"wildcard"
+            );
+            let accepted = workload.accepted();
+            let error = request(&state, &certificate.connector(), SECOND).unwrap_err();
+            assert!(error.contains("no Route Declaration"), "{error}");
+            assert_eq!(workload.accepted(), accepted);
+            assert!(current_active_route(&state, SECOND).unwrap().is_none());
+            let active = state.routes.read().unwrap()[FIRST].clone();
+            for generation in [None, Some(1)] {
+                assert!(
+                    install_active_route(
+                        &state,
+                        PATTERN,
+                        ProbeMatch {
+                            backend: active.backend.clone(),
+                            certificate: active.certificate.clone(),
+                        },
+                        generation,
+                    )
+                    .is_err()
+                );
+            }
+        }
     }
 
     #[test]
@@ -10929,6 +12192,8 @@ mod tests {
             certificate: CertificateProof {
                 fingerprint: "MAIN".to_string(),
                 not_after_unix_seconds: u64::MAX,
+                wildcard: None,
+                dns_san: true,
             },
         };
         let mut https_backend = backend();
@@ -10939,6 +12204,8 @@ mod tests {
             certificate: CertificateProof {
                 fingerprint: "HTTPS".to_string(),
                 not_after_unix_seconds: u64::MAX,
+                wildcard: None,
+                dns_san: true,
             },
         };
         let mut other_backend = backend();
@@ -10949,6 +12216,8 @@ mod tests {
             certificate: CertificateProof {
                 fingerprint: "OTHER".to_string(),
                 not_after_unix_seconds: u64::MAX,
+                wildcard: None,
+                dns_san: true,
             },
         };
 

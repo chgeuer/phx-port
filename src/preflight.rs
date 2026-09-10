@@ -1,6 +1,6 @@
 use crate::{
     activated_listener,
-    ingress_config::{HostingProfile, PublicIngressSnapshot},
+    ingress_config::{HostingProfile, PublicIngressSnapshot, RoutingPolicy},
     ingress_limits::DaemonConfig,
     port_registry,
     production_paths::ProductionPaths,
@@ -197,12 +197,15 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
                         ingress_configuration_valid = true;
                         report.pass(
                             "ingress configuration",
-                            format!(
+                            if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+                                format!("{} uses public certificate_discovery without per-host declarations, matching {} listener(s)",
+                                    snapshot.ingress_config.display(), listen_addresses.len())
+                            } else { format!(
                                 "{} contains {} exact Route Declaration(s) matching {} listener(s)",
                                 snapshot.ingress_config.display(),
                                 snapshot.routes.len(),
                                 listen_addresses.len()
-                            ),
+                            ) },
                         );
                     }
                     Err(error) => report.fail("ingress configuration", error),
@@ -235,7 +238,10 @@ pub fn run(config: DaemonConfig) -> Result<(), String> {
                 if let Some(snapshot) = &snapshot {
                     paths.validate_intent_separation(&snapshot.ingress_config)?;
                 }
-                paths.validate_until(Some(registry_deadline()))
+                paths.validate_for_policy_until(
+                    snapshot.as_ref().map_or(RoutingPolicy::Declared, |snapshot| snapshot.routing_policy),
+                    Some(registry_deadline()),
+                )
             })();
             match result {
                 Ok(()) => {
@@ -437,6 +443,18 @@ fn check_registrations(
         return Vec::new();
     };
 
+    if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+        let count = assignments.keys().filter(|(_, role)| role == "https").count();
+        if count > crate::route_claims::MAX_DISCOVERY_WORKLOADS {
+            report.fail("registrations", "certificate_discovery Workload capacity exceeded; partial candidate sets are forbidden");
+        } else if count == 0 {
+            report.warn("registrations", "no logical HTTPS Workloads registered; discovery readiness will remain false");
+        } else {
+            report.pass("registrations", format!("{count} logical HTTPS Workload(s) eligible for certificate discovery"));
+        }
+        return Vec::new();
+    }
+
     let mut targets = Vec::new();
     let mut required_missing = Vec::new();
     let mut optional_missing = Vec::new();
@@ -516,6 +534,14 @@ fn check_route_certificates(
         );
         return;
     };
+
+    if snapshot.routing_policy == RoutingPolicy::CertificateDiscovery {
+        report.warn(
+            "route certificates",
+            "certificate_discovery has no static targets: the running daemon must verify SANs and durable ownership before readiness; check proxy check --ready",
+        );
+        return;
+    }
 
     let mut required_failures = Vec::new();
     let mut optional_failures = Vec::new();

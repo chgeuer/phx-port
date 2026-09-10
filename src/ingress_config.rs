@@ -17,6 +17,29 @@ pub(crate) const DEFAULT_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30 *
 const MAX_INGRESS_LISTENERS: usize = 2;
 const MAX_SOURCE_DIAGNOSTIC_DURATION_SECONDS: u64 = 60 * 60;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RoutingPolicy {
+    #[default]
+    Declared,
+    CertificateDiscovery,
+}
+
+impl RoutingPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::CertificateDiscovery => "certificate_discovery",
+        }
+    }
+
+    pub fn route_storage(self) -> crate::route_cache::Storage {
+        match self {
+            Self::Declared => crate::route_cache::Storage::SeparateState,
+            Self::CertificateDiscovery => crate::route_cache::Storage::SeparateDiscoveryState,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MetricsConfig {
     pub listen: SocketAddr,
@@ -48,6 +71,7 @@ pub struct PublicIngressSnapshot {
     pub ingress_config: PathBuf,
     pub intent_owner: IntentOwner,
     pub generation: u64,
+    pub routing_policy: RoutingPolicy,
     pub listeners: Option<Vec<SocketAddr>>,
     pub metrics: Option<MetricsConfig>,
     pub source_diagnostics: Option<SourceDiagnosticsConfig>,
@@ -80,6 +104,12 @@ impl HostingProfile {
 
     pub fn load_for_check(path: PathBuf) -> Result<Self, String> {
         Self::load_with_env(Some(path), None, IntentOwner::Root)
+    }
+
+    pub fn load_for_inspection(path: PathBuf) -> Result<Self, String> {
+        Self::load_public(path.clone(), 1, IntentOwner::Root).or_else(|root_error| {
+            Self::load_public(path, 1, IntentOwner::EffectiveUser).map_err(|_| root_error)
+        })
     }
 
     fn load_with_owner(explicit_path: Option<PathBuf>, owner: IntentOwner) -> Result<Self, String> {
@@ -131,7 +161,7 @@ impl HostingProfile {
         for (key, _) in ingress {
             if !matches!(
                 key,
-                "mode" | "unknown_sni" | "listen" | "metrics" | "source_diagnostics" | "hosts"
+                "mode" | "routing_policy" | "unknown_sni" | "listen" | "metrics" | "source_diagnostics" | "hosts"
             ) {
                 return Err(format!(
                     "ingress config {} contains unknown [ingress] key {key:?}",
@@ -147,6 +177,16 @@ impl HostingProfile {
                 path.display()
             ));
         }
+        let routing_policy = match ingress.get("routing_policy") {
+            None => RoutingPolicy::Declared,
+            Some(item) if item.as_str() == Some("declared") => RoutingPolicy::Declared,
+            Some(item) if item.as_str() == Some("certificate_discovery") => {
+                RoutingPolicy::CertificateDiscovery
+            }
+            Some(_) => return Err(
+                "routing_policy must be \"declared\" or \"certificate_discovery\"".to_string(),
+            ),
+        };
         let listeners = match ingress.get("listen") {
             None => None,
             Some(item) => {
@@ -211,16 +251,28 @@ impl HostingProfile {
             source_diagnostics_reference_time,
         )?;
 
-        let hosts = ingress
-            .get("hosts")
-            .and_then(|item| item.as_table())
-            .ok_or_else(|| {
-                format!(
-                    "ingress config {} must contain [ingress.hosts] Route Declarations",
-                    path.display()
-                )
-            })?;
-        if hosts.is_empty() {
+        let empty_hosts = Table::new();
+        let hosts = match routing_policy {
+            RoutingPolicy::Declared => ingress
+                .get("hosts")
+                .and_then(|item| item.as_table())
+                .ok_or_else(|| {
+                    format!(
+                        "ingress config {} must contain [ingress.hosts] Route Declarations",
+                        path.display()
+                    )
+                })?,
+            RoutingPolicy::CertificateDiscovery => {
+                if ingress.contains_key("hosts") {
+                    return Err(
+                        "certificate_discovery must not contain [ingress.hosts] Route Declarations"
+                            .to_string(),
+                    );
+                }
+                &empty_hosts
+            }
+        };
+        if routing_policy == RoutingPolicy::Declared && hosts.is_empty() {
             return Err(format!(
                 "ingress config {} must contain at least one Route Declaration",
                 path.display()
@@ -360,6 +412,7 @@ impl HostingProfile {
             ingress_config: path,
             intent_owner: owner,
             generation,
+            routing_policy,
             listeners,
             metrics,
             source_diagnostics,
@@ -394,6 +447,7 @@ impl HostingProfile {
             );
         }
         if candidate_snapshot.routes == current.routes
+            && candidate_snapshot.routing_policy == current.routing_policy
             && candidate_snapshot.source_diagnostics == current.source_diagnostics
         {
             return Ok(None);
@@ -594,6 +648,13 @@ impl HostingProfile {
         }
     }
 
+    pub fn routing_policy_name(&self) -> &'static str {
+        match self {
+            Self::Development => "development_discovery",
+            Self::Public(snapshot) => snapshot.routing_policy.label(),
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Self::Development => "development",
@@ -618,11 +679,10 @@ mod tests {
     use tempfile::{TempDir, tempdir_in};
 
     fn tempdir() -> std::io::Result<TempDir> {
-        #[cfg(unix)]
-        let root = Path::new("/tmp").canonicalize()?;
-        #[cfg(not(unix))]
-        let root = std::env::temp_dir().canonicalize()?;
-        tempdir_in(root)
+        let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        tempdir_in(root.canonicalize()?)
     }
 
     fn write_public_config(path: &Path, hostname: &str, workload: &str) {
@@ -675,6 +735,7 @@ mod tests {
                 ingress_config: public.clone(),
                 intent_owner: IntentOwner::EffectiveUser,
                 generation: 1,
+                routing_policy: Default::default(),
                 listeners: None,
                 metrics: None,
                 source_diagnostics: None,

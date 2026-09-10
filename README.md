@@ -170,8 +170,9 @@ phx-port daemon --listen 0.0.0.0:443 --listen '[::]:443'
 ```
 
 Development is the default Hosting Profile and retains dynamic certificate
-discovery. Public mode is selected only by `--ingress-config PATH` or
-`PHX_PORT_INGRESS_CONFIG`. Public configuration accepts from one through 1,000
+discovery, including verified one-label wildcard DNS SAN routes. Public mode
+is selected only by `--ingress-config PATH` or `PHX_PORT_INGRESS_CONFIG`.
+Public configuration accepts from one through 1,000
 exact Route Declarations:
 
 ```toml
@@ -437,15 +438,20 @@ the result, duration, forced-task count, and remaining admission count.
 Production load qualification remains a separate milestone; bounded async
 drain is not a public-load support claim.
 
-For an unknown SNI hostname, `phx-port` probes active `https` and `main`
-workloads over loopback using that exact hostname. It routes only when exactly
-one backend completes a system-trusted, hostname-valid TLS handshake. The
+For an unknown development SNI hostname, `phx-port` probes active `https` and
+`main` workloads over loopback using that concrete hostname. Exact certificate
+names take precedence over matching wildcard SANs; discovery requires one
+unambiguous owner at the selected specificity and a system-trusted,
+hostname-valid TLS handshake. A verified wildcard SAN becomes one pattern
+route, not a separate cache entry for every requested subdomain. The
 original ClientHello is then relayed unchanged, so the backend remains the TLS
 endpoint and retains its own certificate and private key.
 
 Successful development discoveries remain cached in the per-user registry.
 Public verified-route state is stored only in the separate disposable
-`routes.toml`. Both can be inspected alongside live daemon health:
+`routes.toml`. **Public mode remains exact Route Declaration-only: a wildcard
+certificate can prove a declared hostname, but never authorizes undeclared
+names or a wildcard route.** Both can be inspected alongside live daemon health:
 
 ```bash
 phx-port proxy status
@@ -651,10 +657,22 @@ touching port 443.
 
 The daemon revalidates a persisted mapping before activating it in a new
 process. Newly active `https` workloads that present a no-SNI default
-certificate are also discovered eagerly from their exact DNS SANs; strictly
-SNI-only workloads and HTTPS servers using the compatibility `main` role
-continue to use lazy discovery. This avoids sending speculative TLS handshakes
-to ordinary clear-HTTP `main` listeners.
+certificate are also discovered eagerly from their exact and wildcard DNS
+SANs; strictly SNI-only workloads and HTTPS servers using the compatibility
+`main` role continue to use lazy discovery. This avoids sending speculative
+TLS handshakes to ordinary clear-HTTP `main` listeners.
+
+In development, `*.dev.example.com` covers `foo.dev.example.com`,
+`bar.dev.example.com`, and any other single nonempty label, but not the apex
+`dev.example.com`, deeper names, or suffix lookalikes. Client SNI must still be
+a concrete hostname. The no-SNI certificate supplies candidates only: wildcard
+activation requires a trusted, hostname-valid probe of `a.dev.example.com`
+whose returned certificate actually contains `*.dev.example.com` as a DNS SAN.
+An exact-only certificate for the probe name cannot claim the wildcard.
+Verified exact routes win over wildcard routes. Duplicate owners without an
+incumbent fail closed; a still-valid incumbent is retained with conflict
+diagnostics. `proxy routes` shows the pattern, and `discover` displays it as a
+non-clickable label rather than an invalid `https://*...` link.
 
 On Linux and macOS, the daemon also checks the route's derived PHXP endpoint
 for a version-compatible, same-user socket-handoff receiver. When present, it

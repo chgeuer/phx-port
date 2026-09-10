@@ -6,6 +6,11 @@ Implemented. The daemon, eager and lazy certificate discovery, persistent
 derived routes, conflict handling, health reconciliation, control socket,
 systemd user-service management, and generic TLS relay are operational.
 
+Dynamic discovery, including wildcard DNS SAN routes, belongs to the
+development Hosting Profile. The public Hosting Profile remains exact
+operator Route Declaration-only with unknown-SNI rejection; a wildcard
+certificate can verify an exact declaration but cannot extend its authority.
+
 On Linux, a compatible workload can additionally receive the original client
 descriptor through the optional socket-handoff path described in
 [`socket-forwarding-design.md`](socket-forwarding-design.md). The generic relay
@@ -46,13 +51,14 @@ The design is not specific to Elixir, Phoenix, Bandit, or HTTP.
 3. Backends use HTTPS and retain ownership of their certificates and private
    keys.
 4. The daemon discovers when registered HTTPS workloads start and stop.
-5. The daemon eagerly discovers hostnames from each new `https` workload's
-   default certificate when that workload supports a TLS handshake without
-   SNI.
+5. The daemon eagerly discovers exact names and wildcard route patterns from
+   each new `https` workload's default certificate when that workload supports
+   a TLS handshake without SNI.
 6. When a client requests an unknown SNI hostname, the daemon probes a bounded
    set of active HTTPS workloads using that hostname as SNI.
-7. A hostname is routed only when exactly one backend presents a valid,
-   matching certificate.
+7. A route activates only when one unambiguous backend presents a valid,
+   matching certificate at the preferred specificity; a valid incumbent is
+   preserved when a later contender appears.
 8. Successful lazy discoveries are cached persistently.
 9. Cached routes are revalidated before activation after daemon or workload
    restart.
@@ -497,22 +503,33 @@ This is opportunistic: strictly SNI-only servers may reject that handshake, in
 which case the workload remains discoverable through the lazy path. Workloads
 serving HTTPS through the compatibility `main` role also use lazy discovery.
 
-Every exact DNS Subject Alternative Name (SAN) in the certificate becomes a
-candidate. The daemon then performs an SNI-specific TLS probe for each
-candidate. A route is activated only if:
+Every canonical exact DNS Subject Alternative Name (SAN) and whole-leftmost
+wildcard SAN in the certificate becomes a candidate. The no-SNI handshake is
+only a source of untrusted hints, never route authority. The daemon then
+performs a separate trusted, SNI-specific TLS proof for each candidate. A
+wildcard such as `*.dev.example.com` is probed using `a.dev.example.com`, not
+literal wildcard SNI. A route is activated only if:
 
 1. The TLS handshake demonstrates possession of the corresponding private key.
 2. The certificate chain is trusted according to the daemon's trust policy.
 3. The certificate is currently valid.
 4. The certificate covers the candidate hostname according to standard TLS
    hostname-verification rules.
-5. No other active backend owns the same hostname.
+5. For a wildcard candidate, the certificate returned by this verified
+   handshake contains that exact canonical wildcard DNS SAN. Passing hostname
+   verification with an exact-only leaf for `a.dev.example.com` is insufficient.
+6. No other valid backend claims the same route pattern without an incumbent
+   (see [Conflicts](#conflicts)).
 
 The Common Name is not used when the certificate contains DNS SANs.
 
-A wildcard SAN cannot enumerate all hostnames that an application intends to
-serve. It may validate a concrete hostname during lazy discovery, but it does
-not eagerly create an unbounded set of routes.
+A wildcard SAN activates one pattern, not an enumeration of hostnames.
+`*.dev.example.com` matches exactly one nonempty DNS label: it covers
+`foo.dev.example.com` and `bar.dev.example.com`, but neither the suffix apex
+nor nested labels, suffix lookalikes, malformed wildcard patterns, or literal
+wildcard SNI. Incoming ClientHello normalization remains concrete-name-only.
+Verified exact routes take precedence over wildcard routes. This is a
+development routing policy, not public wildcard Route Declaration support.
 
 ## Lazy discovery for unknown SNI
 
@@ -529,7 +546,9 @@ For an incoming ClientHello with an unknown hostname:
 4. Concurrently probe up to 32 active HTTPS workloads, using the requested
    hostname as SNI.
 5. Validate each returned certificate and handshake against that hostname.
-6. If exactly one backend matches, atomically add the route.
+6. Prefer exact certificate names over wildcard SAN matches, then apply the
+   existing same-project `https` preference. If exactly one backend remains,
+   atomically add its exact route or the matching wildcard SAN pattern.
 7. Deliver the untouched connection by socket handoff when available;
    otherwise connect to the backend and forward the original ClientHello
    unchanged.
@@ -559,6 +578,12 @@ The original client socket waits for at most 250 milliseconds while discovery
 runs. At most 64 client connections may wait for discovery, and at most 32
 backend TLS probes may run concurrently. Simultaneous discoveries for the same
 normalized hostname share one single-flight operation.
+
+A concrete probe that verifies using a wildcard DNS SAN retains the wildcard
+pattern. The returned, verified certificate must contain that SAN; an
+unverified default certificate or a cached fingerprint is insufficient. Warm
+requests select the exact route first, otherwise the one possible single-label
+wildcard key, without a new probe or per-hostname route insertion.
 
 Port Registry/cache access, loopback candidate scanning, probe admission, and
 TLS verification consume that same absolute discovery deadline. A slow
@@ -590,6 +615,8 @@ Hosting Profile, the same bounded derived schema lives instead in private
 `/var/lib/phx-port/routes.toml` (or sibling `routes.toml` beside an explicit
 `PHX_PORT_CONFIG`). Stable `ports.toml` contains assignments only. Discovered
 or verified routes remain derived, disposable state in both layouts.
+Development keys may be canonical wildcard patterns; public derived state
+continues to reject wildcard keys.
 
 Conceptual cache entry:
 
@@ -611,7 +638,11 @@ restart, a cached route remains inactive until an SNI-specific probe verifies
 it again. If revalidation fails, the cache entry may remain available for
 diagnostics but cannot receive connections. The cache retains at most 1,024
 entries and evicts the oldest verification timestamp before storing a new
-hostname.
+route pattern. A wildcard consumes one entry regardless of how many different
+matching subdomains clients request. Cache lookup prefers an exact hint before
+its matching wildcard hint, and still requires fresh certificate verification.
+`proxy routes` displays the pattern identity; the development `discover` page
+renders wildcards as descriptive labels, never as invalid HTTPS links.
 
 Every daemon and CLI read-modify-write operation takes an advisory lock on a
 sibling lock file. Public assignment and route state use distinct private
@@ -680,16 +711,28 @@ snapshot of the selected route:
 - Existing connections continue until either endpoint closes.
 - Workload restart does not forcibly terminate unrelated connections.
 
-TLS revalidation first probes only the incumbent using the known hostname as
-SNI, allowing the daemon to detect certificate expiration, hostname removal,
-or certificate rotation without generating TLS traffic against unrelated
-clear-HTTP workloads. A failed incumbent triggers full candidate fan-out for
-failover. Newly added explicit `https` workloads are checked for conflicts
-through eager discovery. Rotated certificates are served immediately by the
-backend because phx-port does not terminate TLS.
+TLS revalidation first probes the incumbent using the exact hostname or a
+concrete wildcard representative as SNI, requiring the wildcard SAN again for
+pattern routes. This detects certificate expiration, SAN removal, or rotation
+without generating TLS traffic against unrelated clear-HTTP workloads. Known
+wildcard contenders are rechecked to maintain conflict diagnostics. A failed
+incumbent triggers full candidate fan-out for failover. Newly added explicit
+`https` workloads are checked for conflicts through eager discovery. Foreground
+candidate scans do not consume a Workload's pending eager discovery pass.
+Rotated certificates are served immediately by the backend because phx-port
+does not terminate TLS.
 
-For every verified declared route, the probe retains only the leaf SHA-256
-fingerprint and `notAfter` Unix time. Public status caps certificate detail at
+Expiry, failed backend-connect invalidation/retry, liveness failures, and
+registration removal use the selected pattern's identity rather than the
+client's concrete hostname. Every matching name therefore loses or regains
+the same route together. Removing a wildcard SAN revokes its pattern; an
+exact-only replacement certificate can subsequently prove only exact routes.
+Persisted inactive patterns remain hints, with the existing bounded retry and
+negative-cache policy.
+
+For every verified route, the probe retains the leaf SHA-256 fingerprint,
+`notAfter` Unix time, and matching wildcard pattern when present, never the
+certificate body or private key. Public status caps certificate detail at
 64 rows, while the loopback Prometheus endpoint emits one certificate-expiry
 sample per active declaration, so both remain bounded by the 1,000-declaration
 limit. Fixed 30-, 14-, 7-, and 1-day states produce one structured warning
@@ -705,8 +748,9 @@ certificate material.
 
 ## Conflicts
 
-If multiple active workloads present valid certificates for the same requested
-hostname, discovery is ambiguous. The daemon must:
+After exact-over-wildcard specificity and same-project role preference, if
+multiple active workloads claim the same route pattern, discovery is
+ambiguous. The daemon must:
 
 - Preserve an already active, still-valid incumbent.
 - Quarantine a newly discovered contender for that hostname.
@@ -719,6 +763,11 @@ hostname, discovery is ambiguous. The daemon must:
 Response order, port number, project path ordering, or most-recent startup must
 never be used as an implicit tie-breaker.
 
+A wildcard does not compete with a more-specific verified exact route.
+Unresolved exact-route conflicts must not silently fall through to a wildcard.
+Concurrent discoveries cannot replace a still-valid wildcard incumbent merely
+because a different concrete hostname triggered the later proof.
+
 ## Trust policy
 
 Probe validation uses the operating system's trusted root
@@ -726,9 +775,12 @@ store and standard DNS hostname verification. This proves that a local
 workload holds a certificate trusted for the requested public name.
 
 Support for private development certificate authorities may be added through
-an explicit daemon trust-store option. Disabling certificate verification is
-not an acceptable discovery mode because any local process could then claim
-any hostname.
+an explicit daemon trust-store option. Disabling certificate verification for
+an ownership proof is not acceptable because any local process could then
+claim any hostname. Opportunistic no-SNI
+SAN inspection supplies only candidates; the separate activation proof always
+validates the chain and concrete hostname and, for wildcard authority, the
+verified leaf's wildcard SAN.
 
 The probe must validate the complete chain presented by the backend while
 tolerating conventional extra certificates after the usable chain.
@@ -771,9 +823,10 @@ requires strict bounds. The implementation currently:
 Once a route exists, forwarding does not require additional TLS parsing beyond
 the initial ClientHello.
 
-A wildcard certificate may validate a concrete hostname during lazy
-discovery, but the daemon caches only that observed hostname. It never creates
-an implicit wildcard route from the certificate.
+A verified development wildcard SAN creates one bounded pattern route whether
+learned eagerly or lazily. Matching requests never create an unbounded set of
+exact routes. Neither this matching policy nor the cached pattern is used to
+extend public Route Declaration authority.
 
 Positive persisted routes retain the fixed 1,024-entry bound.
 
@@ -863,7 +916,10 @@ Automated tests currently cover:
 - SNI extraction and hostname normalization.
 - Oversized and malformed ClientHello rejection.
 - Non-consuming ClientHello inspection.
-- Exact-SAN extraction without eager wildcard expansion.
+- Canonical exact/wildcard SAN extraction and eager single-pattern activation.
+- Trusted, unchanged TLS routing for arbitrary matching labels, exact-route
+  precedence, apex/deep/suffix rejection, untrusted and exact-only proof
+  rejection, and preservation of public exact declaration authority.
 - Suppression of eager TLS probes against compatibility `main` roles.
 - Single-flight behavior under concurrent first requests.
 - Waiting-client and concurrent-probe limits.
@@ -881,6 +937,8 @@ Automated tests currently cover:
 - Deterministic conflict recording and `https` role preference.
 - Persistent route creation and removal with registry changes.
 - Deactivation after three failed TCP checks while retaining the cached hint.
+- Wildcard cache reload, whole-pattern expiry and relay-failure invalidation,
+  certificate rotation/SAN removal, and Workload restart/removal.
 - Independent IPv4 and IPv6 listener binding.
 - Control status and stop behavior.
 
@@ -923,9 +981,10 @@ protocols, and certificate hostname removal.
   hosting preflight runbook records the measured matrix.
 - The first request for a non-default hostname waits for discovery and may time
   out under a large or unhealthy workload set.
-- A valid wildcard certificate can prove authority for a requested matching
-  name, but it cannot reveal which concrete names the application intends to
-  serve.
+- A verified development wildcard route forwards every matching one-label
+  name, but cannot reveal which concrete names the application intends to
+  serve. Application-level hostname policy and DNS remain Workload/operator
+  responsibilities. Public ingress still forwards only exact declarations.
 - DNS and certificate renewal remain external responsibilities.
 
 ## Decision summary

@@ -34,6 +34,15 @@ fn joins_confirmed_hostnames_to_the_matching_live_registration() {
     route_cache::store(
         &config,
         route_cache::Storage::CombinedRegistry,
+        "*.contoso.com",
+        "/srv/contoso",
+        "https",
+        "AA:BB",
+    )
+    .unwrap();
+    route_cache::store(
+        &config,
+        route_cache::Storage::CombinedRegistry,
         "www.fabrikam.com",
         "/srv/fabrikam",
         "https",
@@ -50,7 +59,7 @@ fn joins_confirmed_hostnames_to_the_matching_live_registration() {
 
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].dir, "/srv/contoso");
-    assert_eq!(projects[0].hostnames, ["www.contoso.com"]);
+    assert_eq!(projects[0].hostnames, ["*.contoso.com", "www.contoso.com"]);
 }
 
 #[test]
@@ -67,6 +76,20 @@ fn renders_local_and_confirmed_tls_links_with_escaped_labels() {
     assert!(html.contains("href=\"https://www.contoso.com/\""));
     assert!(html.contains("/srv/contoso&lt;&amp;"));
     assert!(!html.contains("/srv/contoso<&"));
+}
+
+#[test]
+fn renders_wildcard_patterns_as_labels_not_invalid_https_links() {
+    let html = build_discover_html(&[RunningProject {
+        dir: "/srv/wildcard".to_string(),
+        role: "https".to_string(),
+        port: 4401,
+        hostnames: vec!["*.example.test".to_string(), "foo.example.test".to_string()],
+    }]);
+
+    assert!(html.contains("*.example.test (one subdomain label)</span>"));
+    assert!(!html.contains("https://*.example.test"));
+    assert!(html.contains("href=\"https://foo.example.test/\""));
 }
 
 #[test]

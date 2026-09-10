@@ -107,6 +107,35 @@ The Workload owns its certificate and private key. The daemon peeks at SNI,
 verifies the Workload certificate, and either hands off the original socket to
 a compatible PHXP receiver or relays encrypted bytes. It never terminates TLS.
 
+### Wildcard certificates
+
+A new `https` listener's no-SNI default certificate can announce an entire
+development wildcard route, such as `*.dev.example.com`, before any browser
+request. The daemon first treats SANs as candidates, then verifies a trusted
+TLS handshake for `a.dev.example.com` and checks that the returned certificate
+contains that same wildcard DNS SAN. An untrusted certificate or an exact-only
+certificate for the probe hostname cannot authorize the pattern.
+
+One verified pattern serves every single nonempty label beneath its suffix:
+`foo.dev.example.com` and `bar.dev.example.com` use the same Workload. It does
+not match `dev.example.com`, `deep.foo.dev.example.com`, or suffix lookalikes.
+The Workload must present a valid certificate for those concrete SNI names;
+the daemon does not alter SNI, enumerate subdomains, configure DNS, or renew
+certificates. Strictly SNI-only listeners and compatibility `main` HTTPS roles
+learn the same kind of pattern lazily from a verified concrete request.
+
+Verified exact routes take precedence. Duplicate wildcard owners fail closed
+without an incumbent; an existing valid incumbent remains selected and the
+contender is reported as a conflict. Cached patterns are only hints and need a
+fresh trusted proof after daemon restart. Certificate revalidation, expiry,
+TCP failure, and registration removal apply to the whole pattern.
+`proxy routes` shows `*.dev.example.com`; `discover` shows a pattern label,
+not a clickable wildcard URL.
+
+**This is development-only. Public mode still requires exact operator Route
+Declarations and rejects unknown SNI, even when a Workload has a wildcard
+certificate.**
+
 For an unprivileged high-port exercise:
 
 ```bash

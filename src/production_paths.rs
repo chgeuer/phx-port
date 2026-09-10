@@ -1,4 +1,4 @@
-use crate::{port_registry, route_cache};
+use crate::{ingress_config::RoutingPolicy, port_registry, route_cache, route_claims};
 use std::env;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
@@ -64,9 +64,16 @@ impl ProductionPaths {
         self.runtime_root.join("control").join("control.sock")
     }
 
+    pub fn ownership_claims(&self) -> PathBuf {
+        self.route_cache.with_file_name("route-claims.toml")
+    }
+
     pub fn validate_intent_separation(&self, ingress_config: &Path) -> Result<(), String> {
         let ingress_config = absolute_path(ingress_config, "ingress config")?;
-        if ingress_config == self.port_registry || ingress_config == self.route_cache {
+        if ingress_config == self.port_registry
+            || ingress_config == self.route_cache
+            || ingress_config == self.ownership_claims()
+        {
             return Err(
                 "root-owned ingress intent, stable assignments, and derived route state must use distinct files"
                     .to_string(),
@@ -83,11 +90,27 @@ impl ProductionPaths {
         &self,
         deadline: Option<port_registry::AccessDeadline<'_>>,
     ) -> Result<(), String> {
-        self.validate_paths(false, deadline)
+        self.validate_paths(false, RoutingPolicy::Declared, deadline)
     }
 
     pub fn prepare_for_startup(&self) -> Result<(), String> {
-        self.validate_paths(true, None)
+        self.validate_paths(true, RoutingPolicy::Declared, None)
+    }
+
+    pub fn validate_for_policy_until(
+        &self,
+        policy: RoutingPolicy,
+        deadline: Option<port_registry::AccessDeadline<'_>>,
+    ) -> Result<(), String> {
+        self.validate_paths(false, policy, deadline)
+    }
+
+    pub fn prepare_for_policy(&self, policy: RoutingPolicy) -> Result<(), String> {
+        if policy == RoutingPolicy::Declared {
+            self.prepare_for_startup()
+        } else {
+            self.validate_paths(true, policy, None)
+        }
     }
 
     pub fn validate_sandbox_access(&self) -> Result<(), String> {
@@ -104,6 +127,7 @@ impl ProductionPaths {
     fn validate_paths(
         &self,
         repair_derived_state: bool,
+        policy: RoutingPolicy,
         deadline: Option<port_registry::AccessDeadline<'_>>,
     ) -> Result<(), String> {
         let state_directory = self
@@ -113,13 +137,29 @@ impl ProductionPaths {
         if state_directory == self.runtime_root {
             return Err("production state directory and runtime root must be distinct".to_string());
         }
-        port_registry::read_logical_assignments_until(&self.port_registry, deadline)?;
+        let assignments = port_registry::read_logical_assignments_until(&self.port_registry, deadline)?;
+        if policy == RoutingPolicy::CertificateDiscovery {
+            if assignments.keys().filter(|(_, role)| role == "https").count()
+                > route_claims::MAX_DISCOVERY_WORKLOADS
+            {
+                return Err(format!("certificate_discovery supports at most {} registered HTTPS Workloads",
+                    route_claims::MAX_DISCOVERY_WORKLOADS));
+            }
+            if self.ownership_claims() == self.port_registry {
+                return Err("ownership claims and the Port Registry must use distinct files".into());
+            }
+            route_claims::load_until(&self.ownership_claims(), deadline)?;
+        }
         if repair_derived_state {
-            route_cache::prepare(&self.route_cache)?;
+            if policy == RoutingPolicy::Declared {
+                route_cache::prepare(&self.route_cache)?;
+            } else {
+                route_cache::prepare_for_storage(&self.route_cache, policy.route_storage())?;
+            }
         } else {
             route_cache::validate_until(
                 &self.route_cache,
-                route_cache::Storage::SeparateState,
+                policy.route_storage(),
                 deadline,
             )?;
         }

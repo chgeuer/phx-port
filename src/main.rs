@@ -27,6 +27,8 @@ mod production_paths;
 mod proxy;
 mod relay;
 mod route_cache;
+mod route_claims;
+mod route_pattern;
 mod systemd_service;
 mod tls_client_hello;
 #[cfg(unix)]
@@ -703,7 +705,7 @@ fn get_running_projects(config: &Path) -> Vec<RunningProject> {
             {
                 continue;
             }
-            if let Ok(hostname) = tls_client_hello::normalize_hostname(hostname) {
+            if let Ok(hostname) = route_pattern::normalize(hostname) {
                 hostnames_by_backend
                     .entry((project.to_string(), role.to_string()))
                     .or_default()
@@ -811,10 +813,16 @@ fn build_discover_html(projects: &[RunningProject]) -> String {
                 ));
                 for hostname in &endpoint.hostnames {
                     let hostname = escape_html(hostname);
-                    items.push_str(&format!(
-                        "<a class=\"endpoint tls\" href=\"https://{hostname}/\">\
-                         https://{hostname}/</a>"
-                    ));
+                    if hostname.starts_with("*.") {
+                        items.push_str(&format!(
+                            "<span class=\"endpoint tls\">{hostname} (one subdomain label)</span>"
+                        ));
+                    } else {
+                        items.push_str(&format!(
+                            "<a class=\"endpoint tls\" href=\"https://{hostname}/\">\
+                             https://{hostname}/</a>"
+                        ));
+                    }
                 }
                 items.push_str("</div></div>");
             }
@@ -1086,10 +1094,17 @@ fn main() {
                         Some(value) if value.is_empty() => exit_registry_error(
                             "PHX_PORT_INGRESS_CONFIG must not be empty".to_string(),
                         ),
-                        Some(_) => {
+                        Some(path) => {
                             let paths = production_paths::ProductionPaths::from_environment()
                                 .unwrap_or_else(exit_registry_error);
-                            (paths.route_cache, route_cache::Storage::SeparateState)
+                            let profile = ingress_config::HostingProfile::load_for_inspection(PathBuf::from(path))
+                                .unwrap_or_else(exit_registry_error);
+                            let snapshot = profile.public_snapshot().expect("explicit public config");
+                            if snapshot.routing_policy == ingress_config::RoutingPolicy::CertificateDiscovery {
+                                route_claims::print(&paths.ownership_claims()).unwrap_or_else(exit_registry_error);
+                                return;
+                            }
+                            (paths.route_cache, snapshot.routing_policy.route_storage())
                         }
                         None => (config.clone(), route_cache::Storage::CombinedRegistry),
                     };
@@ -1140,7 +1155,13 @@ fn main() {
                             .ingress_config,
                     )
                     .unwrap_or_else(exit_registry_error);
-                paths.validate().unwrap_or_else(exit_registry_error);
+                let snapshot = profile.public_snapshot().expect("checked config is public");
+                if snapshot.routing_policy == ingress_config::RoutingPolicy::Declared {
+                    paths.validate().unwrap_or_else(exit_registry_error);
+                } else {
+                    paths.validate_for_policy_until(snapshot.routing_policy, None)
+                        .unwrap_or_else(exit_registry_error);
+                }
                 #[cfg(unix)]
                 paths
                     .validate_control_group()
@@ -1152,6 +1173,10 @@ fn main() {
                     paths.route_cache.display(),
                     paths.runtime_root.display()
                 );
+                println!("Routing policy: {}", snapshot.routing_policy.label());
+                if snapshot.routing_policy == ingress_config::RoutingPolicy::CertificateDiscovery {
+                    println!("Durable ownership claims: {}", paths.ownership_claims().display());
+                }
             }
             Some("config")
                 if args.get(2).map(String::as_str) == Some("migrate")
