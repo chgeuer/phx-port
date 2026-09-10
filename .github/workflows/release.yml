@@ -58,7 +58,9 @@ jobs:
           mkdir systemd
           cp ../../../packaging/systemd/phx-port.service \
              ../../../packaging/systemd/phx-port-ipv4.socket \
-             ../../../packaging/systemd/phx-port-ipv6.socket systemd/
+             ../../../packaging/systemd/phx-port-ipv6.socket \
+             ../../../packaging/systemd/phx-port.sysusers.conf \
+             ../../../packaging/systemd/phx-port.tmpfiles.conf systemd/
           tar czf ../../../phx-port-${{ matrix.target }}.tar.gz \
             ${{ matrix.artifact }} systemd
 

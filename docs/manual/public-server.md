@@ -15,10 +15,12 @@ Do not expose the host until the final readiness check succeeds.
 | `/etc/phx-port/ingress.toml` | `root:phx-port 0640` | Route and listener policy |
 | `/var/lib/phx-port/ports.toml` | `phx-port:phx-port 0600` | Stable Workload ports |
 | `/var/lib/phx-port/routes.toml` | `phx-port:phx-port 0600` | Disposable verified routes |
+| `/var/lib/phx-port/route-claims.toml` | `phx-port:phx-port 0600` | Durable certificate-discovery ownership |
 | `/run/phx-port/handoff/` | `phx-port:phx-port 0700` | Workload PHXP sockets |
 | `/run/phx-port/control/` | `phx-port:phx-port-admin 0750` | Local control socket |
 
-Back up only `ingress.toml` and `ports.toml`.
+Back up `ingress.toml` and `ports.toml`, plus `route-claims.toml` when using
+`certificate_discovery`. Do not recreate lost claims from reachable Workloads.
 
 ### macOS
 
@@ -41,6 +43,30 @@ Only root may mutate public ingress through the control socket. The service UID
 and members of `phx-port-admin` may inspect it.
 
 ## Linux installation
+
+From a source checkout on Linux with `systemd-sysusers`, `systemd-tmpfiles`,
+and `sudo`, provision the accounts and directories for steps 1 and 2 with:
+
+```bash
+just setup-public
+```
+
+This creates the missing non-login `phx-port` service account and its group,
+the `phx-port-admin` group, and the service account's membership in that group.
+It creates or corrects the documented modes/ownership of `/etc/phx-port`,
+`/var/lib/phx-port`, `/run/phx-port`, and the runtime `handoff` and `control`
+directories. It is safe to rerun: existing accounts, configuration, certificates,
+registries, durable ownership claims, and socket files are not replaced.
+
+The task uses `sudo` and makes system-level changes, but does **not** add your
+login account to the admin group, install the binary or policy, enable/start
+services, or switch the running development ingress to public mode. Continue
+with the binary installation in step 2 and the remaining steps below. The
+manual account/directory commands are alternatives to the task.
+
+Runtime directories are ephemeral. Rerun the task after a reboot when using
+foreground ingress; the shipped systemd service recreates its runtime tree
+when used instead.
 
 ### 1. Create identities
 
@@ -72,11 +98,13 @@ sudo -n -u phx-port -g phx-port -- install -d -o phx-port -g phx-port -m 0700 \
   /run/phx-port/handoff
 ```
 
-Initialize the `handoff` child as the service user, including on repeated
-provisioning runs. Its parent is service-writable, so a pre-existing child
+Initialize children of `/run/phx-port` as the service user, including on repeated
+provisioning runs. Their parent is service-writable, so a pre-existing child
 could be a symlink. Root's `install -o phx-port` does not drop privileges and
-could change the symlink target's ownership or permissions. If the
-unprivileged step fails, inspect the path rather than retrying it as root.
+could change the symlink target's ownership or permissions. `just setup-public`
+uses the service identity for both `handoff` and `control`; otherwise ingress
+creates `control` when it starts. If the unprivileged step fails, inspect the
+path rather than retrying it as root.
 
 ### 3. Write ingress configuration
 

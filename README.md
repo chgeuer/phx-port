@@ -623,10 +623,19 @@ rejected. Other root CLI commands retain their existing behavior.
 
 The explicit public Hosting Profile ships separate system units in
 `packaging/systemd/` and in the Linux release archive's `systemd/` directory.
-Provision the non-login `phx-port` user and group plus a `phx-port-admin`
-group, add the service account and read-only operators to that administration
-group, install the binary at `/usr/local/bin/phx-port`, install the root-owned
-ingress intent, then install and start all three units:
+From a Linux source checkout, `just setup-public` uses `sudo`,
+`systemd-sysusers`, and `systemd-tmpfiles` to create the non-login `phx-port`
+user/group, `phx-port-admin` membership for the service account, and the
+protected configuration/state/runtime directories. It is safe to rerun and
+does not replace configuration, registries, durable claims, or socket files.
+It does not install a binary/policy, add login users to the admin group, start
+services, or change the running ingress profile. See the
+[public server manual](docs/manual/public-server.md#linux-installation) for
+manual provisioning and ownership details.
+
+Add read-only operators to `phx-port-admin` explicitly. After provisioning,
+install the binary at `/usr/local/bin/phx-port`, install the root-owned ingress
+intent, then install and start all three units:
 
 ```bash
 sudo install -o root -g root -m 0755 target/release/phx-port \

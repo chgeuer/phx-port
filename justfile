@@ -22,6 +22,14 @@ install:
 install-release:
     cargo install --path . --locked --force
 
+# Create Linux public-hosting accounts and directories without starting services
+[linux]
+setup-public:
+    sudo systemd-sysusers packaging/systemd/phx-port.sysusers.conf
+    sudo systemd-tmpfiles --create packaging/systemd/phx-port.tmpfiles.conf
+    sudo -n -u phx-port -g phx-port -- install -d -o phx-port -g phx-port -m 0700 /run/phx-port/handoff
+    sudo -n -u phx-port -g phx-port-admin -- install -d -o phx-port -g phx-port-admin -m 0750 /run/phx-port/control
+
 # Run the production ingress daemon in the foreground on a privileged port
 run-production listen=default_listen:
     #!/usr/bin/env bash
