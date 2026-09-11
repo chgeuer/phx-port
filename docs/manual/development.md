@@ -208,6 +208,17 @@ This requires the three local certificate fixtures. It uses isolated temporary
 registry/runtime state, requires exactly one successful handoff and zero
 relays per framework, stops only the PIDs it starts, and removes its state.
 
+The Rust/Elixir local playground separately exercises handoff and relay:
+
+```bash
+just play
+just play-status
+just play-logs daemon
+just play-down
+```
+
+It expects the test certificates described in the main README.
+
 ## Native regression tests
 
 ```bash
@@ -225,17 +236,10 @@ socket-based fixtures.
 Functional eager-discovery tests wait for bounded reconciliation to complete,
 including retries after transient probe timeouts. Deadline regressions still
 exercise individual passes with unchanged production timeout limits.
-
-The Rust/Elixir local playground separately exercises handoff and relay:
-
-```bash
-just play
-just play-status
-just play-logs daemon
-just play-down
-```
-
-It expects the test certificates described in the main README.
+Public ownership tests give cold native TLS proofs an explicit bounded test
+deadline, then verify end-to-end traffic after catalogue reconciliation.
+A separate end-to-end regression requires the default routing deadline to
+reject a slow exact-name proof without routing to a faster wildcard Workload.
 
 ## Troubleshooting
 

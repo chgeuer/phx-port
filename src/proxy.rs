@@ -11533,20 +11533,28 @@ mod tests {
             ))
         }
 
-        fn delay_first_catalogue(workload: &TestTlsBackend) -> Arc<AtomicBool> {
+        pub(in crate::proxy) fn delay_first_handshake(
+            workload: &TestTlsBackend,
+            server_name: Option<&str>,
+            delay: Duration,
+        ) -> Arc<AtomicBool> {
             #[derive(Debug)]
-            struct DelayedCatalogue {
+            struct DelayedHandshake {
                 inner: Arc<dyn rustls::server::ResolvesServerCert>,
                 first: Arc<AtomicBool>,
+                server_name: Option<String>,
+                delay: Duration,
             }
 
-            impl rustls::server::ResolvesServerCert for DelayedCatalogue {
+            impl rustls::server::ResolvesServerCert for DelayedHandshake {
                 fn resolve(
                     &self,
                     hello: rustls::server::ClientHello<'_>,
                 ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-                    if hello.server_name().is_none() && self.first.swap(false, Ordering::AcqRel) {
-                        thread::sleep(proxy::PROBE_TIMEOUT + Duration::from_millis(100));
+                    if hello.server_name() == self.server_name.as_deref()
+                        && self.first.swap(false, Ordering::AcqRel)
+                    {
+                        thread::sleep(self.delay);
                     }
                     self.inner.resolve(hello)
                 }
@@ -11555,9 +11563,11 @@ mod tests {
             let first = Arc::new(AtomicBool::new(true));
             let mut config = workload.tls_config.write().unwrap();
             let config = Arc::make_mut(&mut config);
-            config.cert_resolver = Arc::new(DelayedCatalogue {
+            config.cert_resolver = Arc::new(DelayedHandshake {
                 inner: config.cert_resolver.clone(),
                 first: first.clone(),
+                server_name: server_name.map(str::to_string),
+                delay,
             });
             first
         }
@@ -11655,7 +11665,11 @@ mod tests {
             let directory = tempdir().unwrap();
             let certificate = TestCertificate::for_hostname(PATTERN);
             let workload = TestTlsBackend::start_with_workers(&certificate, b"wildcard", 2);
-            let first_catalogue = delay_first_catalogue(&workload);
+            let first_catalogue = delay_first_handshake(
+                &workload,
+                None,
+                proxy::PROBE_TIMEOUT + Duration::from_millis(100),
+            );
             let state = development_state(
                 directory.path(),
                 &[("/wildcard", "https", workload.port())],
@@ -11701,7 +11715,11 @@ mod tests {
             let directory = tempdir().unwrap();
             let certificate = TestCertificate::for_hostname(PATTERN);
             let workload = TestTlsBackend::start_with_workers(&certificate, b"wildcard", 2);
-            let first_catalogue = delay_first_catalogue(&workload);
+            let first_catalogue = delay_first_handshake(
+                &workload,
+                None,
+                proxy::PROBE_TIMEOUT + Duration::from_millis(100),
+            );
             let state = development_state(
                 directory.path(),
                 &[("/wildcard", "https", workload.port())],

@@ -1,6 +1,8 @@
 use super::*;
 use crate::proxy::tests::{
-    TestCertificate, TestTlsBackend, wildcard_routing::request, write_logical_registry,
+    TestCertificate, TestTlsBackend,
+    wildcard_routing::{delay_first_handshake, request},
+    write_logical_registry,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -87,6 +89,24 @@ fn reconcile(state: &ProxyState) {
     crate::proxy::reconcile_workloads_until(state, Instant::now() + RECONCILIATION_PASS_TIMEOUT);
 }
 
+fn reconcile_catalogues(state: &ProxyState) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        crate::proxy::reconcile_workloads_until(
+            state,
+            deadline.min(Instant::now() + RECONCILIATION_PASS_TIMEOUT),
+        );
+        if state.certificate_discovery.read().unwrap().reconciled {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "certificate catalogues remained incomplete"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn damaged_or_missing_live_claims_block_routing_until_authority_is_restored() {
     let directory = directory();
@@ -168,11 +188,36 @@ fn public_discovery_uses_exact_precedence_in_both_startup_orders() {
             connector.clone(),
         );
         if eager {
-            reconcile(&state);
+            reconcile_catalogues(&state);
+        } else {
+            assert!(state.routes.read().unwrap().is_empty());
+            delay_first_handshake(
+                &exact,
+                Some(EXACT),
+                DISCOVERY_TIMEOUT + Duration::from_millis(100),
+            );
         }
 
-        assert_eq!(request(&state, &connector, EXACT).unwrap(), *b"exact!!!");
+        for (hostname, id, port) in [
+            (EXACT, exact_id, exact.port()),
+            (OTHER, wildcard_id, wildcard.port()),
+            ("another.public.example.test", wildcard_id, wildcard.port()),
+        ] {
+            let selected =
+                resolve_backend_until(hostname, &state, Instant::now() + Duration::from_secs(2))
+                    .unwrap();
+            assert_eq!(
+                selected.project, id,
+                "exact_first={exact_first}, eager={eager}"
+            );
+            assert_eq!(selected.role, "https");
+            assert_eq!(selected.port, port);
+        }
+        if !eager {
+            reconcile_catalogues(&state);
+        }
         assert_eq!(state.routes.read().unwrap().len(), 2);
+        assert_eq!(request(&state, &connector, EXACT).unwrap(), *b"exact!!!");
         for hostname in [OTHER, "another.public.example.test"] {
             assert_eq!(request(&state, &connector, hostname).unwrap(), *b"wildcard");
         }
@@ -189,6 +234,43 @@ fn public_discovery_uses_exact_precedence_in_both_startup_orders() {
         );
         assert!(state.public_snapshot().unwrap().routes.is_empty());
     }
+}
+
+#[test]
+fn cold_exact_proof_timeout_never_routes_to_the_faster_wildcard() {
+    let directory = directory();
+    let wildcard_certificate = TestCertificate::for_hostname(WILDCARD);
+    let exact_certificate = TestCertificate::for_hostname(EXACT);
+    let wildcard = TestTlsBackend::start(&wildcard_certificate, b"wildcard");
+    let exact = TestTlsBackend::start(&exact_certificate, b"exact!!!");
+    let connector = TestCertificate::connector_for(&[&wildcard_certificate, &exact_certificate]);
+    let state = setup(
+        directory.path(),
+        &[("a-wild", wildcard.port()), ("z-exact", exact.port())],
+        connector.clone(),
+    );
+    delay_first_handshake(
+        &exact,
+        Some(EXACT),
+        DISCOVERY_TIMEOUT + Duration::from_millis(100),
+    );
+
+    let error = request(&state, &connector, EXACT).unwrap_err();
+    assert!(error.contains("route selection timed out"), "{error}");
+    assert_eq!(state.rejected_routing_timeout.load(Ordering::Acquire), 1);
+    assert_eq!(state.relayed_connections.load(Ordering::Acquire), 0);
+    assert_eq!(state.handoff_attempts.load(Ordering::Acquire), 0);
+    assert_eq!(state.admission.snapshot().global.in_use, 0);
+    assert!(state.routes.read().unwrap().is_empty());
+    assert!(
+        state
+            .certificate_discovery
+            .read()
+            .unwrap()
+            .claims
+            .routes
+            .is_empty()
+    );
 }
 
 #[test]
