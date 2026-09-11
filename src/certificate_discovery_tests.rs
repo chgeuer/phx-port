@@ -738,6 +738,20 @@ fn production_default_wildcard_hint_cannot_be_proved_by_an_exact_only_sni_leaf()
             .is_empty()
     );
     assert!(request(&state, &connector, OTHER).is_err());
+    delay_first_handshake(
+        &workload,
+        Some("a.public.example.test"),
+        DISCOVERY_TIMEOUT + Duration::from_millis(100),
+    );
+    let selected = resolve_backend_until(
+        "a.public.example.test",
+        &state,
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap();
+    assert_eq!(selected.project, "wild");
+    assert_eq!(selected.role, "https");
+    assert_eq!(selected.port, workload.port());
     assert_eq!(
         request(&state, &connector, "a.public.example.test").unwrap(),
         *b"exact!!!"

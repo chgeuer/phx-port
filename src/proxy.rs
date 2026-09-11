@@ -8218,6 +8218,31 @@ mod tests {
             runtime_root: directory.path().join("runtime"),
         });
         state.probe_connector_override = Some(certificate.connector());
+        let proof = super::probe_declared_backend_until(
+            "a-ready.example.com",
+            &Backend {
+                project: "web".into(),
+                role: "https".into(),
+                port: backend.port(),
+            },
+            &state,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        let cache = &state.production_paths.as_ref().unwrap().route_cache;
+        // Seed a hint, not an active route, so this deadline test does not benchmark fsync.
+        route_cache::store(
+            cache,
+            route_cache::Storage::SeparateState,
+            "a-ready.example.com",
+            "web",
+            "https",
+            &proof.fingerprint,
+        )
+        .unwrap();
+        assert!(state.routes.read().unwrap().is_empty());
+        let accepted = backend.accepted();
+        crate::port_registry::take_derived_io_counts();
         let deadline = Instant::now() + pass_timeout;
         super::reconcile_workloads_until(&state, deadline);
         assert!(
@@ -8229,6 +8254,11 @@ mod tests {
             (1..=silent_count).contains(&examined),
             "silent workload backlog did not exhaust the pass"
         );
+        assert!(
+            backend.accepted() > accepted,
+            "cached hints must still be reverified"
+        );
+        assert_eq!(crate::port_registry::take_derived_io_counts().writes, 0);
         assert_eq!(state.routes.read().unwrap().len(), 1);
         assert!(
             state

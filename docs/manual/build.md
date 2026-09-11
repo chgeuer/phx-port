@@ -117,9 +117,19 @@ a silent-workload test retains a 150 ms deadline and checks that discovery
 actually starts a probe, with worker startup outside that deadline.
 
 The publication-deadline test uses the production reconciliation pass budget
-and enough silent probes to exceed that budget. This keeps the starvation
-regression active without requiring certificate verification and cache
-persistence to complete within an artificial 300 ms window.
+and enough silent probes to exceed that budget. It starts with initialized
+probe workers and a persisted certificate hint but no active route; a fresh
+native TLS proof must still activate before the deadline. Keeping worker
+startup and first-write disk sync outside the timed pass isolates publication
+starvation from startup and filesystem latency. Separate batch I/O tests cover
+new and changed cache writes.
+
+Public ownership checks also separate cold native TLS proof from frontend
+latency. Functional tests use a bounded resolver deadline, then exercise real
+HTTPS traffic. A separate end-to-end test requires the unchanged production
+deadline to reject a slow exact-name proof without falling back to a wildcard.
+The same rule applies when a default wildcard hint is rejected but the
+Workload can prove an exact-only SNI certificate.
 
 The cursor regression checks progress and resumption rather than assuming a
 fixed probe count fits a short wall-clock window. Cache/reload ordering uses
