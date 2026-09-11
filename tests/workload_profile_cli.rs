@@ -8,9 +8,13 @@ use tempfile::tempdir_in;
 use toml_edit::DocumentMut;
 
 fn tempdir() -> std::io::Result<tempfile::TempDir> {
+    #[cfg(unix)]
+    let default_root = std::path::PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let default_root = std::env::temp_dir();
     let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+        .unwrap_or(default_root);
     tempdir_in(root.canonicalize()?)
 }
 
@@ -96,7 +100,11 @@ impl RunningDaemon {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !control.exists() {
             if let Some(status) = daemon.child.as_mut().unwrap().try_wait().unwrap() {
-                panic!("daemon exited before creating control socket: {status}");
+                let output = daemon.child.take().unwrap().wait_with_output().unwrap();
+                panic!(
+                    "daemon exited before creating control socket ({status}): {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
             assert!(
                 Instant::now() < deadline,

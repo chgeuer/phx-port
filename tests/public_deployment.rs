@@ -44,7 +44,14 @@ impl Drop for RunningExecutable {
 fn atomic_install_replaces_a_running_executable_without_truncation() {
     let root = tempdir().unwrap();
     let destination = root.path().join("phx-port");
-    fs::copy("/bin/sleep", &destination).unwrap();
+    // Keep the writable executable out of descriptors inherited by concurrent test forks.
+    assert_success(
+        &Command::new("cp")
+            .arg("/bin/sleep")
+            .arg(&destination)
+            .output()
+            .unwrap(),
+    );
     let previous_inode = destination.metadata().unwrap().ino();
     let mut running = RunningExecutable(Command::new(&destination).arg("30").spawn().unwrap());
     let source = root.path().join("release");

@@ -11533,6 +11533,61 @@ mod tests {
             ))
         }
 
+        fn delay_first_catalogue(workload: &TestTlsBackend) -> Arc<AtomicBool> {
+            #[derive(Debug)]
+            struct DelayedCatalogue {
+                inner: Arc<dyn rustls::server::ResolvesServerCert>,
+                first: Arc<AtomicBool>,
+            }
+
+            impl rustls::server::ResolvesServerCert for DelayedCatalogue {
+                fn resolve(
+                    &self,
+                    hello: rustls::server::ClientHello<'_>,
+                ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                    if hello.server_name().is_none() && self.first.swap(false, Ordering::AcqRel) {
+                        thread::sleep(proxy::PROBE_TIMEOUT + Duration::from_millis(100));
+                    }
+                    self.inner.resolve(hello)
+                }
+            }
+
+            let first = Arc::new(AtomicBool::new(true));
+            let mut config = workload.tls_config.write().unwrap();
+            let config = Arc::make_mut(&mut config);
+            config.cert_resolver = Arc::new(DelayedCatalogue {
+                inner: config.cert_resolver.clone(),
+                first: first.clone(),
+            });
+            first
+        }
+
+        fn reconcile_eager_workloads(state: &ProxyState) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let candidates = proxy::candidate_backends_until(state, None, deadline).unwrap();
+            loop {
+                proxy::reconcile_workloads_until(
+                    state,
+                    deadline.min(Instant::now() + proxy::RECONCILIATION_PASS_TIMEOUT),
+                );
+                let pending = {
+                    let evaluated = state.eager_workloads.lock().unwrap();
+                    candidates
+                        .iter()
+                        .filter(|backend| !evaluated.contains(backend))
+                        .collect::<Vec<_>>()
+                };
+                if pending.is_empty() {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "eager Workloads were not evaluated: {pending:?}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
         pub(in crate::proxy) fn request(
             state: &Arc<ProxyState>,
             connector: &TlsConnector,
@@ -11599,15 +11654,17 @@ mod tests {
         fn eager_route_serves_arbitrary_labels_before_any_concrete_discovery() {
             let directory = tempdir().unwrap();
             let certificate = TestCertificate::for_hostname(PATTERN);
-            let workload = TestTlsBackend::start(&certificate, b"wildcard");
+            let workload = TestTlsBackend::start_with_workers(&certificate, b"wildcard", 2);
+            let first_catalogue = delay_first_catalogue(&workload);
             let state = development_state(
                 directory.path(),
                 &[("/wildcard", "https", workload.port())],
                 certificate.connector(),
             );
 
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
 
+            assert!(!first_catalogue.load(Ordering::Acquire));
             assert_eq!(state.routes.read().unwrap().len(), 1);
             assert!(state.routes.read().unwrap().contains_key(PATTERN));
             assert_eq!(state.successful_discoveries.load(Ordering::Acquire), 1);
@@ -11641,36 +11698,10 @@ mod tests {
 
         #[test]
         fn timed_out_catalogue_is_retried_without_a_registration_change() {
-            #[derive(Debug)]
-            struct DelayedCatalogue {
-                inner: Arc<dyn rustls::server::ResolvesServerCert>,
-                first: AtomicBool,
-            }
-
-            impl rustls::server::ResolvesServerCert for DelayedCatalogue {
-                fn resolve(
-                    &self,
-                    hello: rustls::server::ClientHello<'_>,
-                ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-                    if hello.server_name().is_none() && self.first.swap(false, Ordering::AcqRel) {
-                        thread::sleep(proxy::PROBE_TIMEOUT + Duration::from_millis(100));
-                    }
-                    self.inner.resolve(hello)
-                }
-            }
-
             let directory = tempdir().unwrap();
             let certificate = TestCertificate::for_hostname(PATTERN);
             let workload = TestTlsBackend::start_with_workers(&certificate, b"wildcard", 2);
-            let resolver = Arc::new(DelayedCatalogue {
-                inner: certificate.server_config().cert_resolver.clone(),
-                first: AtomicBool::new(true),
-            });
-            *workload.tls_config.write().unwrap() = Arc::new(
-                rustls::ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_cert_resolver(resolver.clone()),
-            );
+            let first_catalogue = delay_first_catalogue(&workload);
             let state = development_state(
                 directory.path(),
                 &[("/wildcard", "https", workload.port())],
@@ -11678,13 +11709,13 @@ mod tests {
             );
 
             reconcile_workloads(&state);
-            assert!(!resolver.first.load(Ordering::Acquire));
+            assert!(!first_catalogue.load(Ordering::Acquire));
             assert!(state.routes.read().unwrap().is_empty());
             assert!(
                 state.eager_workloads.lock().unwrap().is_empty(),
                 "a timed-out catalogue must remain eligible for the next pass"
             );
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             assert!(state.routes.read().unwrap().contains_key(PATTERN));
             assert_eq!(
                 request(&state, &certificate.connector(), FIRST).unwrap(),
@@ -11705,7 +11736,7 @@ mod tests {
             assert!(request(&state, &certificate.connector(), "unrelated.example.test").is_err());
             assert!(state.routes.read().unwrap().is_empty());
 
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
 
             assert!(state.routes.read().unwrap().contains_key(PATTERN));
             assert_eq!(
@@ -11724,7 +11755,7 @@ mod tests {
                 &[("/wildcard", "https", workload.port())],
                 certificate.connector(),
             );
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
 
             for hostname in [
                 "wildcard.example.test",
@@ -11770,7 +11801,7 @@ mod tests {
                     ],
                     connector.clone(),
                 );
-                reconcile_workloads(&state);
+                reconcile_eager_workloads(&state);
 
                 assert_eq!(state.routes.read().unwrap().len(), 2);
                 assert!(state.conflicts.read().unwrap().is_empty());
@@ -11818,14 +11849,14 @@ mod tests {
                 &[("/wildcard", "https", wildcard.port())],
                 connector.clone(),
             );
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             update_config(&state.config, |document| {
                 for (project, port) in [("/first", first.port()), ("/second", second.port())] {
                     document["ports"][project] = toml_edit::table();
                     document["ports"][project]["https"] = value(i64::from(port));
                 }
             });
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             assert_eq!(state.conflicts.read().unwrap()[FIRST].len(), 2);
             assert!(request(&state, &connector, FIRST).is_err());
             assert_eq!(request(&state, &connector, SECOND).unwrap(), *b"wildcard");
@@ -11841,7 +11872,7 @@ mod tests {
                 &[("/wildcard", "main", workload.port())],
                 certificate.connector(),
             );
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             assert!(state.routes.read().unwrap().is_empty());
             assert_eq!(
                 request(&state, &certificate.connector(), FIRST).unwrap(),
@@ -11894,7 +11925,7 @@ mod tests {
                 ],
                 certificate.connector(),
             );
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             assert!(state.routes.read().unwrap().is_empty());
             let contenders = state.conflicts.read().unwrap()[PATTERN].clone();
             assert_eq!(
@@ -11920,7 +11951,7 @@ mod tests {
                     .unwrap()
                     .remove("/a-second");
             });
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             assert_eq!(
                 request(&state, &certificate.connector(), SECOND).unwrap(),
                 *b"wildcard"
@@ -11943,12 +11974,12 @@ mod tests {
                 &[("/incumbent", "https", first.port())],
                 certificate.connector(),
             );
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             update_config(&state.config, |document| {
                 document["ports"]["/contender"] = toml_edit::table();
                 document["ports"]["/contender"]["https"] = value(i64::from(second.port()));
             });
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             assert_eq!(state.conflicts.read().unwrap()[PATTERN].len(), 2);
             state
                 .routes
@@ -11988,7 +12019,7 @@ mod tests {
                 document["ports"]["/contender"] = toml_edit::table();
                 document["ports"]["/contender"]["https"] = value(i64::from(second.port()));
             });
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             first.replace_certificate(&TestCertificate::for_hostname("removed.example.test"));
             state
                 .routes
@@ -12019,7 +12050,7 @@ mod tests {
                 &[("/wildcard", "https", workload.port())],
                 TestCertificate::unrelated_connector(PATTERN),
             );
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             assert_eq!(state.workloads.lock().unwrap().len(), 1);
             assert!(state.routes.read().unwrap().is_empty());
             assert!(request(&state, &certificate.connector(), FIRST).is_err());
@@ -12044,7 +12075,7 @@ mod tests {
                 &[("/wildcard", "https", workload.port())],
                 certificate.connector(),
             );
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             assert_eq!(state.workloads.lock().unwrap().len(), 1);
             assert!(state.routes.read().unwrap().is_empty());
             assert!(state.negative.lock().unwrap().contains_key(PATTERN));
@@ -12102,7 +12133,7 @@ mod tests {
                 error.contains("does not contain wildcard DNS SAN"),
                 "{error}"
             );
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             assert_eq!(state.workloads.lock().unwrap().len(), 1);
             assert!(state.routes.read().unwrap().is_empty());
             assert!(request(&state, &connector, FIRST).is_err());
@@ -12132,7 +12163,7 @@ mod tests {
                 &[("/wildcard", "https", workload.port())],
                 connector.clone(),
             );
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             state
                 .routes
                 .write()
@@ -12176,7 +12207,7 @@ mod tests {
             );
 
             drop(workload);
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             reconcile_routes(&state);
             reconcile_routes(&state);
             assert!(state.routes.read().unwrap().contains_key(PATTERN));
@@ -12196,7 +12227,7 @@ mod tests {
             update_config(&state.config, |document| {
                 document["ports"]["/wildcard"]["https"] = value(i64::from(restarted.port()));
             });
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             assert_eq!(
                 request(&state, &connector, "new.wildcard.example.test").unwrap(),
                 *b"renewed!"
@@ -12238,7 +12269,7 @@ mod tests {
                 &[("/wildcard", "https", workload.port())],
                 connector.clone(),
             );
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             workload.replace_certificate(&exact);
             state
                 .routes
@@ -12283,7 +12314,7 @@ mod tests {
                 &[("/wildcard", "https", workload.port())],
                 certificate.connector(),
             );
-            reconcile_workloads(&state);
+            reconcile_eager_workloads(&state);
             let selected = current_active_route(&state, FIRST).unwrap().unwrap();
             let previous_check = selected.active.last_tls_check;
             assert_eq!(selected.pattern, PATTERN);

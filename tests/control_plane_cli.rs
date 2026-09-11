@@ -13,7 +13,7 @@ use tempfile::{TempDir, tempdir_in};
 fn tempdir() -> std::io::Result<TempDir> {
     let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
     tempdir_in(root.canonicalize()?)
 }
 

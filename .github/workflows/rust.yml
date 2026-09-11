@@ -82,6 +82,15 @@ jobs:
           cargo test --locked --target ${{ matrix.target }} --bin phx-port certificate_discovery
         PHX_PORT_TEST_TMPDIR="$temporary_alias" \
           cargo test --locked --target ${{ matrix.target }} --bin phx-port route_claims
+    - name: Regression-test long platform temporary paths
+      shell: bash
+      run: |
+        set -euo pipefail
+        temporary_root="$(mktemp -d "$RUNNER_TEMP/phx-port-platform-temporary-root-too-long-for-control-sockets.XXXXXX")"
+        trap 'rmdir "$temporary_root"' EXIT
+        TMPDIR="$temporary_root" \
+          cargo test --locked --target ${{ matrix.target }} \
+            --test control_plane_cli --test preflight_cli --test workload_profile_cli
     - name: Test Rust handoff sample
       run: cargo test --locked --manifest-path samples/rust/Cargo.toml --verbose --target ${{ matrix.target }}
     - name: Test Rustler handoff broker

@@ -208,6 +208,24 @@ This requires the three local certificate fixtures. It uses isolated temporary
 registry/runtime state, requires exactly one successful handoff and zero
 relays per framework, stops only the PIDs it starts, and removes its state.
 
+## Native regression tests
+
+```bash
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+```
+
+CI runs the native suite and framework adapters on Linux and macOS, both x64
+and ARM64. Separate regressions exercise aliased temporary roots and long
+platform `TMPDIR` paths. Unix socket fixtures use short, canonical `/tmp`
+paths because macOS's default temporary path can exceed the socket address
+limit. A `PHX_PORT_TEST_TMPDIR` override must likewise stay short when running
+socket-based fixtures.
+
+Functional eager-discovery tests wait for bounded reconciliation to complete,
+including retries after transient probe timeouts. Deadline regressions still
+exercise individual passes with unchanged production timeout limits.
+
 The Rust/Elixir local playground separately exercises handoff and relay:
 
 ```bash
