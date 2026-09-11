@@ -829,7 +829,10 @@ requires strict bounds. The implementation currently:
 - Keeps at most 1,024 verified routes and 1,024 conflict diagnostics.
 - Returns at most 64 live route-detail rows per control request.
 - Keeps at most 1,024 negative entries for 30 seconds.
-- Invalidates negative entries when the live workload set changes.
+- Invalidates negative entries when the live workload set changes or a
+  verified route activates for the same exact name or wildcard pattern.
+  Late failed probes cannot restore a negative entry over that still-valid
+  activation.
 - Performs only loopback TCP/TLS probes; it does not follow redirects or make
   HTTP requests.
 - Does not log certificate contents, key material, or TLS payload.

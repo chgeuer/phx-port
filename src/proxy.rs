@@ -4888,6 +4888,17 @@ fn discover_backend_until(
 }
 
 fn cache_negative(state: &ProxyState, hostname: &str) {
+    let routes = state
+        .routes
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if routes
+        .get(hostname)
+        .is_some_and(|route| route.certificate_is_valid_at(current_unix_seconds()))
+    {
+        return;
+    }
+    // Keep the route read lock until insertion so a later activation clears this result.
     if let Ok(mut negative) = state.negative.lock() {
         if negative.len() >= MAX_NEGATIVE_ROUTES {
             let now = Instant::now();
@@ -5965,6 +5976,11 @@ fn publish_active_route(
     {
         return Err("route changed while certificate proof was pending".to_string());
     }
+    let mut negative = state
+        .negative
+        .lock()
+        .map_err(|_| "negative route cache lock poisoned".to_string())?;
+    state.check_running_until(deadline)?;
     routes.insert(
         hostname.to_string(),
         ActiveRoute {
@@ -5976,6 +5992,8 @@ fn publish_active_route(
             tcp_failures: 0,
         },
     );
+    negative.remove(hostname);
+    drop(negative);
     drop(routes);
 
     if rotated {
@@ -11628,6 +11646,21 @@ mod tests {
             }
         }
 
+        fn resolve_then_request(
+            state: &Arc<ProxyState>,
+            connector: &TlsConnector,
+            hostname: &str,
+        ) -> Result<[u8; 8], String> {
+            if current_active_route(state, hostname)?.is_none() {
+                proxy::resolve_backend_until(
+                    hostname,
+                    state,
+                    Instant::now() + Duration::from_secs(2),
+                )?;
+            }
+            request(state, connector, hostname)
+        }
+
         pub(in crate::proxy) fn request(
             state: &Arc<ProxyState>,
             connector: &TlsConnector,
@@ -11715,7 +11748,7 @@ mod tests {
             let accepted = workload.accepted();
             for hostname in [FIRST, SECOND] {
                 assert_eq!(
-                    request(&state, &certificate.connector(), hostname).unwrap(),
+                    resolve_then_request(&state, &certificate.connector(), hostname).unwrap(),
                     *b"wildcard"
                 );
             }
@@ -11766,9 +11799,110 @@ mod tests {
             reconcile_eager_workloads(&state);
             assert!(state.routes.read().unwrap().contains_key(PATTERN));
             assert_eq!(
-                request(&state, &certificate.connector(), FIRST).unwrap(),
+                resolve_then_request(&state, &certificate.connector(), FIRST).unwrap(),
                 *b"wildcard"
             );
+        }
+
+        #[test]
+        fn verified_eager_routes_supersede_stale_negative_results() {
+            let directory = tempdir().unwrap();
+            let certificate = TestCertificate::for_hostname(PATTERN);
+            let workload = TestTlsBackend::start(&certificate, b"wildcard");
+            let state = development_state(
+                directory.path(),
+                &[("/wildcard", "https", workload.port())],
+                certificate.connector(),
+            );
+            proxy::observe_workloads(
+                &state,
+                &[Backend {
+                    project: "/wildcard".into(),
+                    role: "https".into(),
+                    port: workload.port(),
+                }],
+            );
+            cache_negative(&state, PATTERN);
+            assert!(state.negative.lock().unwrap().contains_key(PATTERN));
+
+            reconcile_eager_workloads(&state);
+            assert!(state.routes.read().unwrap().contains_key(PATTERN));
+            assert!(
+                !state.negative.lock().unwrap().contains_key(PATTERN),
+                "a successful proof must supersede an earlier failed probe"
+            );
+            cache_negative(&state, PATTERN);
+            assert!(
+                !state.negative.lock().unwrap().contains_key(PATTERN),
+                "a late failed probe must not shadow a valid activation"
+            );
+
+            state
+                .routes
+                .write()
+                .unwrap()
+                .get_mut(PATTERN)
+                .unwrap()
+                .certificate
+                .not_after_unix_seconds = current_unix_seconds();
+            assert!(current_active_route(&state, FIRST).unwrap().is_none());
+            let selected = proxy::resolve_backend_until(
+                FIRST,
+                &state,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!(selected.port, workload.port());
+            assert_eq!(
+                resolve_then_request(&state, &certificate.connector(), FIRST).unwrap(),
+                *b"wildcard"
+            );
+
+            state
+                .routes
+                .write()
+                .unwrap()
+                .get_mut(PATTERN)
+                .unwrap()
+                .certificate
+                .not_after_unix_seconds = current_unix_seconds();
+            cache_negative(&state, PATTERN);
+            assert!(
+                state.negative.lock().unwrap().contains_key(PATTERN),
+                "an expired activation must not suppress a genuine failed probe"
+            );
+        }
+
+        #[test]
+        fn cold_exact_proof_timeout_never_falls_back_to_a_wildcard() {
+            let directory = tempdir().unwrap();
+            let wildcard_certificate = TestCertificate::for_hostname(PATTERN);
+            let exact_certificate = TestCertificate::for_hostname(FIRST);
+            let wildcard = TestTlsBackend::start(&wildcard_certificate, b"wildcard");
+            let exact = TestTlsBackend::start(&exact_certificate, b"exact!!!");
+            let connector =
+                TestCertificate::connector_for(&[&wildcard_certificate, &exact_certificate]);
+            let state = development_state(
+                directory.path(),
+                &[
+                    ("/a-wild", "https", wildcard.port()),
+                    ("/z-exact", "https", exact.port()),
+                ],
+                connector.clone(),
+            );
+            delay_first_handshake(
+                &exact,
+                Some(FIRST),
+                proxy::DISCOVERY_TIMEOUT + Duration::from_millis(100),
+            );
+
+            let error = request(&state, &connector, FIRST).unwrap_err();
+            assert!(error.contains("route selection timed out"), "{error}");
+            assert_eq!(state.rejected_routing_timeout.load(Ordering::Acquire), 1);
+            assert_eq!(state.relayed_connections.load(Ordering::Acquire), 0);
+            assert_eq!(state.handoff_attempts.load(Ordering::Acquire), 0);
+            assert_eq!(state.admission.snapshot().global.in_use, 0);
+            assert!(state.routes.read().unwrap().is_empty());
         }
 
         #[test]
@@ -11788,7 +11922,7 @@ mod tests {
 
             assert!(state.routes.read().unwrap().contains_key(PATTERN));
             assert_eq!(
-                request(&state, &certificate.connector(), FIRST).unwrap(),
+                resolve_then_request(&state, &certificate.connector(), FIRST).unwrap(),
                 *b"wildcard"
             );
         }
@@ -11853,8 +11987,14 @@ mod tests {
 
                 assert_eq!(state.routes.read().unwrap().len(), 2);
                 assert!(state.conflicts.read().unwrap().is_empty());
-                assert_eq!(request(&state, &connector, FIRST).unwrap(), *b"exact!!!");
-                assert_eq!(request(&state, &connector, SECOND).unwrap(), *b"wildcard");
+                assert_eq!(
+                    resolve_then_request(&state, &connector, FIRST).unwrap(),
+                    *b"exact!!!"
+                );
+                assert_eq!(
+                    resolve_then_request(&state, &connector, SECOND).unwrap(),
+                    *b"wildcard"
+                );
             }
         }
 
@@ -11865,6 +12005,11 @@ mod tests {
             let exact_certificate = TestCertificate::for_hostname(FIRST);
             let wildcard = TestTlsBackend::start(&wildcard_certificate, b"wildcard");
             let exact = TestTlsBackend::start(&exact_certificate, b"exact!!!");
+            delay_first_handshake(
+                &exact,
+                Some(FIRST),
+                proxy::DISCOVERY_TIMEOUT + Duration::from_millis(100),
+            );
             let connector =
                 TestCertificate::connector_for(&[&wildcard_certificate, &exact_certificate]);
             let state = development_state(
@@ -11875,9 +12020,15 @@ mod tests {
                 ],
                 connector.clone(),
             );
-            assert_eq!(request(&state, &connector, FIRST).unwrap(), *b"exact!!!");
+            assert_eq!(
+                resolve_then_request(&state, &connector, FIRST).unwrap(),
+                *b"exact!!!"
+            );
             assert_eq!(state.routes.read().unwrap()[FIRST].backend.role, "main");
-            assert_eq!(request(&state, &connector, SECOND).unwrap(), *b"wildcard");
+            assert_eq!(
+                resolve_then_request(&state, &connector, SECOND).unwrap(),
+                *b"wildcard"
+            );
             assert_eq!(state.routes.read().unwrap()[PATTERN].backend.role, "https");
             assert_eq!(state.routes.read().unwrap().len(), 2);
         }
@@ -11907,7 +12058,10 @@ mod tests {
             reconcile_eager_workloads(&state);
             assert_eq!(state.conflicts.read().unwrap()[FIRST].len(), 2);
             assert!(request(&state, &connector, FIRST).is_err());
-            assert_eq!(request(&state, &connector, SECOND).unwrap(), *b"wildcard");
+            assert_eq!(
+                resolve_then_request(&state, &connector, SECOND).unwrap(),
+                *b"wildcard"
+            );
         }
 
         #[test]
@@ -11915,6 +12069,11 @@ mod tests {
             let directory = tempdir().unwrap();
             let certificate = TestCertificate::for_hostname(PATTERN);
             let workload = TestTlsBackend::start(&certificate, b"wildcard");
+            delay_first_handshake(
+                &workload,
+                Some(FIRST),
+                proxy::DISCOVERY_TIMEOUT + Duration::from_millis(100),
+            );
             let state = development_state(
                 directory.path(),
                 &[("/wildcard", "main", workload.port())],
@@ -11923,7 +12082,7 @@ mod tests {
             reconcile_eager_workloads(&state);
             assert!(state.routes.read().unwrap().is_empty());
             assert_eq!(
-                request(&state, &certificate.connector(), FIRST).unwrap(),
+                resolve_then_request(&state, &certificate.connector(), FIRST).unwrap(),
                 *b"wildcard"
             );
             assert_eq!(state.routes.read().unwrap().len(), 1);
@@ -11938,7 +12097,7 @@ mod tests {
             assert!(current_active_route(&reloaded, SECOND).unwrap().is_none());
             let accepted = workload.accepted();
             assert_eq!(
-                request(&reloaded, &certificate.connector(), SECOND).unwrap(),
+                resolve_then_request(&reloaded, &certificate.connector(), SECOND).unwrap(),
                 *b"wildcard"
             );
             assert!(
@@ -12001,7 +12160,7 @@ mod tests {
             });
             reconcile_eager_workloads(&state);
             assert_eq!(
-                request(&state, &certificate.connector(), SECOND).unwrap(),
+                resolve_then_request(&state, &certificate.connector(), SECOND).unwrap(),
                 *b"wildcard"
             );
             assert!(state.conflicts.read().unwrap().is_empty());
@@ -12039,7 +12198,7 @@ mod tests {
             reconcile_routes(&state);
             assert_eq!(state.conflicts.read().unwrap()[PATTERN].len(), 2);
             assert_eq!(
-                request(&state, &certificate.connector(), FIRST).unwrap(),
+                resolve_then_request(&state, &certificate.connector(), FIRST).unwrap(),
                 *b"wildcard"
             );
 
@@ -12083,7 +12242,7 @@ mod tests {
                 second.port()
             );
             assert_eq!(
-                request(&state, &certificate.connector(), FIRST).unwrap(),
+                resolve_then_request(&state, &certificate.connector(), FIRST).unwrap(),
                 *b"second!!"
             );
         }
@@ -12222,7 +12381,10 @@ mod tests {
                 .not_after_unix_seconds = current_unix_seconds();
             assert!(current_active_route(&state, FIRST).unwrap().is_none());
             assert!(state.routes.read().unwrap().is_empty());
-            assert_eq!(request(&state, &connector, SECOND).unwrap(), *b"wildcard");
+            assert_eq!(
+                resolve_then_request(&state, &connector, SECOND).unwrap(),
+                *b"wildcard"
+            );
 
             let old_fingerprint = state.routes.read().unwrap()[PATTERN]
                 .certificate
@@ -12277,7 +12439,7 @@ mod tests {
             });
             reconcile_eager_workloads(&state);
             assert_eq!(
-                request(&state, &connector, "new.wildcard.example.test").unwrap(),
+                resolve_then_request(&state, &connector, "new.wildcard.example.test").unwrap(),
                 *b"renewed!"
             );
             assert_eq!(state.routes.read().unwrap().len(), 1);
@@ -12328,7 +12490,10 @@ mod tests {
                 .last_tls_check -= TLS_REVALIDATION_INTERVAL;
             reconcile_routes(&state);
             assert!(state.routes.read().unwrap().is_empty());
-            assert_eq!(request(&state, &connector, FIRST).unwrap(), *b"wildcard");
+            assert_eq!(
+                resolve_then_request(&state, &connector, FIRST).unwrap(),
+                *b"wildcard"
+            );
             assert!(state.routes.read().unwrap().contains_key(FIRST));
             assert!(!state.routes.read().unwrap().contains_key(PATTERN));
             assert!(request(&state, &connector, SECOND).is_err());
@@ -12349,7 +12514,10 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
-            assert_eq!(request(&state, &connector, SECOND).unwrap(), *b"wildcard");
+            assert_eq!(
+                resolve_then_request(&state, &connector, SECOND).unwrap(),
+                *b"wildcard"
+            );
         }
 
         #[test]
@@ -12440,7 +12608,7 @@ mod tests {
             assert!(state.routes.read().unwrap().contains_key(FIRST));
             assert!(!state.routes.read().unwrap().contains_key(PATTERN));
             assert_eq!(
-                request(&state, &certificate.connector(), FIRST).unwrap(),
+                resolve_then_request(&state, &certificate.connector(), FIRST).unwrap(),
                 *b"wildcard"
             );
             let accepted = workload.accepted();

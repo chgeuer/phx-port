@@ -124,12 +124,15 @@ startup and first-write disk sync outside the timed pass isolates publication
 starvation from startup and filesystem latency. Separate batch I/O tests cover
 new and changed cache writes.
 
-Public ownership checks also separate cold native TLS proof from frontend
-latency. Functional tests use a bounded resolver deadline, then exercise real
-HTTPS traffic. A separate end-to-end test requires the unchanged production
-deadline to reject a slow exact-name proof without falling back to a wildcard.
-The same rule applies when a default wildcard hint is rejected but the
-Workload can prove an exact-only SNI certificate.
+Public ownership and development wildcard checks separate cold native TLS
+proof from frontend latency. Functional cold and recovery tests use a bounded
+resolver deadline, then exercise real HTTPS traffic; warm-route assertions
+still require no additional probes. End-to-end tests in both profiles require
+the unchanged production deadline to reject a slow exact-name proof without
+falling back to a wildcard. The same separation applies when a default
+wildcard hint is rejected but the Workload can prove an exact-only SNI
+certificate. A successful activation must also clear stale negative results
+without allowing late failed probes to suppress the still-valid route.
 
 The cursor regression checks progress and resumption rather than assuming a
 fixed probe count fits a short wall-clock window. Cache/reload ordering uses
