@@ -30,13 +30,9 @@ struct RunningDaemon {
 #[cfg(unix)]
 impl RunningDaemon {
     fn start(ingress_config: Option<&Path>, workload_id: Option<&str>) -> Self {
-        use std::net::TcpListener;
         use std::process::Stdio;
         use std::time::{Duration, Instant};
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
         let home = tempdir().unwrap();
         let (public_registry, public_runtime) = if ingress_config.is_some() {
             use std::os::unix::fs::PermissionsExt;
@@ -56,7 +52,7 @@ impl RunningDaemon {
             .args([
                 "daemon",
                 "--listen",
-                &address.to_string(),
+                "127.0.0.1:0",
                 "--active-connections",
                 "1",
                 "--pre-routing-connections",

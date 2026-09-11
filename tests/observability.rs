@@ -7,11 +7,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::{TempDir, tempdir_in};
+
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn tempdir() -> std::io::Result<TempDir> {
     let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
@@ -33,10 +35,44 @@ struct Daemon {
     ingress_config: PathBuf,
     registry: PathBuf,
     runtime: PathBuf,
-    ingress_address: SocketAddr,
+    stderr: PathBuf,
 }
 
 impl Daemon {
+    fn start_with_metrics() -> (Self, SocketAddr) {
+        Self::start_with_metrics_using(reserve_address)
+    }
+
+    fn start_with_metrics_using(
+        mut next_address: impl FnMut() -> SocketAddr,
+    ) -> (Self, SocketAddr) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let address = next_address();
+            let daemon = Self::start(Some(address), None);
+            let stderr = fs::read_to_string(&daemon.stderr).unwrap();
+            if stderr
+                .lines()
+                .any(|line| line.starts_with("event=metrics_listener result=started "))
+            {
+                return (daemon, address);
+            }
+            let stderr = daemon.stop_and_stderr();
+            assert!(
+                stderr.lines().any(|line| {
+                    line == "event=metrics_listener result=unavailable reason=bind_failed"
+                }),
+                "unexpected metrics startup failure:\n{stderr}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "cannot allocate an available metrics port:\n{stderr}"
+            );
+            eprintln!("metrics fixture port {address} is unavailable; retrying allocation");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn start(metrics_address: Option<SocketAddr>, source_diagnostics_expiry: Option<u64>) -> Self {
         let home = tempdir().unwrap();
         let state = home.path().join("state");
@@ -47,6 +83,7 @@ impl Daemon {
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o750)).unwrap();
         let ingress_config = home.path().join("ingress.toml");
         let registry = state.join("ports.toml");
+        let stderr = home.path().join("daemon.stderr");
         let mut config = String::from(
             "[ingress]\n\
              mode = \"public\"\n\
@@ -70,12 +107,11 @@ impl Daemon {
         );
         fs::write(&ingress_config, config).unwrap();
 
-        let ingress_address = reserve_address();
         let child = Command::new(env!("CARGO_BIN_EXE_phx-port"))
             .args([
                 "daemon",
                 "--listen",
-                &ingress_address.to_string(),
+                "127.0.0.1:0",
                 "--ingress-config",
                 ingress_config.to_str().unwrap(),
                 "--active-connections",
@@ -95,7 +131,7 @@ impl Daemon {
             .env_remove("PHX_PORT_INGRESS_CONFIG")
             .env_remove("XDG_RUNTIME_DIR")
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(fs::File::create(&stderr).unwrap())
             .spawn()
             .unwrap();
         let mut daemon = Self {
@@ -104,9 +140,9 @@ impl Daemon {
             ingress_config,
             registry,
             runtime,
-            ingress_address,
+            stderr,
         };
-        daemon.wait_until_ready();
+        daemon.wait_until_ready(metrics_address.is_some());
         daemon
     }
 
@@ -114,24 +150,24 @@ impl Daemon {
         self.runtime.join("control/control.sock")
     }
 
-    fn wait_until_ready(&mut self) {
+    fn wait_until_ready(&mut self, metrics_enabled: bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !self.control_path().exists() {
+        loop {
+            let stderr = fs::read_to_string(&self.stderr).unwrap();
             if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
-                let mut stderr = String::new();
-                self.child
-                    .as_mut()
-                    .unwrap()
-                    .stderr
-                    .as_mut()
-                    .unwrap()
-                    .read_to_string(&mut stderr)
-                    .unwrap();
                 panic!("daemon exited before creating control socket ({status}): {stderr}");
+            }
+            if self.control_path().exists()
+                && (!metrics_enabled
+                    || stderr
+                        .lines()
+                        .any(|line| line.starts_with("event=metrics_listener result=")))
+            {
+                return;
             }
             assert!(
                 Instant::now() < deadline,
-                "daemon did not create its control socket"
+                "daemon did not finish listener startup:\n{stderr}"
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -150,7 +186,19 @@ impl Daemon {
     }
 
     fn emit_client_hello(&self) {
-        let stream = TcpStream::connect(self.ingress_address).unwrap();
+        let output = self.command(&["proxy", "status", "--json"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let listeners = status["listeners"].as_array().unwrap();
+        assert_eq!(listeners.len(), 1);
+        let address: SocketAddr = listeners[0].as_str().unwrap().parse().unwrap();
+        assert!(address.ip().is_loopback());
+        assert_ne!(address.port(), 0);
+        let stream = TcpStream::connect(address).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -168,13 +216,10 @@ impl Daemon {
         let child = self.child.as_mut().unwrap();
         let result = unsafe { nix::libc::kill(child.id() as nix::libc::pid_t, nix::libc::SIGINT) };
         assert_eq!(result, 0, "cannot terminate test daemon");
-        let output = self.child.take().unwrap().wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "daemon shutdown failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stderr).unwrap()
+        let status = self.child.take().unwrap().wait().unwrap();
+        let stderr = fs::read_to_string(&self.stderr).unwrap();
+        assert!(status.success(), "daemon shutdown failed: {stderr}");
+        stderr
     }
 }
 
@@ -210,9 +255,33 @@ fn http_request(address: SocketAddr, request: &str) -> String {
 }
 
 #[test]
+fn metrics_fixture_reallocates_a_port_taken_before_bind() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied_address = occupied.local_addr().unwrap();
+    let mut attempts = 0;
+    let (daemon, metrics_address) = Daemon::start_with_metrics_using(|| {
+        attempts += 1;
+        if attempts == 1 {
+            occupied_address
+        } else {
+            reserve_address()
+        }
+    });
+    assert!(attempts >= 2);
+    assert_ne!(metrics_address, occupied_address);
+    let response = http_request(
+        metrics_address,
+        "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    daemon.stop_and_stderr();
+}
+
+#[test]
 fn metrics_listener_is_bounded_read_only_and_uses_only_declared_labels() {
-    let metrics_address = reserve_address();
-    let daemon = Daemon::start(Some(metrics_address), None);
+    let _guard = TEST_LOCK.lock().unwrap();
+    let (daemon, metrics_address) = Daemon::start_with_metrics();
 
     let response = http_request(
         metrics_address,
@@ -284,6 +353,7 @@ fn metrics_listener_is_bounded_read_only_and_uses_only_declared_labels() {
 
 #[test]
 fn source_diagnostics_are_sampled_only_before_the_explicit_expiry() {
+    let _guard = TEST_LOCK.lock().unwrap();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -311,6 +381,7 @@ fn source_diagnostics_are_sampled_only_before_the_explicit_expiry() {
 
 #[test]
 fn unavailable_metrics_listener_does_not_stop_the_data_plane() {
+    let _guard = TEST_LOCK.lock().unwrap();
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     let metrics_address = occupied.local_addr().unwrap();
     let daemon = Daemon::start(Some(metrics_address), None);
@@ -332,8 +403,8 @@ fn unavailable_metrics_listener_does_not_stop_the_data_plane() {
 
 #[test]
 fn partial_local_requests_cannot_outlive_daemon_shutdown() {
-    let metrics_address = reserve_address();
-    let mut daemon = Daemon::start(Some(metrics_address), None);
+    let _guard = TEST_LOCK.lock().unwrap();
+    let (mut daemon, metrics_address) = Daemon::start_with_metrics();
     let metrics_deadline = Instant::now() + Duration::from_secs(5);
     let metrics = loop {
         match TcpStream::connect(metrics_address) {
@@ -385,15 +456,11 @@ fn partial_local_requests_cannot_outlive_daemon_shutdown() {
     trickling.store(false, Ordering::Release);
     metrics_writer.join().unwrap();
     control_writer.join().unwrap();
-    let output = daemon.child.take().unwrap().wait_with_output().unwrap();
+    let status = daemon.child.take().unwrap().wait().unwrap();
+    let stderr = fs::read_to_string(&daemon.stderr).unwrap();
     assert!(
         exited_promptly,
-        "partial local requests blocked controlled shutdown:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        "partial local requests blocked controlled shutdown:\n{stderr}"
     );
-    assert!(
-        output.status.success(),
-        "daemon shutdown failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(status.success(), "daemon shutdown failed: {stderr}");
 }

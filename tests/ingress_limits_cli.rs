@@ -82,7 +82,7 @@ fn development_fixtures_ignore_inherited_profile_and_runtime() {
 mod unix {
     use super::development_command;
     use std::io::{ErrorKind, Read, Write};
-    use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+    use std::net::{Shutdown, SocketAddr, TcpStream};
     use std::os::unix::net::UnixStream;
     use std::process::{Child, Stdio};
     use std::thread;
@@ -107,21 +107,17 @@ mod unix {
     }
 
     impl Daemon {
-        fn start(address: SocketAddr) -> Self {
-            Self::start_with_limits(address, 1, 1)
+        fn start() -> Self {
+            Self::start_with_limits(1, 1)
         }
 
-        fn start_with_limits(
-            address: SocketAddr,
-            active_connections: usize,
-            pre_routing_connections: usize,
-        ) -> Self {
+        fn start_with_limits(active_connections: usize, pre_routing_connections: usize) -> Self {
             let home = tempdir().unwrap();
             let child = development_command(home.path())
                 .args([
                     "daemon".to_string(),
                     "--listen".to_string(),
-                    address.to_string(),
+                    "127.0.0.1:0".to_string(),
                     "--active-connections".to_string(),
                     active_connections.to_string(),
                     "--pre-routing-connections".to_string(),
@@ -148,13 +144,13 @@ mod unix {
         }
 
         #[cfg(target_os = "linux")]
-        fn start_for_idle_scale(address: SocketAddr, connections: usize) -> Self {
+        fn start_for_idle_scale(connections: usize) -> Self {
             let home = tempdir().unwrap();
             let child = development_command(home.path())
                 .args([
                     "daemon".to_string(),
                     "--listen".to_string(),
-                    address.to_string(),
+                    "127.0.0.1:0".to_string(),
                     "--active-connections".to_string(),
                     connections.to_string(),
                     "--pre-routing-connections".to_string(),
@@ -223,6 +219,17 @@ mod unix {
             Ok(response)
         }
 
+        fn address(&self) -> SocketAddr {
+            let status: serde_json::Value =
+                serde_json::from_str(&self.request("STATUS JSON").unwrap()).unwrap();
+            let listeners = status["listeners"].as_array().unwrap();
+            assert_eq!(listeners.len(), 1);
+            let address: SocketAddr = listeners[0].as_str().unwrap().parse().unwrap();
+            assert!(address.ip().is_loopback());
+            assert_ne!(address.port(), 0);
+            address
+        }
+
         fn wait_for_count(&self, name: &str, expected: usize) {
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
@@ -288,11 +295,6 @@ mod unix {
         }
     }
 
-    fn reserve_address() -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap()
-    }
-
     #[cfg(target_os = "linux")]
     fn ensure_open_file_limit(required: rlim_t) {
         let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
@@ -308,15 +310,15 @@ mod unix {
 
     #[test]
     fn daemon_constructors_use_isolated_development_environment() {
-        Daemon::start(reserve_address()).stop_and_stderr();
+        Daemon::start().stop_and_stderr();
         #[cfg(target_os = "linux")]
-        Daemon::start_for_idle_scale(reserve_address(), 1).stop_and_stderr();
+        Daemon::start_for_idle_scale(1).stop_and_stderr();
     }
 
     #[test]
     fn connection_admission_rejects_before_worker_and_recovers() {
-        let address = reserve_address();
-        let daemon = Daemon::start(address);
+        let daemon = Daemon::start();
+        let address = daemon.address();
 
         let first = TcpStream::connect(address).unwrap();
         daemon.wait_for_count("active_connections", 1);
@@ -354,8 +356,8 @@ mod unix {
 
     #[test]
     fn repeated_global_overload_emits_one_bounded_aggregate_event() {
-        let address = reserve_address();
-        let daemon = Daemon::start(address);
+        let daemon = Daemon::start();
+        let address = daemon.address();
 
         let admitted = TcpStream::connect(address).unwrap();
         daemon.wait_for_count("active_connections", 1);
@@ -385,8 +387,8 @@ mod unix {
 
     #[test]
     fn sigterm_uses_coordinated_shutdown() {
-        let address = reserve_address();
-        let mut daemon = Daemon::start(address);
+        let mut daemon = Daemon::start();
+        let address = daemon.address();
         let client = TcpStream::connect(address).unwrap();
         daemon.wait_for_count("pre_routing_connections", 1);
         let child = daemon.child.as_mut().unwrap();
@@ -418,7 +420,7 @@ mod unix {
 
     #[test]
     fn clean_shutdown_emits_one_bounded_drain_event() {
-        let daemon = Daemon::start(reserve_address());
+        let daemon = Daemon::start();
         let stderr = daemon.stop_and_stderr();
         let drain_events = stderr
             .lines()
@@ -447,8 +449,8 @@ mod unix {
 
     #[test]
     fn source_pre_routing_limit_rejects_before_worker_and_recovers() {
-        let address = reserve_address();
-        let daemon = Daemon::start_with_limits(address, 32, 32);
+        let daemon = Daemon::start_with_limits(32, 32);
+        let address = daemon.address();
         let mut admitted = Vec::new();
 
         for expected in 1..=16 {
@@ -496,8 +498,8 @@ mod unix {
         const CONNECTIONS: usize = 2_000;
 
         ensure_open_file_limit((CONNECTIONS + 256) as rlim_t);
-        let address = reserve_address();
-        let daemon = Daemon::start_for_idle_scale(address, CONNECTIONS);
+        let daemon = Daemon::start_for_idle_scale(CONNECTIONS);
+        let address = daemon.address();
         let pid = daemon.child.as_ref().unwrap().id();
         let baseline_threads = fs::read_dir(format!("/proc/{pid}/task")).unwrap().count();
         let clients = (0..CONNECTIONS)

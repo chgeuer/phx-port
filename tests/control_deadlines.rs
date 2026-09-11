@@ -3,7 +3,6 @@
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -59,10 +58,7 @@ impl ControlEndpoint {
     }
 
     fn spawn_duplicate(&self) -> BoundedChild {
-        let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = reserved.local_addr().unwrap();
-        drop(reserved);
-        self.spawn(&["daemon", "--listen", &address.to_string()])
+        self.spawn(&["daemon", "--listen", "127.0.0.1:0"])
     }
 
     #[cfg(target_os = "linux")]

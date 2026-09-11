@@ -150,6 +150,13 @@ deadline instead of changing socket timeouts after a peer may have closed;
 macOS rejects those timeout changes even when response bytes remain buffered.
 Accept-queue and `SOCK_SEQPACKET` control fixtures remain Linux-specific.
 
+Daemon fixtures bind their own ingress listener on `127.0.0.1:0` and read the
+assigned endpoint from control status instead of probing and releasing a port.
+Fixed-port metrics fixtures run serially and wait for the explicit metrics
+startup result before sending traffic; the public metrics configuration still
+requires a nonzero port. Allocation retries only reported bind failures within
+a bounded setup window, before any test assertions or client traffic.
+
 ## Release
 
 Push a version tag:

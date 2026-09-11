@@ -2,7 +2,6 @@
 
 use serde_json::Value;
 use std::fs;
-use std::net::TcpListener;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
@@ -66,16 +65,12 @@ impl Daemon {
         registry: Option<PathBuf>,
         runtime: Option<PathBuf>,
     ) -> Self {
-        let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = reserved.local_addr().unwrap();
-        drop(reserved);
-
         let mut command = Command::new(env!("CARGO_BIN_EXE_phx-port"));
         command
             .args([
                 "daemon",
                 "--listen",
-                &address.to_string(),
+                "127.0.0.1:0",
                 "--active-connections",
                 "4",
                 "--pre-routing-connections",
