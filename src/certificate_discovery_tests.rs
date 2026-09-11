@@ -14,7 +14,7 @@ fn directory() -> TempDir {
     let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    tempdir_in(root).unwrap()
+    tempdir_in(root.canonicalize().unwrap()).unwrap()
 }
 
 fn restart(directory: &Path, connector: TlsConnector) -> Arc<ProxyState> {

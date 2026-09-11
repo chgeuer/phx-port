@@ -255,7 +255,7 @@ mod tests {
         let root = std::env::var_os("PHX_PORT_TEST_TMPDIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        let directory = tempfile::tempdir_in(root).unwrap();
+        let directory = tempfile::tempdir_in(root.canonicalize().unwrap()).unwrap();
         #[cfg(unix)]
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         directory

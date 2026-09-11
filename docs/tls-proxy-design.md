@@ -473,8 +473,9 @@ after the final bounded shutdown result is emitted.
 
 ## Workload discovery
 
-This section describes the default development Hosting Profile. Public mode
-does not perform this dynamic discovery.
+This section describes the default development Hosting Profile. Declaration-only
+public ingress does not perform this dynamic discovery; the explicit public
+certificate-discovery policy uses logical registrations and durable claims.
 
 The daemon rereads and reconciles the existing port registry once per second.
 This simple polling model also handles atomic registry replacement without
@@ -495,6 +496,13 @@ for a hostname after one complete TLS probe for that hostname succeeds with
 certificate and hostname validation. Failure to present a no-SNI default
 certificate disables eager discovery for that workload but does not prevent
 exact-SNI lazy discovery.
+
+The unauthenticated catalogue TLS connector is initialized once before routing
+deadlines and reused; loading platform trust roots must not consume each
+200-millisecond catalogue probe budget. Catalogue hints still authorize no
+routes: separate trusted hostname/private-key verification is required.
+Interrupted catalogue or proof deadlines leave the Workload eligible for the
+next eager pass instead of permanently marking its discovery as complete.
 
 The daemon must connect only to loopback addresses derived from registered
 ports. Discovery data must never be able to turn the daemon into a proxy for

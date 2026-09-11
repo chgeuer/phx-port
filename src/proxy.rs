@@ -674,6 +674,7 @@ struct ProxyState {
     reconciliation_probes: Arc<ProbeLimiter>,
     probe_workers: Mutex<Option<BoundedWorkerPool<ProbeJob>>>,
     probe_connector_override: Option<TlsConnector>,
+    default_certificate_connector: Result<TlsConnector, String>,
     allocator_reclaim_gate: RwLock<()>,
     connection_tasks_in_flight: AtomicUsize,
     completed_connection_tasks: AtomicUsize,
@@ -752,6 +753,7 @@ impl ProxyState {
             reconciliation_probes: Arc::new(ProbeLimiter::with_limit(MAX_RECONCILIATION_PROBES)),
             probe_workers: Mutex::new(None),
             probe_connector_override,
+            default_certificate_connector: default_certificate_connector(),
             allocator_reclaim_gate: RwLock::new(()),
             connection_tasks_in_flight: AtomicUsize::new(0),
             completed_connection_tasks: AtomicUsize::new(0),
@@ -5008,7 +5010,8 @@ fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
         if !supports_eager_discovery(backend) {
             continue;
         }
-        let names = match default_certificate_dns_names_until(state, backend, deadline) {
+        let catalogue_deadline = deadline.min(Instant::now() + PROBE_TIMEOUT);
+        let names = match default_certificate_dns_names_until(state, backend, catalogue_deadline) {
             Ok(names) => names,
             Err(error) => {
                 eprintln!(
@@ -5018,6 +5021,9 @@ fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
                 if state.check_running_until(deadline).is_err() {
                     defer_eager_workloads(state, &added[index..]);
                     return;
+                }
+                if state.check_running_until(catalogue_deadline).is_err() {
+                    defer_eager_workloads(state, &added[index..=index]);
                 }
                 continue;
             }
@@ -5034,20 +5040,19 @@ fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
                 .ok()
                 .and_then(|routes| routes.get(&hostname).cloned());
             if let Some(incumbent) = incumbent {
+                let proof_deadline = deadline.min(Instant::now() + DISCOVERY_TIMEOUT);
                 if &incumbent.backend != backend
-                    && probe_declared_backend_until(
-                        &hostname,
-                        backend,
-                        state,
-                        deadline.min(Instant::now() + DISCOVERY_TIMEOUT),
-                    )
-                    .is_ok()
+                    && probe_declared_backend_until(&hostname, backend, state, proof_deadline)
+                        .is_ok()
                 {
                     record_conflict(state, &hostname, vec![incumbent.backend, backend.clone()]);
                 }
                 if state.check_running_until(deadline).is_err() {
                     defer_eager_workloads(state, &added[index..]);
                     return;
+                }
+                if state.check_running_until(proof_deadline).is_err() {
+                    defer_eager_workloads(state, &added[index..=index]);
                 }
                 continue;
             }
@@ -5074,16 +5079,18 @@ fn reconcile_workloads_until(state: &ProxyState, deadline: Instant) {
                     return;
                 }
             };
-            let result = state.discover_once_until(
-                &hostname,
-                deadline.min(Instant::now() + DISCOVERY_TIMEOUT),
-                |deadline| discover_backend_until(&hostname, state, candidates, deadline),
-            );
+            let proof_deadline = deadline.min(Instant::now() + DISCOVERY_TIMEOUT);
+            let result = state.discover_once_until(&hostname, proof_deadline, |deadline| {
+                discover_backend_until(&hostname, state, candidates, deadline)
+            });
             if let Err(error) = result {
                 eprintln!("Eager TLS discovery rejected {hostname}: {error}");
                 if state.check_running_until(deadline).is_err() {
                     defer_eager_workloads(state, &added[index..]);
                     return;
+                }
+                if state.check_running_until(proof_deadline).is_err() {
+                    defer_eager_workloads(state, &added[index..=index]);
                 }
             }
         }
@@ -5412,6 +5419,23 @@ fn supports_eager_discovery(backend: &Backend) -> bool {
     backend.role == "https"
 }
 
+fn default_certificate_connector() -> Result<TlsConnector, String> {
+    static CONNECTOR: OnceLock<Result<TlsConnector, String>> = OnceLock::new();
+    // Initialize untrusted-catalogue TLS before probe deadlines. Native TLS may
+    // load platform roots even when verification is disabled; trusted proofs stay separate.
+    CONNECTOR
+        .get_or_init(|| {
+            let mut builder = TlsConnector::builder();
+            builder.use_sni(false);
+            builder.danger_accept_invalid_certs(true);
+            builder.danger_accept_invalid_hostnames(true);
+            builder
+                .build()
+                .map_err(|error| format!("cannot create catalogue TLS connector: {error}"))
+        })
+        .clone()
+}
+
 fn default_certificate_dns_names_until(
     state: &ProxyState,
     backend: &Backend,
@@ -5425,15 +5449,12 @@ fn default_certificate_dns_names_until(
         .ok_or_else(|| "probe capacity unavailable".to_string())?;
     let stream = connect_backend_with_timeout(backend, route_deadline_remaining(deadline)?)
         .map_err(|error| format!("TCP connection failed: {error}"))?;
-    let mut builder = TlsConnector::builder();
-    builder.use_sni(false);
-    builder.danger_accept_invalid_certs(true);
-    builder.danger_accept_invalid_hostnames(true);
-    let connector = builder
-        .build()
-        .map_err(|error| format!("cannot create TLS connector: {error}"))?;
+    let connector = state
+        .default_certificate_connector
+        .as_ref()
+        .map_err(Clone::clone)?;
     let tls = tls_connect_until(
-        &connector,
+        connector,
         "localhost",
         stream,
         deadline,
@@ -11616,6 +11637,59 @@ mod tests {
             let status = render_control_response(&state, &running_shutdown(), "STATUS");
             assert!(status.contains("active_routes=1\n"), "{status}");
             assert_eq!(state.admission.snapshot().global.in_use, 0);
+        }
+
+        #[test]
+        fn timed_out_catalogue_is_retried_without_a_registration_change() {
+            #[derive(Debug)]
+            struct DelayedCatalogue {
+                inner: Arc<dyn rustls::server::ResolvesServerCert>,
+                first: AtomicBool,
+            }
+
+            impl rustls::server::ResolvesServerCert for DelayedCatalogue {
+                fn resolve(
+                    &self,
+                    hello: rustls::server::ClientHello<'_>,
+                ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                    if hello.server_name().is_none() && self.first.swap(false, Ordering::AcqRel) {
+                        thread::sleep(proxy::PROBE_TIMEOUT + Duration::from_millis(100));
+                    }
+                    self.inner.resolve(hello)
+                }
+            }
+
+            let directory = tempdir().unwrap();
+            let certificate = TestCertificate::for_hostname(PATTERN);
+            let workload = TestTlsBackend::start_with_workers(&certificate, b"wildcard", 2);
+            let resolver = Arc::new(DelayedCatalogue {
+                inner: certificate.server_config().cert_resolver.clone(),
+                first: AtomicBool::new(true),
+            });
+            *workload.tls_config.write().unwrap() = Arc::new(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(resolver.clone()),
+            );
+            let state = development_state(
+                directory.path(),
+                &[("/wildcard", "https", workload.port())],
+                certificate.connector(),
+            );
+
+            reconcile_workloads(&state);
+            assert!(!resolver.first.load(Ordering::Acquire));
+            assert!(state.routes.read().unwrap().is_empty());
+            assert!(
+                state.eager_workloads.lock().unwrap().is_empty(),
+                "a timed-out catalogue must remain eligible for the next pass"
+            );
+            reconcile_workloads(&state);
+            assert!(state.routes.read().unwrap().contains_key(PATTERN));
+            assert_eq!(
+                request(&state, &certificate.connector(), FIRST).unwrap(),
+                *b"wildcard"
+            );
         }
 
         #[test]
