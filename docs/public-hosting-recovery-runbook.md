@@ -103,7 +103,9 @@ Keep DNS and the public firewall withdrawn while restoring.
    [host preflight](public-hosting-preflight-runbook.md) in the target service
    context. On systemd, apply its temporary
    `RuntimeDirectoryPreserve=yes` override before any stop so this step does
-   not remove Workload-owned PHXP endpoints.
+   not remove Workload-owned PHXP endpoints. Current packaged units already
+   preserve this directory across stops; the override also protects older
+   installed units.
 8. Start ingress and wait for local certificate verification to rebuild
    disposable route state.
 9. Require `proxy check --live` and `proxy check --ready`, then exercise one

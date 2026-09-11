@@ -30,7 +30,59 @@ setup-public:
     sudo -n -u phx-port -g phx-port -- install -d -o phx-port -g phx-port -m 0700 /run/phx-port/handoff
     sudo -n -u phx-port -g phx-port-admin -- install -d -o phx-port -g phx-port-admin -m 0750 /run/phx-port/control
 
-# Run the production ingress daemon in the foreground on a privileged port
+# Install a built release, initial policy and system units without starting/restarting
+[linux]
+[positional-arguments]
+install-public binary="target/release/phx-port": setup-public
+    sudo bash packaging/systemd/install-public.sh "$1"
+
+# Build this host's optimized release and install it; service activation stays unchanged
+[linux]
+deploy-public:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    host="$(rustc -vV | awk '$1 == "host:" {print $2}')"
+    test -n "$host" || { echo "Cannot determine the native Rust target" >&2; exit 1; }
+    cargo build --release --locked --target-dir target --target "$host"
+    just install-public "target/$host/release/phx-port"
+
+# Enable at boot and start public ingress plus both socket units
+[linux]
+public-on: setup-public
+    @bash packaging/systemd/public-service.sh on
+
+# Disable at boot and stop ingress AND its sockets, preventing socket reactivation
+[linux]
+public-off:
+    @bash packaging/systemd/public-service.sh off
+
+# Load the installed binary if already running, without changing boot enablement
+[linux]
+public-restart: setup-public
+    @bash packaging/systemd/public-service.sh restart
+
+# Show installed, enabled and running state, including when deliberately off
+[linux]
+public-status:
+    @bash packaging/systemd/public-service.sh status
+
+# Require a live public ingress and certificate-verified route readiness
+[linux]
+public-check:
+    @bash packaging/systemd/public-service.sh check
+
+# Show recent system-service logs without a pager
+[linux]
+public-logs:
+    @bash packaging/systemd/public-service.sh logs
+
+# Allocate/reuse a logical public workload port (prints only the port)
+[linux]
+[positional-arguments]
+public-port workload role="https": setup-public
+    @bash packaging/systemd/public-service.sh port "$1" "$2"
+
+# Run login-user ingress on a privileged port, not the public system service
 run-production listen=default_listen:
     #!/usr/bin/env bash
     set -euo pipefail

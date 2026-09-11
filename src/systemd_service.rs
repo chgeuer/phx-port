@@ -200,7 +200,7 @@ mod tests {
             "MemoryMax=70%",
             "RuntimeDirectory=phx-port",
             "RuntimeDirectoryMode=0750",
-            "RuntimeDirectoryPreserve=restart",
+            "RuntimeDirectoryPreserve=yes",
             "StateDirectory=phx-port",
             "StateDirectoryMode=0700",
             "ReadOnlyPaths=/etc/phx-port",

@@ -16,6 +16,15 @@ export PHX_PORT_RUNTIME_DIR=/run/phx-port
 
 On macOS, substitute the paths from the installed LaunchDaemon.
 
+From a Linux source checkout, `just public-status`, `just public-check`, and
+`just public-logs` select the installed machine service explicitly; no exported
+environment or login-account admin-group membership is needed. The recipes
+use `sudo`. `just deploy-public` installs a new native release without changing
+activation; use `just public-restart` to load it in an already-running service.
+`just public-on` enables/starts the daemon and both sockets, while
+`just public-off` disables/stops all three so socket traffic cannot reactivate
+it. Persistent routing state and Workload-owned handoff endpoints are retained.
+
 ## Fast health check
 
 ```bash

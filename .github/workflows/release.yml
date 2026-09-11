@@ -60,7 +60,10 @@ jobs:
              ../../../packaging/systemd/phx-port-ipv4.socket \
              ../../../packaging/systemd/phx-port-ipv6.socket \
              ../../../packaging/systemd/phx-port.sysusers.conf \
-             ../../../packaging/systemd/phx-port.tmpfiles.conf systemd/
+             ../../../packaging/systemd/phx-port.tmpfiles.conf \
+             ../../../packaging/systemd/ingress.toml \
+             ../../../packaging/systemd/install-public.sh \
+             ../../../packaging/systemd/public-service.sh systemd/
           tar czf ../../../phx-port-${{ matrix.target }}.tar.gz \
             ${{ matrix.artifact }} systemd
 

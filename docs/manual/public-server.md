@@ -44,6 +44,91 @@ and members of `phx-port-admin` may inspect it.
 
 ## Linux installation
 
+### Repeatable release deployment
+
+From a source checkout:
+
+```bash
+just deploy-public
+```
+
+This builds an optimized, locked-dependency release for this machine's native
+Rust target, runs `setup-public`, installs `/usr/local/bin/phx-port`, and
+installs the three packaged systemd units. On first installation it creates
+`/etc/phx-port/ingress.toml` with the explicit `certificate_discovery` policy,
+IPv4/IPv6 port 443 listeners, and loopback metrics on port 9464. No hostname
+declarations are required.
+
+**Deployment does not start, stop, restart, enable, or disable the service.**
+`systemctl daemon-reload` refreshes unit definitions only. A running process
+keeps using its old binary until you explicitly restart it.
+
+| Task | Effect |
+|---|---|
+| `just deploy-public` | Build this host's release, provision prerequisites, and install; preserve activation state |
+| `just install-public` | Install an already-built `target/release/phx-port`, policy if absent, and units |
+| `just install-public /path/to/phx-port` | Install a selected prebuilt release instead |
+| `just setup-public` | Provision only service accounts and protected directories |
+| `just public-on` | Validate policy, enable all three units at boot, start them, and require a live control endpoint |
+| `just public-off` | Disable and stop the service and both sockets; traffic cannot reactivate ingress |
+| `just public-restart` | Load the installed binary only if ingress is already running; preserve boot enablement |
+| `just public-status` | Show load, running, and boot-enabled states, including when off |
+| `just public-check` | Require liveness and route readiness, then show verified routes |
+| `just public-logs` | Show the latest 100 service journal entries |
+| `just public-port sub-domain` | Allocate/reuse the logical Workload's `https` port in the public registry |
+
+`public-port` accepts a second argument for another role, for example
+`just public-port sub-domain main`. It prints only the port on stdout and uses
+the service identity and `/var/lib/phx-port/ports.toml`, not the development
+registry. Start the Workload on that port as described in step 4. Deployment
+does not register/start applications, migrate per-user port assignments, or
+copy certificates, private keys, or DNS credentials.
+
+After installing and starting your Workloads, run the host preflight described
+below before first activation, then:
+
+```bash
+just public-on
+just public-check
+
+# After subsequent code changes, install without affecting activation:
+just deploy-public
+# Explicitly load the new binary in an already-running service:
+just public-restart
+
+# Later, disable ingress until you explicitly turn it on again:
+just public-off
+```
+
+`public-on` is safe to repeat but does not restart an already-running process.
+`public-restart` fails explicitly when off instead of accidentally turning it
+on. Startup proves liveness, not route readiness: certificate discovery can
+still be pending or have no live registered Workloads. Use `public-check` and
+inspect `public-logs` before exposing traffic. These recipes use `sudo` and
+affect only the machine service, not the separate development user service.
+They do not kill another process that owns port 443 or alter the firewall.
+
+Installations are serialized and the executable is replaced atomically, so
+reinstalling over a running release does not truncate it. The new executable
+validates the existing policy and protected state as the service identity
+before replacing the installed binary. Packaged units pass `systemd-analyze
+verify` before installation. An existing policy is retained
+byte-for-byte, including the declaration-only policy of older installations.
+Registry, cache, durable claims, and Workload-owned sockets are not replaced.
+If policy is missing but public state already exists, deployment stops and
+requires policy recovery rather than silently assigning new authority.
+Symlinked/masked unit targets are rejected; inspect and deliberately unmask
+them rather than bypassing the error.
+
+The packaged unit files are managed deployment artifacts and are refreshed on
+each install. Put local unit customizations in systemd drop-ins, which are
+retained. Keep policy listeners and socket units consistent; changing listener
+addresses requires an explicit off/on cycle, not merely a daemon restart.
+`RuntimeDirectoryPreserve=yes` keeps live Workload handoff endpoints through
+both restart and off/on cycles. `/run` is still ephemeral across host reboot.
+
+### Prerequisites only
+
 From a source checkout on Linux with `systemd-sysusers`, `systemd-tmpfiles`,
 and `sudo`, provision the accounts and directories for steps 1 and 2 with:
 
@@ -60,9 +145,10 @@ registries, durable ownership claims, and socket files are not replaced.
 
 The task uses `sudo` and makes system-level changes, but does **not** add your
 login account to the admin group, install the binary or policy, enable/start
-services, or switch the running development ingress to public mode. Continue
-with the binary installation in step 2 and the remaining steps below. The
-manual account/directory commands are alternatives to the task.
+services, or switch the running development ingress to public mode. Use
+`deploy-public` for the complete release installation, or follow the manual
+procedure below. The manual account/directory commands are alternatives to the
+task.
 
 Runtime directories are ephemeral. Rerun the task after a reboot when using
 foreground ingress; the shipped systemd service recreates its runtime tree

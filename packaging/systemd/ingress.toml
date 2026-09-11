@@ -1,0 +1,8 @@
+[ingress]
+mode = "public"
+routing_policy = "certificate_discovery"
+unknown_sni = "reject"
+listen = ["0.0.0.0:443", "[::]:443"]
+
+[ingress.metrics]
+listen = "127.0.0.1:9464"

@@ -314,7 +314,9 @@ Remove only
 and keep the real service stopped until every failure is corrected. The
 temporary `RuntimeDirectoryPreserve=yes` is applied before stopping and
 remains through the oneshot exit so Workload-owned PHXP endpoints are not
-removed. Do not leave the temporary override installed.
+removed. Current packaged units also use this preservation setting; keeping
+it in the override protects older installations. Do not leave the temporary
+override installed.
 
 The shipped unit's `ReadOnlyPaths`, `ReadWritePaths`,
 `RestrictAddressFamilies`, `LimitNOFILE`, `TasksMax`, and identity are active

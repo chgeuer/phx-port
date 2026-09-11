@@ -623,15 +623,38 @@ rejected. Other root CLI commands retain their existing behavior.
 
 The explicit public Hosting Profile ships separate system units in
 `packaging/systemd/` and in the Linux release archive's `systemd/` directory.
-From a Linux source checkout, `just setup-public` uses `sudo`,
-`systemd-sysusers`, and `systemd-tmpfiles` to create the non-login `phx-port`
-user/group, `phx-port-admin` membership for the service account, and the
-protected configuration/state/runtime directories. It is safe to rerun and
-does not replace configuration, registries, durable claims, or socket files.
-It does not install a binary/policy, add login users to the admin group, start
-services, or change the running ingress profile. See the
-[public server manual](docs/manual/public-server.md#linux-installation) for
-manual provisioning and ownership details.
+From a Linux source checkout:
+
+```bash
+just deploy-public               # native release build + setup + installation
+just public-port sub-domain      # allocate/reuse this Workload's public HTTPS port
+# Start the Workload on its registered port and complete host preflight.
+just public-on                   # enable at boot and start ingress + both sockets
+just public-check                # require live ingress and verified route readiness
+
+# After changing code:
+just deploy-public               # install only; running/enabled state is unchanged
+just public-restart              # explicitly load the new binary if already running
+just public-off                  # disable and stop ingress AND its activation sockets
+just public-status
+just public-logs
+```
+
+`deploy-public` builds with locked dependencies for this machine's native target,
+runs the idempotent `setup-public`, atomically installs `/usr/local/bin/phx-port`,
+and installs the systemd units. It creates a certificate-discovery policy only
+on first installation; existing policy, registry, durable claims, and Workload
+sockets are preserved. **Deployment never enables or restarts the service.**
+`public-on`/`public-off` control activation explicitly. A running binary is
+unchanged until `public-restart` or a later start.
+
+`just install-public /path/to/phx-port` installs a prebuilt release instead.
+`just setup-public` still provisions only identities/directories. These tasks
+use `sudo`, `systemd-sysusers`, and `systemd-tmpfiles`; they do not deploy
+applications, copy their certificates/credentials, or migrate development
+registrations. See the
+[public server manual](docs/manual/public-server.md#repeatable-release-deployment)
+for the full task list, safety rules, preflight, and manual alternatives.
 
 Add read-only operators to `phx-port-admin` explicitly. After provisioning,
 install the binary at `/usr/local/bin/phx-port`, install the root-owned ingress
@@ -658,8 +681,9 @@ read-only control access. The IPv4 and IPv6 socket units own port 443 and pass d
 configured listening TCP sockets, sets them nonblocking and close-on-exec, and
 does not bind again. systemd creates private state/runtime roots; the service
 creates the mode `0700` handoff directory without removing Workload endpoints
-on restart. Its sandbox has no capabilities, restricts address families and
-writable paths, uses `LimitNOFILE=65536`, `TasksMax=1024`, a finite
+on restart or explicit off/on cycles. Its sandbox has no capabilities,
+restricts address families and writable paths, uses `LimitNOFILE=65536`,
+`TasksMax=1024`, a finite
 `MemoryMax=70%` ceiling, and allows five seconds beyond the public profile's
 60-second drain. Tune the memory ceiling downward for the measured host and
 Workload budget; it is a resource boundary, not a capacity claim. Development
