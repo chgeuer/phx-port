@@ -51,6 +51,13 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
 
+      - name: Verify release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(target/${{ matrix.target }}/release/${{ matrix.artifact }} --version)" \
+            = "phx-port ${GITHUB_REF_NAME#v}"
+
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |

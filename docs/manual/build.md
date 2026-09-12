@@ -13,6 +13,7 @@ CI builds and tests these native targets:
 
 Tagged releases also build `x86_64-pc-windows-msvc`. Public-ingress and PHXP
 support target Linux and macOS; Windows retains the port-registry CLI.
+The Linux x64 CI job checks Windows CLI compilation before release tagging.
 
 ## Prerequisites
 
@@ -165,18 +166,22 @@ a bounded setup window, before any test assertions or client traffic.
 Push a version tag:
 
 ```bash
-git tag -s v0.2.0 -m "phx-port v0.2.0"
-git push origin v0.2.0
+git tag -s v0.3.0 -m "phx-port v0.3.0"
+git push origin v0.3.0
 ```
 
 `.github/workflows/release.yml` builds:
 
-- Linux x64 and ARM64 tarballs containing the binary and `systemd/` units;
+- Linux x64 and ARM64 tarballs containing the binary and `systemd/` units,
+  setup configuration, and deployment scripts;
 - macOS x64 and ARM64 tarballs containing the binary and `launchd/` plists;
 - a Windows x64 zip.
 
+Each built binary must report the version named by the release tag before it
+is packaged.
+
 Release archives intentionally contain the `phx-port` binary and native
-service-manager definitions only. Framework integrations remain source
+service-manager deployment files only. Framework integrations remain source
 examples in the repository and are validated by CI; they are not separate
 runtime artifacts shipped with the daemon.
 

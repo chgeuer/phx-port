@@ -113,6 +113,7 @@ impl ProductionPaths {
         }
     }
 
+    #[cfg(unix)]
     pub fn validate_sandbox_access(&self) -> Result<(), String> {
         let state_directory = self
             .port_registry
@@ -122,6 +123,11 @@ impl ProductionPaths {
         validate_runtime_root(&self.runtime_root)?;
         probe_directory_write(state_directory, "production state directory")?;
         probe_directory_write(&self.runtime_root, "production runtime root")
+    }
+
+    #[cfg(not(unix))]
+    pub fn validate_sandbox_access(&self) -> Result<(), String> {
+        Err("the public Hosting Profile requires Unix sandbox path checks".to_string())
     }
 
     fn validate_paths(
@@ -304,11 +310,6 @@ fn probe_directory_write(path: &Path, description: &str) -> Result<(), String> {
             probe.display()
         )),
     }
-}
-
-#[cfg(not(unix))]
-fn probe_directory_write(_path: &Path, _description: &str) -> Result<(), String> {
-    Err("the public Hosting Profile requires Unix sandbox path checks".to_string())
 }
 
 #[cfg(unix)]
