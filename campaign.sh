@@ -306,7 +306,7 @@ for (( iter=1; iter<=MAX_ITERS; iter++ )); do
   log "iteration $iter/$MAX_ITERS — $ready ready, $before_closed closed so far → $logf"
   [[ -n "$csid" ]] && log "  copilot session: $csid   (resume with: copilot --resume=$csid)"
 
-  cargs=( -C "$REPO" -p "$DRIVER_PROMPT" --allow-all-tools --no-ask-user
+  cargs=( -C "$REPO" -p "$DRIVER_PROMPT" --allow-all --no-ask-user
           --no-auto-update --no-color --log-level error -s )
   [[ -n "$csid" ]] && cargs+=( --session-id "$csid" )
   [[ -n "${COPILOT_MODEL:-}"  ]] && cargs+=( --model "$COPILOT_MODEL" )
@@ -347,7 +347,7 @@ for (( iter=1; iter<=MAX_ITERS; iter++ )); do
           "${COPILOT_FALLBACK_EFFORT:-<default>}" "$remaining_timeout" "$(date -Is)"
       } | tee -a "$logf"
 
-      fallback_args=( -C "$REPO" -p "$FALLBACK_PROMPT" --allow-all-tools --no-ask-user
+      fallback_args=( -C "$REPO" -p "$FALLBACK_PROMPT" --allow-all --no-ask-user
                       --no-auto-update --no-color --log-level error -s
                       "--resume=$csid" --model "$COPILOT_FALLBACK_MODEL" )
       [[ -n "${COPILOT_FALLBACK_EFFORT:-}" ]] &&
