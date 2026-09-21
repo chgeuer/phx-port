@@ -7,6 +7,16 @@ use std::process;
 use std::time::{Duration, Instant};
 use toml_edit::DocumentMut;
 
+// Daemon diagnostics must not abort the process when a supervising log pipe closes.
+macro_rules! eprintln {
+    () => {
+        crate::stderr::write_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        crate::stderr::write_line(format_args!($($arg)*))
+    };
+}
+
 mod activated_listener;
 mod admission;
 #[cfg(test)]
@@ -29,6 +39,7 @@ mod relay;
 mod route_cache;
 mod route_claims;
 mod route_pattern;
+mod stderr;
 mod systemd_service;
 mod tls_client_hello;
 #[cfg(unix)]
